@@ -1,0 +1,23 @@
+# GeptHooks source contract (README_AGENT.md RL-52):
+# .c/.h = UTF-8 BOM, .asm = no BOM; kernel sources must check out as
+# CRLF on EVERY platform and git config (cl/ml64 break on stripped or
+# mixed endings). Repository stores them normalized (LF); eol=crlf
+# guarantees the checkout side.
+*.c                text eol=crlf
+*.h                text eol=crlf
+*.asm              text eol=crlf
+*.inf              text eol=crlf
+*.sln              text eol=crlf
+*.vcxproj          text eol=crlf
+*.vcxproj.filters  text eol=crlf
+
+# Tools & docs: repository-native, no forcing
+*.py               text
+*.ps1              text eol=crlf
+*.md               text
+
+# Never normalize binaries
+*.dmp              binary
+*.exe              binary
+*.sys              binary
+*.pdf              binary
