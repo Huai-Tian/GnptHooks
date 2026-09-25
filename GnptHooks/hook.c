@@ -181,7 +181,7 @@ ULONG64 GnptCallOriginal(ULONG64 Arg1, ULONG64 Arg2, ULONG64 Arg3, ULONG64 Arg4)
 //     (改写后生成物长度≠源覆盖长——跳回点必须按源侧算)
 //  ⑤回扫自检: 重新解码逐条比对长度+字节(disp区除外); 改写段验
 //     双长度吻合+直存值==绝对有效地址(等价性黄金校验)
-//本生成器与 tests/test_reloc.c(用户态执行级单测)为镜像契约:
+//本生成器与 DbgTools/test_reloc.c(用户态执行级单测)为镜像契约:
 //逻辑改动必须双向同步并通过该测试(含真实CPU执行验证)
 
 //改写记录(回扫自检用): At=生成物内偏移 OldLen=源指令长度 Value=直存值

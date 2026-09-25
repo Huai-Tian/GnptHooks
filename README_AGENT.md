@@ -54,7 +54,7 @@
 | bug = 蓝屏/冻结 | 没有用户态容错边界，一切以裸机正确性为准 |
 | 嵌套环境是开发形态 | VMware 嵌套 SVM 特性位失真；异常先物理机复现再定性（勿追鬼） |
 
-**当前版本 v0.7e = M5 毕业（v0.7d 全链路 E2E 验收通过）**：M0 骨架/M1 世界开关/M2 NPT 恒等/M3 hook 引擎封版（v0.3c）；M4 TF+#DB 单步原语毕业（EFLAGS 影子/PUSHF/POPF 窗口仿真/读透明双方案）；M5 四视图 TRANSPARENT 毕业并实测（v0.7d：自触发×3+真实内核调用 17 次+265s 浸泡 18 万单步窗口全收口+干净卸载零泄漏核；单步窗口泄漏防御四道防线；重定位器超±2GB 改写器+执行级单测 tests/test_reloc.c）。**CPUID 伪装、TSC 时间轴、时钟域、自我隐蔽仍未实现**（M5 剩余隐蔽面/M6/M7），你也不要"顺手实现"。
+**当前版本 v0.7e = M5 毕业（v0.7d 全链路 E2E 验收通过）**：M0 骨架/M1 世界开关/M2 NPT 恒等/M3 hook 引擎封版（v0.3c）；M4 TF+#DB 单步原语毕业（EFLAGS 影子/PUSHF/POPF 窗口仿真/读透明双方案）；M5 四视图 TRANSPARENT 毕业并实测（v0.7d：自触发×3+真实内核调用 17 次+265s 浸泡 18 万单步窗口全收口+干净卸载零泄漏核；单步窗口泄漏防御四道防线；重定位器超±2GB 改写器+执行级单测 DbgTools/test_reloc.c）。**CPUID 伪装、TSC 时间轴、时钟域、自我隐蔽仍未实现**（M5 剩余隐蔽面/M6/M7），你也不要"顺手实现"。
 
 ---
 
@@ -149,9 +149,10 @@
 仓库根/
 ├── README.md / README_ZH.md     人类文档（英文/中文）
 ├── README_AGENT.md              本文档
-├── tests/                       test_reloc.c 重定位器执行级单测（用户态 x64；
+├── DbgTools/                    调试与测试工具集（同 GeptHooks 目录语义）
+│                                test_reloc.c 重定位器执行级单测（用户态 x64；
 │                                与 hook.c 生成器为镜像契约, 改动须双向同步）
-└── src/                         源码（VS 工程）
+└── GnptHooks/                    源码（VS 工程）
     ├── main.c                   使用示例：DriverEntry→SvmStartAllCpus→TRANSPARENT demo(自触发)→DriverUnload
     ├── svm.c/.h                 SVM 核心：三态检测/资源分配/VMCB 填充/exit 分发/生命周期
     ├── vmcb.h                   VMCB 结构（控制区+状态保存区, 逐偏移, clean bits 位表）
@@ -340,7 +341,7 @@ Debug 构建双自旋看门狗线程（纯 rdtsc 计时）：行环游标 30s �
 
 ### 10.1 构建
 
-- VS2022 + WDK，x64，工程在 `src/`（.sln/.vcxproj）。
+- VS2022 + WDK，x64，工程在 `GnptHooks/`（.sln/.vcxproj）。
 - **Debug 构建（DBG=1）= 完整观测**：T1 写 `C:\Windows\Temp\gnpt_log.txt`（权威）+ T2 Desktop 镜像（`C:\Users\Public\Desktop\gnpt_log.txt`——通用路径，与登录用户名无关）+ 二进制环 + 看门狗黑匣子。开发/排障一律用它。
 - **Release 构建（DBG=0）= 零日志代码进产物**（Fl\* 全部空操作宏）。交付形态。
 - inf2cat 已在 Debug/Release 双配置关闭（EnableInf2cat=false）。

@@ -26,7 +26,7 @@
   安装时通过 `GNPT_HOOK.StackArgs` 声明目标函数栈参数个数（最多 32 个），回调即收到指向触发栈上实参的 `StackArgs` 指针（可读**可写**，改写后的值随 `GnptCallOriginal` 一并转发）——多参数内核函数的钩取不再有参数缺口。
 
 - **版本无关的运行时跳板**
-  跳板由 LDE 重定位引擎在运行时生成——逐指令解码、RIP-relative 重定位（近距目标直接重算 disp32；超 ±2GB 的远距目标改写为等价的 `mov reg, imm64` 绝对直存，Zw 桩类 prologue 不再因距离被拒）、相对分支拒绝、生成后按 CPU 视角回扫自检。没有绑定某个 Windows 构建的硬编码 prologue：钩子可跨 Windows 版本安装；不可重定位的 prologue 在安装时即被拒绝。另配有执行级单元测试（`tests/test_reloc.c`，用户态 x64）在真实 CPU 上运行生成的跳板验证语义等价。
+  跳板由 LDE 重定位引擎在运行时生成——逐指令解码、RIP-relative 重定位（近距目标直接重算 disp32；超 ±2GB 的远距目标改写为等价的 `mov reg, imm64` 绝对直存，Zw 桩类 prologue 不再因距离被拒）、相对分支拒绝、生成后按 CPU 视角回扫自检。没有绑定某个 Windows 构建的硬编码 prologue：钩子可跨 Windows 版本安装；不可重定位的 prologue 在安装时即被拒绝。另配有执行级单元测试（`DbgTools/test_reloc.c`，用户态 x64）在真实 CPU 上运行生成的跳板验证语义等价。
 
 - **构造即写透明**
   Secondary 视图把钩子页映射为只读：任何对该页的写访问触发 NPF，引擎转发回 Primary 视图——写操作落在真实的原始页上——调用者永远观察不到影子副本，钩子簿记页保持一致。
