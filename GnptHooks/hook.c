@@ -173,11 +173,50 @@ ULONG64 GnptCallOriginal(ULONG64 Arg1, ULONG64 Arg2, ULONG64 Arg3, ULONG64 Arg4)
 }
 
 //==================== LDE重定位跳板生成器 ====================
-//  ①逐指令解码到≥MinLen(整指令边界, 跳回点不错位); 无效/超长=拒
+//  ①逐指令解码到源侧≥MinLen(整指令边界, 跳回点不错位); 无效/超长=拒
 //  ②相对分支=拒(rel8无法跨页重定位)
-//  ③RIP-relative寻址: 重算disp32=绝对有效地址-新RIP_after, 超±2GB=拒
-//  ④尾接 FF 25 00000000 + <Target+Len> 位置无关绝对跳转
-//  ⑤回扫自检: 重新解码逐条比对长度+字节(disp区除外)
+//  ③RIP-relative寻址: 重算disp32保绝对有效地址; 超±2GB→改写为
+//     mov reg,imm64绝对直存(仅REX.W lea, 不可改写=拒)
+//  ④尾接 FF 25 00000000 + <Target+源覆盖长> 位置无关绝对跳转
+//     (改写后生成物长度≠源覆盖长——跳回点必须按源侧算)
+//  ⑤回扫自检: 重新解码逐条比对长度+字节(disp区除外); 改写段验
+//     双长度吻合+直存值==绝对有效地址(等价性黄金校验)
+//本生成器与 tests/test_reloc.c(用户态执行级单测)为镜像契约:
+//逻辑改动必须双向同步并通过该测试(含真实CPU执行验证)
+
+//改写记录(回扫自检用): At=生成物内偏移 OldLen=源指令长度 Value=直存值
+typedef struct _HOOK_REWRITE_REC
+{
+	ULONG   At;
+	ULONG   OldLen;
+	ULONG64 Value;
+} HOOK_REWRITE_REC;
+#define HOOK_MAX_REWRITES 8
+
+//lea reg,[rip+disp32]→mov reg,imm64绝对直存(RIP-rel超±2GB改写)。
+//仅收无前缀REX.W lea(modrm mod=00 rm=101, 7B形态); 直存值=原绝对
+//有效地址, 语义等价(模块内相对偏移运行期不变, KASLR下恒真)。
+//mov等内存加载源不在改写范围=拒(需保持逐字语义, 防越权扩面)
+static ULONG HookRewriteRipRelImm64(PUCHAR Dst, ldasm_data* Ld,
+	ULONG OldLen, ULONG64 Value)
+{
+	if (OldLen != 7 || Ld->opcd_offset != 1 || Ld->opcd_size != 1 ||
+		Dst[1] != 0x8D || (Ld->flags & F_PREFIX) || (Ld->flags & F_SIB) ||
+		Ld->imm_size != 0 || Ld->disp_size != 4 || (Ld->rex & 0x08) == 0)
+	{
+		return 0;    //非"REX.W 8D /r"纯净7B形态=拒
+	}
+	if ((Ld->modrm & 0xC7) != 0x05)    //mod=00 rm=101=[rip+disp32]
+	{
+		return 0;
+	}
+	ULONG reg = ((Ld->modrm >> 3) & 7) + ((Ld->rex & 0x04) ? 8 : 0);
+	Dst[0] = (UCHAR)(0x48 | (reg >= 8 ? 1 : 0));    //REX.W(+B)
+	Dst[1] = (UCHAR)(0xB8 | (reg & 7));             //mov reg,imm64
+	*(ULONG64*)(Dst + 2) = Value;
+	return 10;
+}
+
 static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutLen)
 {
 	if (OutLen != NULL)
@@ -195,7 +234,11 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutL
 	ULONG total = 0;
 	ULONG64 src = Target;
 	BOOLEAN bad = FALSE;
-	while (total < MinLen)
+	HOOK_REWRITE_REC rewTab[HOOK_MAX_REWRITES];
+	ULONG rewCount = 0;
+	//循环按源侧覆盖长判定(非生成物长度): 改写膨胀不得计入"已
+	//跳过patch区"的账——否则源侧<14即停, 跳回点落patch内=死循环
+	while ((ULONG)(src - Target) < MinLen)
 	{
 		ldasm_data ld = { 0 };
 		ULONG len = ldasm((PVOID)src, &ld, TRUE);
@@ -215,31 +258,57 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutL
 			break;
 		}
 		RtlCopyMemory(buf + total, (PVOID)src, len);
-		//RIP-relative数据寻址: 重算disp32(保持同一绝对有效地址)
+		//RIP-relative数据寻址(非分支): 保绝对有效地址不变。
+		//近区(±2GB内)=重算disp32; 超距(Zw桩形如lea r10,[rip±2TB])=
+		//改写为等价mov reg,imm64绝对直存(见HookRewriteRipRelImm64)
 		if ((ld.flags & F_DISP) && (ld.flags & F_RELATIVE) && ld.disp_size == 4)
 		{
 			LONG64 oldDisp = *(LONG*)(buf + total + ld.disp_offset);
 			ULONG64 effective = src + len + (ULONG64)oldDisp;
 			LONG64 newDisp = (LONG64)effective - (LONG64)(buf + total + len);
-			if (newDisp < -0x80000000LL || newDisp > 0x7FFFFFFFLL)
+			if (newDisp >= -0x80000000LL && newDisp <= 0x7FFFFFFFLL)
 			{
-				FlLog("[Reloc] 拒绝: 偏移+%u处RIP-relative目标超±2GB(disp需%llX)",
-					total, (long long)newDisp);
-				bad = TRUE;
-				break;
+				*(LONG*)(buf + total + ld.disp_offset) = (LONG)newDisp;
 			}
-			*(LONG*)(buf + total + ld.disp_offset) = (LONG)newDisp;
+			else
+			{
+				//超±2GB: lea reg,[rip+d]→mov reg,imm64直存。
+				//生成物按新长推进, 源/自检按原长推进(两账分开)
+				ULONG rew = 0;
+				if (rewCount < HOOK_MAX_REWRITES &&
+					total + 10 + 14 <= HOOK_REPLAY_BUF)
+				{
+					rew = HookRewriteRipRelImm64(buf + total, &ld, len, effective);
+				}
+				if (rew == 0)
+				{
+					FlLog("[Reloc] 拒绝: 偏移+%u处RIP-rel超±2GB且不可改写"
+						"(disp需%llX 字节%02X %02X %02X)",
+						total, (long long)newDisp,
+						*(PUCHAR)src, *((PUCHAR)src + 1), *((PUCHAR)src + 2));
+					bad = TRUE;
+					break;
+				}
+				rewTab[rewCount].At = total;
+				rewTab[rewCount].OldLen = len;
+				rewTab[rewCount].Value = effective;
+				rewCount++;
+				total += rew;    //生成物: mov reg,imm64=10B
+				src += len;      //源: 原指令长度
+				continue;
+			}
 		}
 		total += len;
 		src += len;
 	}
 	if (!bad)
 	{
-		//尾接位置无关绝对跳转 → Target+total
+		//尾接位置无关绝对跳转 → Target+源覆盖长(=src; 改写后生成
+		//物长度≠源覆盖长, 跳回点必须按源侧算, 否则落指令中途)
 		buf[total] = 0xFF;
 		buf[total + 1] = 0x25;
 		*(ULONG32*)(buf + total + 2) = 0;
-		*(ULONG64*)(buf + total + 6) = Target + total;
+		*(ULONG64*)(buf + total + 6) = src;
 		//回扫自检: 按CPU视角重新解码生成物, 与原始指令序列逐条比对
 		ULONG chk = 0;
 		ULONG64 ori = Target;
@@ -249,6 +318,36 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutL
 			ldasm_data ldOld = { 0 };
 			ULONG lNew = ldasm(buf + chk, &ldNew, TRUE);
 			ULONG lOld = ldasm((PVOID)ori, &ldOld, TRUE);
+			//改写段: 不比字节(必然不同), 验解码有效+双长度吻合+
+			//直存值==改写时记录的绝对有效地址(等价性黄金校验)
+			ULONG r;
+			for (r = 0; r < rewCount; r++)
+			{
+				if (rewTab[r].At == chk)
+				{
+					break;
+				}
+			}
+			if (r < rewCount)
+			{
+				if (lNew == 0 || (ldNew.flags & F_INVALID) || lNew != 10 ||
+					lOld != rewTab[r].OldLen ||
+					(buf[chk] & 0xF0) != 0x40 || (buf[chk] & 0x08) == 0 ||
+					(buf[chk + 1] & 0xF8) != 0xB8 ||
+					*(ULONG64*)(buf + chk + 2) != rewTab[r].Value)
+				{
+					FlLog("[Reloc] 回扫自检FAIL: 改写段偏移+%u校验不符"
+						"(新len=%u 旧len=%u 直存=%llX 应存=%llX)",
+						chk, lNew, lOld,
+						(long long)*(ULONG64*)(buf + chk + 2),
+						(long long)rewTab[r].Value);
+					bad = TRUE;
+					break;
+				}
+				chk += lNew;
+				ori += rewTab[r].OldLen;
+				continue;
+			}
 			if (lNew == 0 || lNew != lOld || (ldNew.flags & F_INVALID))
 			{
 				FlLog("[Reloc] 回扫自检FAIL: 生成物偏移+%u解码异常(新len=%u 旧len=%u)",
@@ -284,15 +383,18 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutL
 	}
 	if (OutLen != NULL)
 	{
-		*OutLen = total;
+		//源侧覆盖长(≠生成物长度): CodePage还原宽度+尾跳落点依据
+		*OutLen = (ULONG)(src - Target);
 	}
 	return buf;
 }
 
-//==================== TF+#DB单步原语(M4; AMD无MTF的读透明基础件) ====================
-//窗口式拦截: 仅单步窗口开#DB+PUSHF+POPF拦截位(exit handler写VMCB下次
-//vmrun生效=天然原子); 窗口=1条指令, 窗口外零开销。
-//IRET/SYSCALL/SYSRET/INTn不拦——自愈论证见NOTES M4.2裁决3。
+//==================== TF+#DB单步原语(AMD无MTF的读透明基础件) ====================
+//窗口式拦截: PUSHF/POPF仅单步窗口开(窗口外零开销); #DB拦截常驻
+//(窗口外残余TF的guest可见#DB=0x3B/0x1E致命, 常驻
+//+IDLE吞+清TF=最后一道网, guest调试兼容性让位于稳定性)。
+//IRET/SYSCALL/SYSRET不拦(清TF类→LeakCheck收口); INTn不拦但arm时
+//探测+#DB收尾清洗int帧内TF。
 static VOID HookSwitchView(PVMCB Vmcb, ULONG Cpu, ULONG View);    //前向(定义在NPF引擎段)
 #define RFLAGS_TF               (1ULL << 8)
 #define RFLAGS_FIXED1           (1ULL << 1)
@@ -305,11 +407,18 @@ static VOID HookSwitchView(PVMCB Vmcb, ULONG Cpu, ULONG View);    //前向(定�
 #define STEP_IDLE               0     //无单步
 #define STEP_READ_TRANS         1     //方案A: #DB时切回Secondary
 #define STEP_TEMP_RW            2     //方案B: #DB时撤临时RW页集(视图不动)
+#define STEP_REHIDE             3     //TRANSPARENT: #DB时本核副本复位潜伏P=0
 
 //每核单步状态
 static volatile LONG g_stepUse[64];        //用途(STEP_*)
 static volatile LONG g_stepRwMask[64];     //方案B页集(bit i=g_hooks[i]临时RW中)
 static volatile LONG64 g_stepTfShadow[64];  //guest TF影子(arm时初始化, popf仿真同步)
+static volatile LONG g_stepHookIdx[64];    //arm时的hook条目(REHIDE收尾用)
+static volatile LONG g_stepRetView[64];    //READ_TRANS归返视图(HIDE或HOOKS)
+static volatile LONG g_stepArmIntn[64];    //arm时步进指令=INTn(0xCD): 收尾须清int帧内注入TF
+//NPF乒乓计数(定义于此: #DB收尾与泄漏收口都要复位; 引擎主体在NPF段)
+static ULONG64 g_lastNpfGpa[64];
+static ULONG g_npfLoopCnt[64];
 
 //hooked页PTE临时RW开/撤(方案B; 调用方统一置TlbControl=3)
 static VOID HookTempRwSet(ULONG HookIdx, ULONG Cpu, BOOLEAN On)
@@ -341,6 +450,18 @@ static VOID HookTempRwSet(ULONG HookIdx, ULONG Cpu, BOOLEAN On)
 static VOID HookStepArm(PVMCB Vmcb, ULONG Cpu, LONG Use, ULONG HookIdx)
 {
 	g_stepTfShadow[Cpu] = (LONG64)((Vmcb->State.Rflags & RFLAGS_TF) >> 8);
+	g_stepHookIdx[Cpu] = (LONG)HookIdx;
+	//步进指令INTn探测: int压栈的是活RFLAGS=含注入TF→
+	//handler iret复活=guest自发#DB(0x1E级)。#DB收尾清帧内TF
+	//(见GnptHookStepDbExit)。读原页真字节(host直译=原页恒在)
+	{
+		ldasm_data la = { 0 };
+		ULONG al = ldasm((PVOID)(ULONG_PTR)Vmcb->State.Rip, &la, TRUE);
+		g_stepArmIntn[Cpu] = (al != 0 && !(la.flags & F_INVALID) &&
+			la.opcd_size == 1 &&
+			((PUCHAR)(ULONG_PTR)Vmcb->State.Rip)[la.opcd_offset] == 0xCD)
+			? 1 : 0;
+	}
 	if (Use == STEP_TEMP_RW)
 	{
 		g_stepRwMask[Cpu] = 0;
@@ -370,16 +491,33 @@ BOOLEAN GnptHookStepDbExit(PVMCB Vmcb, ULONG Cpu)
 	{
 		return FALSE;
 	}
-	//认领(v0.4c, M4.8判例): armed窗口内#DB一律认领——含BS=0的
+	//认领: armed窗口内#DB一律认领——含BS=0的
 	//Dr断点#DB(注入回guest无调试接手→0x1E)。BS降级面包屑;
 	//guest自身单步(影子TF)嵌套验收场景无此形态, 物理机再评
 	BOOLEAN bs = (Vmcb->State.Dr6 & DR6_BS) != 0;
+	//INTn步进收尾: TF-trap落点=int handler首指令(指令已完整执行,
+	//int帧已压栈)。帧[+0x10]=RFLAGS(同CPL无SS:RSP槽, §6.14.2)——
+	//压入的是活RFLAGS=含注入TF, 不清则handler iret弹回=TF复活进
+	//EFLAGS→后续窗口shadow投毒→忠实还原连环泄漏→guest可见#DB
+	//(0x3B级)。**不可bs门控**: 嵌套环境可能以DR6.BS=0投递TF陷阱,
+	//bs恒假=清洗被跳过。栈=内核栈(window仅hooked页取指可达)
+	if (g_stepArmIntn[Cpu])
+	{
+		*(ULONG64*)(Vmcb->State.Rsp + 0x10) &= ~RFLAGS_TF;
+		static volatile LONG s_inCnt[64] = { 0 };
+		LONG in = InterlockedIncrement(&s_inCnt[Cpu & 63]);
+		if (in == 1 || (in & 0xFF) == 0)
+		{
+			FlRingPush('I', Cpu, 0, (ULONG64)(ULONG_PTR)Vmcb->State.Rip,
+				*(ULONG64*)(Vmcb->State.Rsp + 0x10), 0);
+		}
+	}
 	//收尾(所有armed场景: guest事件抢先也意味着窗口指令已完成)
 	LONG use = g_stepUse[Cpu];
 	g_stepUse[Cpu] = STEP_IDLE;
 	if (use == STEP_READ_TRANS)
 	{
-		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_SECONDARY);   //切回
+		HookSwitchView(Vmcb, Cpu, (ULONG)g_stepRetView[Cpu]);   //归返原视图
 	}
 	else if (use == STEP_TEMP_RW)
 	{
@@ -394,16 +532,32 @@ BOOLEAN GnptHookStepDbExit(PVMCB Vmcb, ULONG Cpu)
 		}
 		Vmcb->Control.TlbControl = 3;    //撤RW即刻生效
 	}
-	//关窗口拦截位
-	Vmcb->Control.InterceptException &= ~EXCP_INTERCEPT_DB;
+	else if (use == STEP_REHIDE)
+	{
+		//TRANSPARENT: 窗口指令执行完毕——ASID配对切回HIDE潜伏树
+		//(§15.16换ASID=零flush; 树静态无PTE写)。他核恒
+		//潜伏→读hooked页=fault→原始字节(破洞=0)
+		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_HIDE);
+	}
+	//关窗口拦截位(仅PUSHF/POPF; #DB拦截常驻——窗口外任何
+	//残余TF的#DB→svm.c IDLE吞+清TF, 杜绝guest可见#DB=0x3B/0x1E)
 	Vmcb->Control.InterceptMisc1 &= ~STEP_WINDOW_INTERCEPTS;
-	Vmcb->State.Rflags &= ~RFLAGS_TF;    //清注入TF(窗口终结)
+	//TF忠实还原: 撤注入TF, 重应用guest自身TF(影子)
+	if (g_stepTfShadow[Cpu])
+	{
+		Vmcb->State.Rflags |= RFLAGS_TF;
+	}
+	else
+	{
+		Vmcb->State.Rflags &= ~RFLAGS_TF;
+	}
+	g_npfLoopCnt[Cpu] = 0;    //窗口收口=NPF乒乓计数复位(舞步逐指令同gpa不误触[X])
 	{
 		static volatile LONG s_finCnt[64] = { 0 };
 		LONG fn = InterlockedIncrement(&s_finCnt[Cpu & 63]);
 		if (fn == 1 || (fn & 0xFFF) == 0)
 		{
-			//'e': b=0(BS=1 TF引发)/b=1(BS=0 Dr断点抢入已吞, M4.8)
+			//'e': b=0(BS=1 TF引发)/b=1(BS=0 Dr断点抢入已吞)
 			FlRingPush('e', Cpu, (ULONG)use, bs ? 0 : 1, (ULONG64)fn, 0);
 		}
 	}
@@ -443,7 +597,7 @@ BOOLEAN GnptHookStepEmuPopf(PVMCB Vmcb, ULONG Cpu)
 	}
 	ULONG64 val = *(ULONG64*)Vmcb->State.Rsp;
 	Vmcb->State.Rsp += 8;
-	//影子同步: guest想改TF(记录意图; 重应用=物理机再评, M4.8)
+	//影子同步: guest想改TF(记录意图; 重应用=物理机再评)
 	g_stepTfShadow[Cpu] = (LONG64)((val & RFLAGS_TF) >> 8);
 	//新RFLAGS=合法可写位 | bit1固定1; TF=注入态保留(窗口未收尾)
 	ULONG64 rf = (val & RFLAGS_POPF_WRITEABLE) | RFLAGS_FIXED1;
@@ -467,17 +621,20 @@ BOOLEAN GnptHookStepEmuPopf(PVMCB Vmcb, ULONG Cpu)
 
 //==================== NPF视图切换引擎(svm.c exit handler调用) ====================
 //返回TRUE=已处理(重入guest); FALSE=未处理(异常留痕由调用方)
-static ULONG64 g_lastNpfGpa[64];
-static ULONG g_npfLoopCnt[64];
 
-//写VMCB切换视图; bring-up形态=每次切换置TLB_CONTROL=3(正确性优先,
-//免flush的ASID配对切换=物理机定案阶段性能项)
+//写VMCB切换视图(四视图ASID配对): NCr3+ASID同写——TLB条目按
+//ASID tag(§15.25.1), 四套翻译并存互不命中, 切换零flush零PTE写
+//(§15.16同ASID改翻译才须flush, 留给临时RW/NPTSYNC)。
+//clean bits全0=两字段每轮vmrun必从VMCB加载, 写即生效
+static const ULONG k_viewAsid[GNPT_VIEW_COUNT] = {
+	NPT_ASID_PRIMARY, NPT_ASID_SECONDARY, NPT_ASID_HIDE, NPT_ASID_EXEC
+};
+
 static VOID HookSwitchView(PVMCB Vmcb, ULONG Cpu, ULONG View)
 {
+	View &= (GNPT_VIEW_COUNT - 1);
 	Vmcb->Control.NCr3 = SvmNptViewNcr3(View);
-	Vmcb->Control.GuestAsid = (View == GNPT_VIEW_SECONDARY)
-		? NPT_ASID_SECONDARY : NPT_ASID_PRIMARY;
-	Vmcb->Control.TlbControl = 3;    //本guest全部TLB条目下轮vmrun失效
+	Vmcb->Control.GuestAsid = k_viewAsid[View];
 	g_view[Cpu] = (LONG)View;
 	//视图切换面包屑(首条+每4096条采样; 触发链定位用)
 	{
@@ -486,6 +643,61 @@ static VOID HookSwitchView(PVMCB Vmcb, ULONG Cpu, ULONG View)
 		if (vn == 1 || (vn & 0xFFF) == 0)
 		{
 			FlRingPush('V', Cpu, 0, (ULONG64)View, (ULONG64)vn, 0);
+		}
+	}
+}
+
+//svm.c每exit首查: 单步窗口泄漏防御收口。
+//泄漏形态: 步进指令属清/搬运TF类(syscall清TF/sysret-iret弹回值,
+//按设计不拦)→#DB永不到达→PUSHF/POPF/#DB拦截位+EXEC视图
+//永久泄漏→全系统pushf/popf exit风暴+兜底"推进"跳过指令的
+//标志/栈效应=guest状态破坏(0x1E级)。
+//判据: armed而guest TF已失=窗口死亡铁证。按use收尾+解除拦截+
+//影子TF忠实还原。开销: 窗口外2读+1比较/exit。
+VOID GnptHookStepLeakCheck(PVMCB Vmcb, ULONG Cpu)
+{
+	if (g_stepUse[Cpu] == STEP_IDLE ||
+		(Vmcb->State.Rflags & RFLAGS_TF) != 0)
+	{
+		return;    //无窗口或TF仍活(窗口健康, #DB必达)
+	}
+	LONG use = g_stepUse[Cpu];
+	g_stepUse[Cpu] = STEP_IDLE;
+	if (use == STEP_REHIDE)
+	{
+		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_HIDE);
+	}
+	else if (use == STEP_READ_TRANS)
+	{
+		HookSwitchView(Vmcb, Cpu, (ULONG)g_stepRetView[Cpu]);
+	}
+	else if (use == STEP_TEMP_RW)
+	{
+		ULONG mask = (ULONG)g_stepRwMask[Cpu];
+		g_stepRwMask[Cpu] = 0;
+		for (ULONG i = 0; mask != 0 && i < GNPT_MAX_HOOKS; i++, mask >>= 1)
+		{
+			if (mask & 1)
+			{
+				HookTempRwSet(i, Cpu, FALSE);
+			}
+		}
+		Vmcb->Control.TlbControl = 3;
+	}
+	Vmcb->Control.InterceptMisc1 &= ~STEP_WINDOW_INTERCEPTS;    //#DB拦截常驻
+	if (g_stepTfShadow[Cpu])
+	{
+		Vmcb->State.Rflags |= RFLAGS_TF;    //影子TF忠实还原(guest自有单步)
+	}
+	g_npfLoopCnt[Cpu] = 0;
+	{
+		static volatile LONG s_lkCnt[64] = { 0 };
+		LONG ln = InterlockedIncrement(&s_lkCnt[Cpu & 63]);
+		if (ln == 1 || (ln & 0xFF) == 0)
+		{
+			FlRingPush('L', Cpu, (ULONG)use,
+				(ULONG64)(ULONG_PTR)Vmcb->State.Rip,
+				Vmcb->State.Rflags, 0);
 		}
 	}
 }
@@ -524,33 +736,53 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 	}
 	if (ExitInfo1 & NPF_ERR_ID)
 	{
-		//取指NPF: hooked页(P态HOOKP=NX)→切S驻留; S树恒等RWX=
-		//驻留视图, detour/回调/CallOriginal/跨界调用链全速零exit
-		//(M4.12: S树NX囚笼=跨界乒乓风暴, 已回退)
+		//取指NPF。TRANSPARENT: P(NX)/HIDE(P=0)两视图的取指fault
+		//统一→EXEC窗口(切树+TF, #DB切回HIDE; 零PTE写零flush)
 		if (hit != NULL)
 		{
+			if (hit->pub.Flags & HOOK_TRANSPARENT)
+			{
+				HookSwitchView(Vmcb, Cpu, GNPT_VIEW_EXEC);
+				HookStepArm(Vmcb, Cpu, STEP_REHIDE,
+					(ULONG)(hit - g_hooks));
+				return TRUE;
+			}
+			//常规hook: P态→HOOKS驻留; HOOKS态取指fault
+			//理论不可达(CodePage可执行)——防御留痕+切P自愈
 			if (g_view[Cpu] == GNPT_VIEW_PRIMARY)
 			{
 				HookSwitchView(Vmcb, Cpu, GNPT_VIEW_SECONDARY);
 				return TRUE;
 			}
-			//S态hooked页取指fault: 理论不可达(EXEC常驻P=1)。
-			//防御留痕+切P自愈
 			FlRingPush('N', Cpu, 0x400, ExitInfo2, ExitInfo1, 0);
 			HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
 			return TRUE;
 		}
-		if (g_view[Cpu] == GNPT_VIEW_SECONDARY)
+		if (g_view[Cpu] != GNPT_VIEW_PRIMARY)
 		{
-			//S态非hooked取指fault: S树RWX下理论不可达(防御保留)
+			//非hooked页取指fault: 各驻留树恒等RWX下理论不可达
+			//(防御保留)——回P自愈
 			HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
 			return TRUE;
 		}
 		return FALSE;    //Primary态非hooked取指fault=未覆盖/异常→留痕
 	}
-	//数据NPF(读写fault分流, NOTES M4.2裁决2; 仅常规hook可达——
-	//TRANSPARENT的S-PTE=EXEC全权(RW), 数据访问不fault, 核驻S
-	//长期驻留; 常规hook的S-PTE=HOOKS只读, 外部写→切P转发):
+	//TRANSPARENT潜伏态(HIDE)的非取指fault(P=0拦数据访问, 读透明):
+	//外部读→切P+TF读原始字节(#DB归返HIDE); 外部写→切P惰性落原页。
+	//自读/自写不存在于此形态(EXEC窗口内代码跑CodePage全权)
+	if (hit != NULL && g_view[Cpu] == GNPT_VIEW_HIDE &&
+		(hit->pub.Flags & HOOK_TRANSPARENT))
+	{
+		g_stepRetView[Cpu] = GNPT_VIEW_HIDE;
+		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
+		if ((ExitInfo1 & NPF_ERR_RW) == 0)
+		{
+			HookStepArm(Vmcb, Cpu, STEP_READ_TRANS, (ULONG)(hit - g_hooks));
+		}
+		return TRUE;
+	}
+	//数据NPF(读写fault分流; 仅常规hook可达——
+	//TRANSPARENT潜伏态由上分支拦截, EXEC窗口内数据访问不fault):
 	//自读/自写判定: faulting RIP与目标同4K页(纯VA比较; 同页⇔代码流
 	//在hooked页=hook自身代码, CallOriginal走池页ReplayVA不在此)
 	if (hit != NULL && g_view[Cpu] == GNPT_VIEW_SECONDARY)
@@ -591,7 +823,8 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 			else
 			{
 				//外部读(扫描器/PG): 方案A——切Primary+单步, 读到
-				//原页原始字节, #DB后切回(读透明)
+				//原页原始字节, #DB归返HOOKS(读透明)
+				g_stepRetView[Cpu] = GNPT_VIEW_SECONDARY;
 				HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
 				HookStepArm(Vmcb, Cpu, STEP_READ_TRANS, idx);
 			}
@@ -721,14 +954,15 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	e->TargetPa = MmGetPhysicalAddress(
 		(PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1))).QuadPart;
-	//双视图PTE布防(Secondary先布=布防窗口无害; 均常驻, 运行时零PTE写):
-	//  Primary: 原页可读可写不可执行(取指NPF→进Secondary)
-	//  Secondary: 常规=CodePage只读可执行(写NPF→回Primary转发);
-	//           TRANSPARENT=CodePage全权EXEC(S树唯一可执行页,
-	//           囚笼内整段detour全速; M4.11)
+	//多视图PTE布防(静态一次写死, 运行时零PTE写):
+	//  P: 原页可读可写不可执行(取指NPF→进detour视图)
+	//  常规hook   → HOOKS树=CodePage只读可执行(写NPF→回P转发)
+	//  TRANSPARENT→ HIDE树=P=0潜伏 + EXEC树=CodePage全权
 	if (Hook->Flags & HOOK_TRANSPARENT)
 	{
-		SvmNptSetPte(GNPT_VIEW_SECONDARY, e->TargetPa, e->CodePagePa,
+		SvmNptSetPte(GNPT_VIEW_HIDE, e->TargetPa, e->CodePagePa,
+			NPT_PTE_FLAGS_HOOKT_HIDE);
+		SvmNptSetPte(GNPT_VIEW_EXEC, e->TargetPa, e->CodePagePa,
 			NPT_PTE_FLAGS_HOOKT_EXEC);
 	}
 	else
@@ -760,9 +994,18 @@ NTSTATUS GnptHookRemove(PVOID Target)
 		//  尚持旧TLB翻译的核此刻也只见原始字节=hook死透
 		ULONG off = (ULONG)((ULONG_PTR)Target & (PAGE_SIZE - 1));
 		RtlCopyMemory(e->CodePageVa + off, (PUCHAR)Target, e->ReplayLen);
-		//②双视图PTE恒等还原
+		//②布防树PTE恒等还原(按条目模式: 不触碰未布防树
+		//  =不烧无关树的拆分区配额)
 		SvmNptRestoreIdentity(GNPT_VIEW_PRIMARY, e->TargetPa);
-		SvmNptRestoreIdentity(GNPT_VIEW_SECONDARY, e->TargetPa);
+		if (e->pub.Flags & HOOK_TRANSPARENT)
+		{
+			SvmNptRestoreIdentity(GNPT_VIEW_HIDE, e->TargetPa);
+			SvmNptRestoreIdentity(GNPT_VIEW_EXEC, e->TargetPa);
+		}
+		else
+		{
+			SvmNptRestoreIdentity(GNPT_VIEW_SECONDARY, e->TargetPa);
+		}
 		//③全核TLB同步(残留CodePage翻译被冲净)
 		HookSyncAllCpus();
 		e->Removed = 1;

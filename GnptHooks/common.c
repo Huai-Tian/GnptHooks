@@ -17,8 +17,9 @@ volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX] = { 0 };
 //==================== 文件日志(仅Debug构建编译) ====================
 //DriverEntry/DriverUnload路径零文件I/O(加载窗口期过滤驱动可能死锁):
 //FlLog只入行环; T1线程持有Temp权威副本+心跳+环排空; T2等
-//FlMarkEntryDone后镜像Desktop。
-#define GNPT_LOG_PATH1 L"\\??\\C:\\Users\\User\\Desktop\\gnpt_log.txt"
+//FlMarkEntryDone后镜像Desktop。Desktop镜像走Public桌面(全Windows
+//必有, 与登录用户名无关——个人桌面路径因机而异, 他人机器必开败)
+#define GNPT_LOG_PATH1 L"\\??\\C:\\Users\\Public\\Desktop\\gnpt_log.txt"
 #define GNPT_LOG_PATH2 L"\\??\\C:\\Windows\\Temp\\gnpt_log.txt"
 
 static HANDLE g_flFileTemp = NULL;        //Temp句柄(仅T1触碰; T1退出后FlShutdown收尾)

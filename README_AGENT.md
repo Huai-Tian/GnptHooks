@@ -1,4 +1,4 @@
-# README_AGENT.md — AI 协作者契约文档 (v0.3c 现状)
+# README_AGENT.md — AI 协作者契约文档 (v0.7e 现状)
 
 > **本文档的读者是大语言模型 / 编码 Agent，不是人类。** 人类请阅读 [README.md](README.md) / [README_ZH.md](README_ZH.md)。
 >
@@ -18,7 +18,7 @@
 ## 0. 阅读协议（元指令）
 
 - **权威顺序**：源码注释 > 本文档 > README。若本文档与代码注释冲突，以代码为准，并视为本文档的 bug。
-- 本文档**自包含**：不引用任何仓库外文档。设计依据（APM 页码、判例全过程）在 NOTES.md 按里程碑组织，本文档只沉淀结论。
+- 本文档**自包含**：不引用任何仓库外文档。设计依据以 APM 章节号形式内嵌于代码注释与本文档。
 - §2 的每条铁律都标注了 `[违例后果]`。这些不是代码风格偏好，是已发生事故的总结。
 - 修改任何 `.c/.h/.asm` 之前：先过 §9 的 checklist。
 - 你无法在本机运行此项目（需要 Windows + VS2022 + WDK + AMD SVM 实机/嵌套环境 + 测试签名）。你能做的验证是：静态编译正确性推理、与本文档契约的一致性核对、编码规范校验（§13）、标识符拼写 grep 核对（沙箱无编译器，笔误不可自愈）。
@@ -54,7 +54,7 @@
 | bug = 蓝屏/冻结 | 没有用户态容错边界，一切以裸机正确性为准 |
 | 嵌套环境是开发形态 | VMware 嵌套 SVM 特性位失真；异常先物理机复现再定性（勿追鬼） |
 
-**当前版本 v0.3c = M3 封版**：M0 骨架/M1 世界开关/M2 NPT 恒等/M3 hook 引擎全部嵌套实测毕业。M4（单步原语）/M5（隐身套件）/M6（时钟域）/M7（root 加固+发布）未开工——**反检测、CPUID 伪装、TSC 时间轴、时钟域、自我隐蔽均未实现**，README 的 Features 不含它们，你也不要"顺手实现"。
+**当前版本 v0.7e = M5 毕业（v0.7d 全链路 E2E 验收通过）**：M0 骨架/M1 世界开关/M2 NPT 恒等/M3 hook 引擎封版（v0.3c）；M4 TF+#DB 单步原语毕业（EFLAGS 影子/PUSHF/POPF 窗口仿真/读透明双方案）；M5 四视图 TRANSPARENT 毕业并实测（v0.7d：自触发×3+真实内核调用 17 次+265s 浸泡 18 万单步窗口全收口+干净卸载零泄漏核；单步窗口泄漏防御四道防线；重定位器超±2GB 改写器+执行级单测 tests/test_reloc.c）。**CPUID 伪装、TSC 时间轴、时钟域、自我隐蔽仍未实现**（M5 剩余隐蔽面/M6/M7），你也不要"顺手实现"。
 
 ---
 
@@ -64,7 +64,7 @@
 
 ### A. APM 核对与 AMD/Intel 差量（第一优先级）
 
-- **RL-01** 任何 SVM/NPT/VMCB 语义（指令行为/MSR 号/位定义/VMCB 偏移/exit code）写入代码前，**必须**用 tools/apm.pdf 原文核对（pymupdf 检索），页码记入 NOTES.md。**你的记忆不可信**——本项目第一个判例：异常 exit code 实为 0x40+向量号（APM pdf 页 1244），记忆中的 0x40+2N 是错的。
+- **RL-01** 任何 SVM/NPT/VMCB 语义（指令行为/MSR 号/位定义/VMCB 偏移/exit code）写入代码前，**必须**用 AMD APM 原文核对（*AMD64 Architecture Programmer's Manual Vol2*, Rev 3.45+；从 AMD 官网下载 PDF，pymupdf 检索），出处章节号须标注在紧邻的代码注释中。**你的记忆不可信**——本项目第一个判例：异常 exit code 实为 0x40+向量号（APM §15.5.1 exit-code 表），记忆中的 0x40+2N 是错的。
 - **RL-02** **勿把 Intel/VMX 语义想当然平移到 AMD**。已核对差量：无 MTF（用 TF+#DB）、NPT 无 execute-only、NPT PTE 无内存类型位、无 VMFUNC、GIF 语义（vmrun 置/exit 清）、#PF 无 error-code 过滤、EXITINTINFO/EVENTINJ 与 Intel 同构但布局不同。未列出的差量靠 RL-01 兜底。
 - **RL-03** MSDN 签名核对同样是最后一道防线：API 参数类型不许凭直觉写。`[判例 M3.7: MmGetSystemRoutineAddress(L"NtClose")——参数须 PUNICODE_STRING, 误传 PWSTR → 字符串内容被当结构体解析 → 0x7E 蓝屏。且 DisableSpecificWarnings 禁了 C4133, 编译器静默]`
 
@@ -135,25 +135,30 @@
 | "SvmShutdownAllCpus 返回 void 够了" | park 拒绝时引擎仍在位, 卸载方不能释放 hook 内存 | BOOLEAN：TRUE=全核裸机可 FreeMemory |
 | "重定位跳板失败可以警告后继续安装" | 带病上机 = 不可调试时机的蓝屏 | FAIL → 拒绝安装（安全门语义） |
 | "VMware 嵌套 SVM 测出的异常就是 bug" | 嵌套环境特性位失真（无 vGIF 判例等） | 先物理机复现再定性（勿追鬼） |
+| "LeakCheck 每个 exit 都跑一遍太浪费, 该缓存/挪位/删除" | 清 TF 类指令（syscall/sysret/iret）使 #DB 永不到达 → 单步窗口永不关闭 → 拦截位+EXEC 视图永久泄漏（0x1E 判例: r70 心跳风暴 44→2542） | `GnptHookStepLeakCheck` 必须保持在 exit handler 每个 exit 首查；判据"armed 而 guest TF 已失"开销 = 窗口外 2 读+1 比较 |
+| "#DB 拦截应随单步窗口关闭而解除" | 窗口外残余 TF 的 #DB 直送 guest = 0x3B/0x1E（两判例） | #DB 拦截**常驻**（VMCB init 即设）；IDLE #DB = 吞+清 TF 自愈；只有 PUSHF/POPF 是窗口位 |
+| "int 帧清洗加 DR6.BS 门控更严谨" | 嵌套环境以 BS=0 投递 TF 陷阱（实测铁证）→ 门控恒假 = 清洗永不执行 → iretq 弹回 TF 复活链（0x3B 根因） | 帧清洗只看 `g_stepArmIntn`，不看 bs |
+| "0x70/0x71 非窗口路径该推进 RIP 防死循环" | 推进 = 跳过 pushfq/popfq 的栈/标志效应 → guest 状态破坏（0x1E 根因之一） | 解除窗口位 + 不推 RIP = 重执行真指令 |
+| "窗口关闭时 TF 一律清零更干净" | guest 自身可能持有 TF（单步调试中）——盲清 = 吞掉 guest 状态 | 按 `g_stepTfShadow` 影子忠实还原 |
 
 ---
 
-## 4. 架构地图（v0.3c）
+## 4. 架构地图（v0.7e）
 
 ```
 仓库根/
 ├── README.md / README_ZH.md     人类文档（英文/中文）
 ├── README_AGENT.md              本文档
-├── NOTES.md                     知识库（APM 核对页码/设计裁决/判例全过程）
-├── HANDOFF.md                   会话交接文档（路线/恢复手册）
-├── tools/                       apm.pdf(AMD手册) + 4275.com 传输工具
+├── tests/                       test_reloc.c 重定位器执行级单测（用户态 x64；
+│                                与 hook.c 生成器为镜像契约, 改动须双向同步）
 └── src/                         源码（VS 工程）
-    ├── main.c                   使用示例：DriverEntry→SvmStartAllCpus→NtClose demo→DriverUnload
+    ├── main.c                   使用示例：DriverEntry→SvmStartAllCpus→TRANSPARENT demo(自触发)→DriverUnload
     ├── svm.c/.h                 SVM 核心：三态检测/资源分配/VMCB 填充/exit 分发/生命周期
     ├── vmcb.h                   VMCB 结构（控制区+状态保存区, 逐偏移, clean bits 位表）
-    ├── npt.c/.h                 NPT：双树恒等构建/4KB 拆分/PTE 操作/释放
+    ├── npt.c/.h                 NPT：四棵静态共享树恒等构建/4KB 拆分/PTE 操作/释放
     ├── hook.c/.h                Hook API：Install/Remove/CallOriginal + NPF 视图切换引擎
-    │                            + 跳板槽池 + LDE 重定位跳板生成器（回扫自检）
+    │                            + 跳板槽池 + LDE 重定位跳板生成器（回扫自检+超±2GB改写）
+    │                            + TF+#DB 单步原语 + 单步窗口泄漏防御收口
     ├── common.c/.h              观测体系（Fl* 家族/T1/T2/看门狗/黑匣子, 整体 #if DBG）
     ├── common-asm.asm           CmVmmCall（签名门入口）/shutdown park
     ├── svm-asm.asm              世界开关（CmSvmEnter）/exit 汇编壳/STOP 桥/段助手
@@ -165,18 +170,24 @@
 
 ```
 DriverEntry(main.c)
-  → FlInit → SvmStartAllCpus(svm.c): 三态检测→SvmBuildDualNpt(双树恒等)
+  → FlInit → SvmStartAllCpus(svm.c): 三态检测→SvmBuildNptViews(四树恒等)
     →逐核资源预分配(VMCB/HSAVE/IOPM/MSRPM/VMM栈)→逐核发起线程
     →vmrun→CmGuestProbe自证('W')→KEEP('Q')→停泊(中断直通)
   → GnptHookInstall(main.c demo): LDE重定位跳板(回扫自检)→跳板槽→CodePage
-    →双视图PTE布防(Secondary先)→HookSyncAllCpus('i'×N)
+    →多视图PTE布防(TRANSPARENT: HIDE潜伏P=0+EXEC全权)→HookSyncAllCpus('i'×N)
 
-hook 命中（双 NPT 核, 稳态零 VM-Exit）:
+hook 命中（常规hook: 双 NPT 稳态零 VM-Exit）:
   每核首次: Primary取指hooked页→NPF(ID位)→GnptHookNpfEngine切Secondary('V')
   此后: guest取指→Secondary PTE→CodePage→目标偏移14B绝对跳转
     →跳板槽(mov r10,entry; jmp GnptStubEntry)→SAVE_ALL('H')
     →GnptCallbackDispatch→你的回调(可GnptCallOriginal('O'))
     →RESTORE_ALL→ret
+
+hook 命中（TRANSPARENT: 每指令2exit, 低频目标专用）:
+  潜伏态取指/读hooked页→NPF→EXEC窗口+arm TF('s' rsn=3)→1条指令
+    →#DB('e')→切回HIDE潜伏; 外部读→切P+TF读原始字节(读透明)
+  防线: 每exit首查LeakCheck(armed而TF已失=收口'L')+
+    #DB拦截常驻(IDLE残余=吞+清TF'D')+INTn帧清洗('I')
 
 卸载(DriverUnload): 计数留痕→GnptHookRemoveAll(Remove OK+'i'×N)
   →SvmShutdownAllCpus(STOP桥'S'×N, SVME回读=0)→TRUE→GnptHookFreeMemory
@@ -291,7 +302,12 @@ D=同(code,rip)环路 X=NPF风暴逃生(rsn=0x400) T/Z/U=预留(park/未知exit�
 i=NPTSYNC每核TLB同步确认(rsn=0x81, 安装/移除布防面包屑)
 V=NPT视图切换采样(a=视图 b=每核计数) H=detour分发入口(a=目标)
 O=CallOriginal入口(a=重定位跳板) N=NPF留痕(rsn=0x400, a=gpa, b=错误码)
-h=hook命中采样(用户回调发出, b=辅助参数) w=CallOriginal误用警告(非回调上下文)
+h=hook命中采样(用户回调发出, rsn=Arg1低32位, a=命中计数) w=CallOriginal误用警告(非回调上下文)
+s=单步arm(rsn=用途1读透明/2临时RW/3REHIDE, a=hook条目, b=采样计数; 读透明链起点)
+e=单步#DB收尾(rsn=用途, a=0(BS=1 TF引发)/1(BS=0 Dr断点抢入), b=计数; 链终点)
+b=EXITINTINFO.V=1重放(guest事件递送途中被拦) P=pushf仿真 p=popf仿真(窗口内)
+L=单步窗口泄漏收口(rsn=用途 a=RIP b=RFLAGS——armed而TF已失, 防御按use收尾)
+I=INTn步进帧清洗(a=RIP b=清洗后帧内RFLAGS——int压入活RFLAGS含注入TF)
 ```
 
 触发链面包屑顺序：`i`(布防)→`V`(首切)→`H`(分发)→`h`(回调)→`O`(CallOriginal)。
@@ -325,7 +341,7 @@ Debug 构建双自旋看门狗线程（纯 rdtsc 计时）：行环游标 30s �
 ### 10.1 构建
 
 - VS2022 + WDK，x64，工程在 `src/`（.sln/.vcxproj）。
-- **Debug 构建（DBG=1）= 完整观测**：T1 写 `C:\Windows\Temp\gnpt_log.txt`（权威）+ T2 Desktop 镜像 + 二进制环 + 看门狗黑匣子。开发/排障一律用它。
+- **Debug 构建（DBG=1）= 完整观测**：T1 写 `C:\Windows\Temp\gnpt_log.txt`（权威）+ T2 Desktop 镜像（`C:\Users\Public\Desktop\gnpt_log.txt`——通用路径，与登录用户名无关）+ 二进制环 + 看门狗黑匣子。开发/排障一律用它。
 - **Release 构建（DBG=0）= 零日志代码进产物**（Fl\* 全部空操作宏）。交付形态。
 - inf2cat 已在 Debug/Release 双配置关闭（EnableInf2cat=false）。
 
@@ -334,7 +350,7 @@ Debug 构建双自旋看门狗线程（纯 rdtsc 计时）：行环游标 30s �
 1. **横幅**：日志第一行 `vXXX` 与源码 GNPT_BUILD_TAG 一致（防旧二进制）。
 2. **接管**：每核 `接管(vmrun循环就绪)` → `已guest化(KEEP确认)` × 全核 → `全核接管完成`；'W'/'Q' 每核齐。
 3. **hook 安装**：`[Hook] Install OK`（目标/回调/槽/重定位跳板/CodePage 全要素）→ 'i' × 核数（布防同步确认）。
-4. **触发**：开关任意程序 → 'V'（首切）→ 'H'/'h'/'O' 推进；HB 行 r400 = 核数且**恒定**；r81 账目精确。
+4. **触发**：开关任意程序 → 'V'（首切）→ 'H'/'h'/'O' 推进；HB 行 r400 = 核数且**恒定**；r81 账目精确。TRANSPARENT 目标另查：'s'(rsn=3)/'e' 推进正常；泄漏面包屑 'L'/'D' 允许少量（每秒成百 = 异常须报告）；r70/r41 ≈ 0.1（0.8 = 泄漏风暴形态）。
 5. **卸载**：计数留痕 → Remove OK + 'i'×N → Remove 后新 'h' 即刻停止 → 'S'×N（SVME 回读=0）→ 泄漏掩码 0 → NPT 释放页数账目 → FreeMemory → 完成。
 6. **Release 崩溃无环**：任何 Release 构建的崩溃，先换 Debug 构建复现再判读。
 
@@ -358,6 +374,8 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | C2440 PHYSICAL_ADDRESS 转换 | MmAllocateContiguousMemorySpecifyCache 参数不全（Lowest/Ceiling/Boundary） | svm.c 已正确，勿回退 |
 | LNK2019 未解析符号 | vcxproj 缺 .c 条目（本地工程文件未同步） | 整目录同步 workspace 包，勿单文件拷贝 |
 | 启动横幅版本号与源码不符 | 本地跑旧二进制 / 单文件同步错位 | RL-29；整目录同步 |
+| 0x1E，任意进程；心跳 r70(PUSHF/POPF exit) 指数爆炸（实测 44→2542/s） | 单步窗口泄漏：步进指令为 syscall/sysret/iret 清 TF 类 → #DB 永不到达 → 窗口拦截位+EXEC 视图永久泄漏；0x70/0x71 兜底"推进"跳过 pushfq/popfq 的栈/标志效应 → guest 状态破坏 | 每 exit LeakCheck 收口 + 0x70/0x71 兜底改重执行（M5.8） |
+| 0x3B Arg1=0x8000004（STATUS_SINGLE_STEP），nt!KiServiceInternal+4 取指 | int 2E 硬件帧压入活 RFLAGS（含注入 TF）→ 帧清洗被 bs 门控跳过（嵌套环境以 BS=0 投递 TF 陷阱）→ iretq 弹回 TF 复活 → 影子投毒 → 窗口外 guest 可见 #DB | #DB 拦截常驻 + IDLE 吞清 TF；int 帧清洗不门控 bs（M5.9） |
 
 ---
 
@@ -367,8 +385,11 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 |---|---|---|
 | NPF=0 判据 | 物理机定案项 | 嵌套形态 r400=核数恒定已获证（26081 次零增长）；物理机复核待硬件 |
 | ASID 免 flush 切换 | 物理机定案项 | bring-up 恒 TlbControl=3；嵌套下切换频率 2 次/80s 无评估价值 |
+| 方案 B 临时 RW 跨核窗口 | 已知臂（M4） | SvmNptSetPte 操作全局共享 Secondary 树——单步窗口内其它核对同页读不 fault（读 CodePage 字节，非崩溃）；窗口=1 指令，概率≈0；物理机多核扫描竞争评估 |
 | 无 Enumerate API | 未实现 | GeptHooks 有, 本项目按需后补 |
-| 无 HideRead/MSR hook/CPUID 伪装/TSC 时间轴/时钟域/自我隐蔽 | M4-M7 路线 | 勿"顺手实现"（§1 末尾） |
+| 无 MSR hook/CPUID 伪装/TSC 时间轴/时钟域/NPT 自我隐蔽 | M5 剩余/M6-M7 路线 | 读透明（TRANSPARENT）已实现并 E2E 毕业（v0.7d）；其余勿"顺手实现" |
+| PG 长浸泡 | 待办 | v0.7d 驻留 265s 无 0x109；1h+ 浸泡待做 |
+| 嵌套环境 #DB 投递失真 | 已知项 | TF 陷阱以 DR6.BS=0 投递；int 2E 窗口的 #DB 以"TF 已失"形态到达（走 'L' 收口而非 'I' 路径）——物理机应走 'I'；防线 2 已兜底验证 |
 | VMware 嵌套 SVM 特性失真 | 已知项 | 异常先物理机复现再定性 |
 | 拆分 PT 页不释放 | 交付语义 | 每视图每 2MB 区 1 页, 上限 16 区/树 |
 | 回调线程迁移 | 理论臂 | 每核 g_curHook 上下文, 嵌套实测未出现 'w' 留痕 |
@@ -378,7 +399,7 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 ## 13. 编码与提交规范
 
 - **编码铁律**：RL-28（.c/.h=UTF-8 BOM+CRLF，.asm=无 BOM+CRLF，全 GBK 可表示；工具改写后字节级验证）。
-- **代码注释**：中文；契约/不变式/判例教训写在紧邻代码处（§2/§3 的条目大多在源码有对应注释——修改行为时同步注释）。注释精简纪律：保留功能叙述、契约与硬件语义；过程故事进 NOTES.md，不进源码。
+- **代码注释**：中文；契约/不变式/判例教训写在紧邻代码处（§2/§3 的条目大多在源码有对应注释——修改行为时同步注释）。注释精简纪律：保留功能叙述、契约与硬件语义；修复史/过程叙述不进源码。
 - **每次代码改动**：同步 `GNPT_BUILD_TAG` + 日志判据（§10.2）。
 - **不引入**：运行时日志开关/注册表配置（静态签名风险）、任何"方便调试"的 exit 上下文阻塞调用、Intel 语义的想当然平移（RL-02）。
 
@@ -390,8 +411,8 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 - 给用户的报错清单里 "未找到 XXX 函数定义" = IntelliSense 噪音（不解析 .asm/跨翻译单元），**不是构建错误**；只看 ml64/cl/Link 退出码。
 - 期望输出：中文，先结论后细节，附行动清单。
 - 沙箱无编译器——笔误不可自愈，新增代码发布前 grep 核对标识符拼写。
-- /workspace 唯一持久区（关键代码必须保存在 /workspace，环境重置即清空）；传输走 4275.com 中转（tools/upload_4275.py / download_4275.sh）。
-- 里程碑状态与设计裁决全史：NOTES.md；会话恢复手册：HANDOFF.md。
+- /workspace 唯一持久区（关键代码必须保存在 /workspace，环境重置即清空）；传输走 4275.com 中转（tools/upload_4275.py / download_4275.sh——tools/ 已 gitignore，本地工具不入公开仓）。
+- 里程碑状态与设计裁决全史：本地私有判例库（NOTES.md/HANDOFF.md，均已 gitignore，不入公开仓——与 GeptHooks 仓库形态对齐）；仓库内的权威即本文档 + 源码注释。
 
 ---
 

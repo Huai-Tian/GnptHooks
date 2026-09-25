@@ -1,10 +1,11 @@
 ﻿#include"npt.h"
 #include"svm.h"
 
-//==================== NPT实例状态(双树, 全核共享) ====================
+//==================== NPT实例状态(四棵静态共享树) ====================
 #define NPT_POOL_TAG        'MemN'          //中性池tag
 #define NPT_COVER_LIMIT     0x8000000000ULL //512GB覆盖上限(对齐资源分配界)
-#define NPT_MAX_PAGES       1100            //页表页数组容量(两树514*2+拆分页)
+//页表页数组容量: 4树×514 + 拆分页(16区/树上限, 与条目上限匹配)
+#define NPT_MAX_PAGES       (514 * GNPT_VIEW_COUNT + 64)
 #define NPT_MAX_SPLITS      16              //每树最大拆分区数(2MB区)
 
 typedef struct _NPT_SPLIT
@@ -23,12 +24,13 @@ typedef struct _NPT_TREE
 	NPT_SPLIT Splits[NPT_MAX_SPLITS];
 } NPT_TREE, *PNPT_TREE;
 
+//树布局: [0]=P [1]=HOOKS [2]=HIDE [3]=EXEC(全核共享, 静态)
+static NPT_TREE  g_nptTree[GNPT_VIEW_COUNT];
 static PVOID     g_nptPages[NPT_MAX_PAGES];
 static ULONG     g_nptPageCount = 0;
 static ULONG64   g_nptCoverage = 0;
-static NPT_TREE  g_nptTree[2];              //[0]=Primary [1]=Secondary
 
-ULONG64 SvmNptViewNcr3(ULONG View) { return g_nptTree[View & 1].Ncr3; }
+ULONG64 SvmNptViewNcr3(ULONG View) { return g_nptTree[View & 3].Ncr3; }
 ULONG64 SvmNptCoverageBytes(VOID) { return g_nptCoverage; }
 ULONG SvmNptPageCount(VOID) { return g_nptPageCount; }
 
@@ -95,12 +97,13 @@ static BOOLEAN SvmNptBuildTree(PNPT_TREE Tree, ULONG64 Cover)
 	return TRUE;
 }
 
-//==================== 双树构建 ====================
-BOOLEAN SvmBuildDualNpt(PULONG64 Ncr3Out, PULONG64 CoverOut, PULONG PagesOut)
+//==================== 构建(四棵共享) ====================
+BOOLEAN SvmBuildNptViews(PULONG64 Ncr3Out,
+	PULONG64 CoverOut, PULONG PagesOut)
 {
 	if (Ncr3Out != NULL)
 	{
-		Ncr3Out[0] = Ncr3Out[1] = 0;
+		RtlZeroMemory(Ncr3Out, sizeof(ULONG64) * GNPT_VIEW_COUNT);
 	}
 	if (g_nptTree[0].Ncr3 != 0)
 	{
@@ -111,7 +114,7 @@ BOOLEAN SvmBuildDualNpt(PULONG64 Ncr3Out, PULONG64 CoverOut, PULONG PagesOut)
 	{
 		return FALSE;
 	}
-	for (ULONG t = 0; t < 2; t++)
+	for (ULONG t = 0; t < GNPT_VIEW_COUNT; t++)
 	{
 		if (!SvmNptBuildTree(&g_nptTree[t], cover))
 		{
@@ -122,8 +125,10 @@ BOOLEAN SvmBuildDualNpt(PULONG64 Ncr3Out, PULONG64 CoverOut, PULONG PagesOut)
 	g_nptCoverage = cover;
 	if (Ncr3Out != NULL)
 	{
-		Ncr3Out[0] = g_nptTree[0].Ncr3;
-		Ncr3Out[1] = g_nptTree[1].Ncr3;
+		for (ULONG t = 0; t < GNPT_VIEW_COUNT; t++)
+		{
+			Ncr3Out[t] = g_nptTree[t].Ncr3;
+		}
 	}
 	if (CoverOut != NULL)
 	{
@@ -195,26 +200,24 @@ static PULONG64 SvmNptLocatePte(PNPT_TREE Tree, ULONG64 Gpa)
 	return &pt[ptIdx];
 }
 
-PULONG64 SvmNptEnsureSplit(ULONG View, ULONG64 Gpa)
-{
-	return SvmNptLocatePte(&g_nptTree[View & 1], Gpa);
-}
-
+//把视图内gpa的4KB条目写为 Pa|Flags(现场拆分+置位)。
+//仅Install/Remove/临时RW调用——热路径零PTE写
 VOID SvmNptSetPte(ULONG View, ULONG64 Gpa, ULONG64 Pa, ULONG64 Flags)
 {
-	PULONG64 pte = SvmNptEnsureSplit(View, Gpa);
+	PULONG64 pte = SvmNptLocatePte(&g_nptTree[View & 3], Gpa);
 	if (pte != NULL)
 	{
 		*pte = (Pa & 0x000FFFFFFFFFF000ULL) | Flags;
 	}
 }
 
+//把视图内gpa的4KB条目恢复恒等(P|RW|US|A|D, 指回原物理页)
 VOID SvmNptRestoreIdentity(ULONG View, ULONG64 Gpa)
 {
 	SvmNptSetPte(View, Gpa, Gpa, NPT_PTE_FLAGS_LEAF4K_RWX);
 }
 
-//释放全部页表页(两树); 构建失败路径与卸载共用(幂等)
+//释放全部页表页(四棵); 构建失败路径与卸载共用(幂等)
 VOID SvmFreeNpt(VOID)
 {
 	for (ULONG i = 0; i < g_nptPageCount; i++)

@@ -1,8 +1,8 @@
-# GeptHooks source contract (README_AGENT.md RL-52):
+# GnptHooks source contract (继承GeptHooks 3edf7ee终态配方):
 # .c/.h = UTF-8 BOM, .asm = no BOM; kernel sources must check out as
-# CRLF on EVERY platform and git config (cl/ml64 break on stripped or
-# mixed endings). Repository stores them normalized (LF); eol=crlf
-# guarantees the checkout side.
+# CRLF on EVERY platform (cl/ml64 break on stripped or mixed endings).
+# Repository stores them normalized (LF); eol=crlf guarantees the
+# checkout side.
 *.c                text eol=crlf
 *.h                text eol=crlf
 *.asm              text eol=crlf

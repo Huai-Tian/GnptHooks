@@ -26,10 +26,13 @@ The redirection is performed purely by nested-page-table translation. The *Prima
   Declare the target's stack-argument count in `GNPT_HOOK.StackArgs` (up to 32); your callback receives a `StackArgs` pointer to the live arguments on the trigger stack — readable and **writable**, with modifications forwarded through `GnptCallOriginal`. No argument gaps when hooking multi-parameter kernel functions.
 
 - **Version-independent trampolines**
-  Trampolines are generated at runtime by an LDE relocation engine — per-instruction decode, RIP-relative fixups (±2 GB clamp), rejection of relative branches, and a CPU-view back-scan self-check before going live. No hardcoded prologues bound to one Windows build; unrelocatable prologues are rejected at install time.
+  Trampolines are generated at runtime by an LDE relocation engine — per-instruction decode, RIP-relative fixups (near targets re-based; targets beyond ±2 GB are rewritten to equivalent `mov reg, imm64` absolute loads, so no syscall-stub prologue is rejected for distance alone), rejection of relative branches, and a CPU-view back-scan self-check before going live. No hardcoded prologues bound to one Windows build; unrelocatable prologues are rejected at install time. An execution-grade unit test (`tests/test_reloc.c`, user-mode x64) runs generated trampolines on a real CPU to prove semantic equivalence.
 
 - **Write-transparency by construction**
   The Secondary view maps the hook page as read-only: any guest write to the page faults (NPF) and the engine forwards it to the Primary view, where the write lands on the real original page — hook bookkeeping pages stay coherent while callers never observe the shadow copy.
+
+- **TRANSPARENT mode: read-transparency for scanner-grade stealth**
+  Install with `HOOK_TRANSPARENT` and the engine arms **four static NPT views** (P / HOOKS / HIDE / EXEC, one ASID each — view switches are pure NCR3+ASID writes: zero PTE writes, zero TLB flushes). In the hiding state the hook page is simply *not present*: any external read (PatchGuard, scanners) faults and is served the **original bytes** through a single-step window — AMD has no MTF, so the engine injects TF, claims the #DB, and re-hides. Executing the target opens a one-instruction EXEC window that detours, then re-hides. A leak-defense net (per-exit window liveness check, permanent #DB intercept, interrupt-frame TF scrubbing) makes sure the single-step machinery can never surface a guest-visible #DB. Best for low-traffic targets — each stepped instruction costs 2 VM-Exits.
 
 - **Observability governed by build configuration**
   The whole observation stack (writer threads, binary event ring, BSOD black-box watchdog) is governed by the build type: **Debug builds = full observability** (authoritative log in `C:\Windows\Temp\gnpt_log.txt`, desktop mirror; if logging stalls for 30 s the watchdog deliberately bugchecks to capture a memory dump — a debugging aid, never part of a delivery build); **Release builds = zero logging code in the binary**. Deliberately no runtime/registry switch — a registry value is both a static signature an AV/EDR can flag and a footprint left on the target.
@@ -155,25 +158,27 @@ On unload, remove all hooks **before** SVM teardown (`GnptHookRemoveAll` — in-
 
 ## 🧪 Capability Verification Matrix
 
-Core paths verified on nested AMD SVM (2-core VMware guest, Windows 10 x64, v0.3c):
+Core paths verified on nested AMD SVM (VMware guest, Windows 10 x64) — base engine at v0.3c (2-core), single-step & stealth suite at v0.7d (4-core):
 
 | Capability | Measured evidence |
 |---|---|
-| All-core SVM takeover | 2 cores: per-core vmrun → probe self-certification ('W'/'Q' rings) → clean unload, stable across runs |
-| Dual-NPT build | 1028-page dual identity trees, 512 GB coverage, banner logs both NCR3 values |
-| Steady-state zero-exit interception | 26,081 NtClose hits; NPF exit counter constant at 2 (one per core) for the whole session |
-| NPF view-switch engine | Both cores switched to Secondary on first hooked fetch (error code 0x100000015 = P+ID bits, exactly the armed layout); no further NPF |
+| All-core SVM takeover | per-core vmrun → probe self-certification ('W'/'Q' rings) → clean unload, stable across runs (2-core and 4-core) |
+| Multi-view NPT build | Static identity trees (4 views), 512 GB coverage, banner logs all NCR3 values |
+| Steady-state zero-exit interception | 26,081 NtClose hits; NPF exit counter constant at one-per-core for the whole session |
+| NPF view-switch engine | Cores switched to the hook view on first hooked fetch (error code 0x100000015 = P+ID bits, exactly the armed layout); no further NPF |
 | Full detour control | Callback dispatch / CallOriginal / demo counter all confirmed via ring breadcrumbs ('V'/'H'/'h'/'O') |
-| Version-independent trampolines | LDE back-scan self-check passed; 22-byte relocated prologue for NtClose |
-| Clean removal | CodePage bytes restored + dual-view PTEs reverted to identity + all-core TLB sync; new hook hits stop immediately after Remove |
-| Atomic unload | Both cores STOP bridge with SVME read-back = 0; zero leaked cores; NPT pages fully released (1030 = 1028 + 2 split pages, accounting exact) |
+| Version-independent trampolines | LDE back-scan self-check passed; far RIP-relative targets (ZwPowerInformation stub) relocated via `mov reg, imm64` rewrite; execution-grade unit test all green |
+| TRANSPARENT read-transparency | v0.7d: ZwPowerInformation stub demo — 3 self-triggered + 17 real kernel callers (dwm/dxgkrnl path) intercepted; every external access served original bytes; zero guest-visible #DB |
+| Single-step window leak defenses | v0.7d: 265 s soak at ~680 step-windows/s (180k windows) all closed; leak crumbs ('L'/'D') self-healed with zero system impact; r70/r41 exit ratio ~0.11 (vs. 0.8 storm before the fix) |
+| Clean removal | CodePage bytes restored + view PTEs reverted to identity + all-core TLB sync; new hook hits stop immediately after Remove |
+| Atomic unload | All cores STOP bridge with SVME read-back = 0; zero leaked cores; NPT pages fully released (accounting exact) |
 | Release delivery form | Log-free build compiles clean (Fl\* macros collapse to no-ops) |
 
 Physical-hardware final verification (NPF-counter criteria, ASID no-flush switching) is on the roadmap — see Project Status.
 
 ## ⚠️ Project Status
 
-Milestones M0 (skeleton + observation stack), M1 (SVM world switch), M2 (NPT identity mapping) and M3 (dual-NPT hook engine) have graduated from staged testing **on nested virtualization**. Remaining milestones: M4 single-step primitives, M5 concealment suite (CPUID / TSC timeline / SVM instruction face / NPT self-hiding), M6 clock domains, M7 root hardening + release. The framework is research-grade: a hypervisor-level bug may still bugcheck the system — always test on a disposable machine.
+Milestones M0 (skeleton + observation stack), M1 (SVM world switch), M2 (NPT identity mapping), M3 (dual-NPT hook engine), M4 (TF+#DB single-step primitives) and M5 (four-view TRANSPARENT stealth suite with leak defenses) have graduated from staged testing **on nested virtualization** — the v0.7d build passed a full end-to-end run: 20 real interceptions over a 265 s soak, every single-step window closed, clean unload with zero leaked cores. Remaining: long-duration PatchGuard soak, physical-hardware final verification, M6 clock domains, M7 root hardening + release. The framework is research-grade: a hypervisor-level bug may still bugcheck the system — always test on a disposable machine.
 
 ## 🚫 Non-Commercial Statement
 

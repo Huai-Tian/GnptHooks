@@ -9,7 +9,7 @@ volatile LONG g_gnptParkedMask = 0;    //shutdown park核位掩码(bit i=cpu i)
 GNPT_VCPU_SVM g_svmVcpu[64];           //每核SVM引擎态(BSS清零)
 ULONG64 g_svmFeatBits = 0;             //Fn8000_000A_EDX特性快照(降级决策)
 KEVENT g_svmShutdownEvent;             //卸载广播(通知事件: 一次唤醒全部发起线程)
-static ULONG64 g_svmNcr3 = 0;          //Primary视图NCR3(SvmBuildDualNpt返回; Secondary经SvmNptViewNcr3)
+static ULONG64 g_svmNcr3 = 0;          //P视图NCR3(SvmBuildNptViews返回; 其余视图经SvmNptViewNcr3)
 
 //SVM可用性三态判定(APM §15.4):
 //  0=可用 1=CPU无SVM 2=BIOS禁且不可解锁 3=BIOS禁但有SVM_KEY可能
@@ -133,6 +133,9 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	__svm_vmsave((void*)(ULONG_PTR)Vcpu->VmcbPa);    //参数=VMCB物理地址(按指针值传递, MSVC契约)
 	//---- 拦截配置(最小集; INTR不拦=中断直通) ----
 	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID;    //0x72观测采样
+	//#DB拦截常驻: 单步窗口外的任何#DB=残余TF泄漏→
+	//guest可见=0x3B/0x1E致命; 常驻+IDLE吞+清TF=最后一道网
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB;
 	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;  //VMRUN位强制(一致性检查)+VMMCALL拦截
 	vmcb->Control.IopmBasePa = Vcpu->IopmPa;     //位图全0=不拦任何端口
 	vmcb->Control.MsrpmBasePa = Vcpu->MsrpmPa;   //位图全0=不拦任何MSR
@@ -297,20 +300,22 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		FlLog("[Entry] NP=0(处理器无嵌套分页), 拒绝接管");
 		return STATUS_NOT_SUPPORTED;
 	}
-	//NPT双视图构建(全核共享单实例, 先于每核资源分配):
-	//Primary=常态(取指NPF切换), Secondary=hook(CodePage可执行)
+	//NPT四视图构建(静态共享树, 先于每核资源分配):
+	//P=常态 / HOOKS=常规驻留 / HIDE=TRANSPARENT潜伏 / EXEC=执行窗口
 	{
-		ULONG64 ncr3[2] = { 0, 0 };
+		ULONG64 ncr3[GNPT_VIEW_COUNT] = { 0, 0, 0, 0 };
 		ULONG nptPages = 0;
 		ULONG64 nptCover = 0;
-		if (!SvmBuildDualNpt(ncr3, &nptCover, &nptPages))
+		if (!SvmBuildNptViews(ncr3, &nptCover, &nptPages))
 		{
-			FlLog("[Entry] NPT双视图构建失败(内存不足?), 拒绝接管");
+			FlLog("[Entry] NPT四视图构建失败(内存不足?), 拒绝接管");
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
 		g_svmNcr3 = ncr3[GNPT_VIEW_PRIMARY];
-		FlLog("NPT: 双视图就绪(%u页, 覆盖%lluGB, Primary=%llX Secondary=%llX)",
-			nptPages, nptCover >> 30, ncr3[0], ncr3[1]);
+		FlLog("NPT: 四视图就绪(%u页, 覆盖%lluGB, P=%llX HOOKS=%llX HIDE=%llX EXEC=%llX)",
+			nptPages, nptCover >> 30,
+			ncr3[GNPT_VIEW_PRIMARY], ncr3[GNPT_VIEW_SECONDARY],
+			ncr3[GNPT_VIEW_HIDE], ncr3[GNPT_VIEW_EXEC]);
 	}
 	//每核资源预分配(VMCB/HSAVE 4KB, IOPM 12KB, MSRPM 8KB, VMM栈16KB)
 	for (ULONG i = 0; i < cpuCount; i++)
@@ -454,6 +459,11 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 	Regs->rsp = vmcb->State.Rsp;
 	//上轮注入清场: 不依赖硬件对EVENTINJ.V自动清(每exit一条u64写)
 	vmcb->Control.EventInj = 0;
+	//上轮TLB action清场: VMRUN只读不清TLB_CONTROL(§15.16原文), 置3
+	//不清零=此后每轮vmrun都flush(必须每exit清零)。
+	//免flush切换由ASID配对承载, 置3仅限NPT内容变化路径(Install/Remove/
+	//临时RW), 见hook.c HookSwitchView
+	vmcb->Control.TlbControl = 0;
 	ULONG64 exitCode = vmcb->Control.ExitCode;
 	//负值族(VMEXIT_INVALID等): vmrun一致性失败——'R'环留痕+手动return桥
 	//(探针帧: [RSP+0xA8]=CmSvmEnter返回地址, +0xB0=返回后调用者栈基)
@@ -469,6 +479,10 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 		return 1;
 	}
 	FlRingExit(cpu, (ULONG)exitCode, vmcb->State.Rip, vmcb->Control.ExitInfo1);
+	//单步窗口泄漏防御: armed而guest TF已失=窗口死亡
+	//(步进指令为syscall/sysret/iret类清TF指令, #DB永不到达)→
+	//拦截位+EXEC视图永久泄漏=全系统pushf/popf风暴+guest破坏
+	GnptHookStepLeakCheck(vmcb, cpu);
 	switch ((ULONG)exitCode)
 	{
 		case SVM_EXIT_VMMCALL:    //0x81: 探针/KEEP/STOP桥+签名门
@@ -567,9 +581,9 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				return 0;
 			}
 			//IDLE残余#DB: 一律吞掉不注入。注入回guest无调试接手
-			//=0x1E(M4.8/M4.9两判例实证, RIP=注入点fault语义)。
-			//引擎设计上guest不合法持有TF(注入TF只在armed窗口内),
-			//此形态=多核窗口撕裂竞态残余, 'D'采样留痕观察
+			//=0x1E; guest可见#DB=0x3B——
+			//#DB拦截常驻: 此处=最后一道网, 吞+清TF自愈。
+			//残留窗口位一并解除(LeakCheck已收口, 此为双保险)
 			static volatile LONG s_dbIdleCnt[64] = { 0 };
 			LONG dbn = InterlockedIncrement(&s_dbIdleCnt[cpu & 63]);
 			if (dbn == 1 || (dbn & 0xFF) == 0)
@@ -577,6 +591,8 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				FlRingPush('D', cpu, SVM_EXIT_EXCP_DB,
 					vmcb->State.Rip, vmcb->State.Dr6, 0);
 			}
+			vmcb->Control.InterceptMisc1 &= ~(INTERCEPT_PUSHF | INTERCEPT_POPF);
+			vmcb->State.Rflags &= ~(1ULL << 8);    //清残余TF(自愈终结churn)
 			return 0;    //不推RIP(trap语义RIP已下一条)
 		}
 		case SVM_EXIT_PUSHF:    //0x70: 单步窗口PUSHF仿真(EFLAGS影子)
@@ -585,7 +601,11 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			{
 				return 0;
 			}
-			SvmAdvanceRip(vmcb);    //非窗口(理论不可达): 推进防原地死循环
+			//非窗口=拦截位泄漏: 解除窗口位+重执行原指令。
+			//推进=跳过pushfq的压栈效应=guest标志/栈大面积
+			//破坏(0x1E级)。fault语义不推RIP
+			//#DB拦截常驻不动
+			vmcb->Control.InterceptMisc1 &= ~(INTERCEPT_PUSHF | INTERCEPT_POPF);
 			return 0;
 		}
 		case SVM_EXIT_POPF:    //0x71: 单步窗口POPF仿真(保注入TF)
@@ -594,7 +614,9 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			{
 				return 0;
 			}
-			SvmAdvanceRip(vmcb);    //非窗口(理论不可达): 推进防原地死循环
+			//非窗口=拦截位泄漏: 同0x70——解除窗口位+重执行,
+			//绝不跳过popfq的弹栈/标志效应。#DB拦截常驻不动
+			vmcb->Control.InterceptMisc1 &= ~(INTERCEPT_PUSHF | INTERCEPT_POPF);
 			return 0;
 		}
 		default:    //未知exit: 计数留痕(FlRingExit兜底限流)+推进(观察语义)

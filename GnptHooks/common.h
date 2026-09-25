@@ -118,11 +118,15 @@ typedef struct _GNPT_RING_ENTRY
 //  i=NPTSYNC每核TLB同步确认(rsn=0x81, 安装/移除布防面包屑)
 //  V=NPT视图切换采样(a=视图 b=每核计数) H=detour分发入口(a=目标)
 //  O=CallOriginal入口(a=重定位跳板) N=NPF留痕(rsn=0x400, a=gpa, b=错误码)
-//  h=hook命中采样(用户回调发出, b=辅助参数) w=CallOriginal误用警告(非回调上下文)
-//  s=单步arm(rsn=用途1读透明/2临时RW, b=hook条目; M4读透明链起点)
-//  e=单步#DB收尾(rsn=用途, b=0=ours清TF/1=guest注入回; M4链终点)
+//  h=hook命中采样(用户回调发出, rsn=Arg1低32位, a=命中计数) w=CallOriginal误用警告(非回调上下文)
+//  s=单步arm(rsn=用途1读透明/2临时RW/3REHIDE, a=hook条目, b=采样计数; 读透明链起点)
+//  e=单步#DB收尾(rsn=用途, a=0(BS=1 TF引发)/1(BS=0 Dr断点抢入), b=计数; 链终点)
 //  b=EXITINTINFO.V=1重放(guest事件递送途中被拦, a=EXITINTINFO值)
 //  P=pushf仿真(窗口内) p=popf仿真(窗口内)
+//  L=单步窗口泄漏收口(rsn=用途 a=RIP b=RFLAGS——armed而TF已失,
+//    清TF类指令把窗口卡死, 防御体系按use收尾)
+//  I=INTn步进帧清洗(a=RIP b=帧内RFLAGS清洗后值——int压入活
+//    RFLAGS含注入TF, 不清则handler iret弹回=TF复活)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -209,7 +213,7 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.4g"
+#define GNPT_BUILD_TAG "v0.7e"
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 
 #ifdef __cplusplus

@@ -53,16 +53,18 @@ typedef struct _GNPT_HOOK
 	ULONG StackArgs;           //目标函数第5+栈参数个数(0=不转发;
 	                          //>0时回调收StackArgs指针+CallOriginal
 	                          //自动转发; 超上限Install拒绝)
-	ULONG Flags;               //位0=HOOK_TRANSPARENT: CodePage全权
-	                          //模式(S视图驻留: detour零切换零exit;
-	                          //取指/写均落CodePage; 见hook.c/npt.h)
+	ULONG Flags;               //位0=HOOK_TRANSPARENT: 读透明模式
+	                          //(潜伏P=0+执行窗口翻转, PG/扫描器读
+	                          //=原始字节; 每指令2exit只适合低频
+	                          //目标; 见hook.c/npt.h)
 } GNPT_HOOK, *PGNPT_HOOK;
 
 //hook模式标志(Flags位)
-#define HOOK_TRANSPARENT        0x1   //CodePage全权(EXEC常驻P|RW):
-                                       //核切S后长期驻留, detour零成本;
-                                       //读hooked页=见CodePage(含跳转码,
-                                       // NPT无read-deny, 读透明未实现)
+#define HOOK_TRANSPARENT        0x1   //读透明: 每核S副本潜伏P=0,
+                                       //取指→执行窗口(#DB复位潜伏);
+                                       //外部读→切P读原始字节。
+                                       //低频目标专用(高频=NtClose式
+                                       //每指令2exit风暴)
 
 //安装hook(PASSIVE_LEVEL, 引擎运行中): CodePage构建+双NPT视图布防
 //+全核TLB同步(布防即刻生效)
@@ -90,10 +92,14 @@ VOID GnptHookFreeMemory(VOID);
 BOOLEAN GnptHookNpfEngine(struct _VMCB* Vmcb, ULONG Cpu,
 	ULONG64 ExitInfo1, ULONG64 ExitInfo2);
 
-//TF+#DB单步原语(M4读透明基础件): svm.c的0x41/0x70/0x71三case入口。
+//TF+#DB单步原语(读透明基础件): svm.c的0x41/0x70/0x71三case入口。
 //返回TRUE=已处理(重入guest); FALSE=非单步窗口(svm.c防御留痕)
 BOOLEAN GnptHookStepDbExit(struct _VMCB* Vmcb, ULONG Cpu);
 BOOLEAN GnptHookStepEmuPushf(struct _VMCB* Vmcb, ULONG Cpu);
 BOOLEAN GnptHookStepEmuPopf(struct _VMCB* Vmcb, ULONG Cpu);
+
+//单步窗口泄漏防御收口: svm.c每exit首查——armed而guest TF
+//已失(清TF类指令使#DB永不到达)=拦截位+视图泄漏, 统一收尾
+VOID GnptHookStepLeakCheck(struct _VMCB* Vmcb, ULONG Cpu);
 
 #endif // HOOK_H

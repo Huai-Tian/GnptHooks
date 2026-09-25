@@ -350,7 +350,7 @@ static unsigned char flags_table_ex[256] =
     /* 0F1C */    OP_INVALID,
     /* 0F1D */    OP_INVALID,
     /* 0F1E */    OP_INVALID,
-    /* 0F1F */    OP_NONE,
+    /* 0F1F */    OP_MODRM,     //NOP r/m*(multi-byte NOP, 需modrm; 原OP_NONE致2B错切=跳板错位崩)
 
     /* 0F20 */    OP_MODRM,
     /* 0F21 */    OP_MODRM,
