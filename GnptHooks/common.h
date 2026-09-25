@@ -119,6 +119,10 @@ typedef struct _GNPT_RING_ENTRY
 //  V=NPT视图切换采样(a=视图 b=每核计数) H=detour分发入口(a=目标)
 //  O=CallOriginal入口(a=重定位跳板) N=NPF留痕(rsn=0x400, a=gpa, b=错误码)
 //  h=hook命中采样(用户回调发出, b=辅助参数) w=CallOriginal误用警告(非回调上下文)
+//  s=单步arm(rsn=用途1读透明/2临时RW, b=hook条目; M4读透明链起点)
+//  e=单步#DB收尾(rsn=用途, b=0=ours清TF/1=guest注入回; M4链终点)
+//  b=EXITINTINFO.V=1重放(guest事件递送途中被拦, a=EXITINTINFO值)
+//  P=pushf仿真(窗口内) p=popf仿真(窗口内)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -205,7 +209,7 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.3c"
+#define GNPT_BUILD_TAG "v0.4g"
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 
 #ifdef __cplusplus

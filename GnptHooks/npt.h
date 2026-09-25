@@ -6,7 +6,10 @@
 //嵌套页表(NPT)双视图恒等映射: gpa->spa 1:1, AMD APM §15.25。
 //  Primary  = 常态视图: 全恒等2MB大页; hooked页拆4KB后置NX
 //             (数据读写正常, 取指NPF触发切换)
-//  Secondary= hook视图: 全恒等; hooked页改指CodePage(可执行)
+//  Secondary= hook视图: 全恒等RWX(驻留视图: 取指detour/回调/
+//             CallOriginal/后续执行全速零exit); hooked页改指
+//             CodePage。TRANSPARENT下核取指fault切S后**长期驻留**,
+//             detour=零切换成本(M4.12)
 //两树全核共享(单实例), 每核VMCB按当前视图选择NCR3/ASID。
 
 #ifdef __cplusplus
@@ -31,7 +34,12 @@ extern "C" {
 #define NPT_PTE_FLAGS_HOOKP      (NPT_PTE_FLAGS_LEAF4K_RWX | NPT_PTE_NX)
 //Secondary的hooked页: CodePage只读可执行(写触发NPF回Primary转发)
 #define NPT_PTE_FLAGS_HOOKS      (NPT_PTE_P | NPT_PTE_US | \
-                                  NPT_PTE_A | NPT_PTE_D)
+                                   NPT_PTE_A | NPT_PTE_D)
+//TRANSPARENT的hooked页(Secondary): EXEC常驻=CodePage全权(P|RW)。
+//S视图驻留形态: detour零切换; 读者(同核)读hooked页=见CodePage
+//(含跳转码)——NPT无read-deny位, **读透明如实降级为未实现**,
+//真读透明留M5 per-CPU NPT+ASID免flush后的P=0方案(M4.12)
+#define NPT_PTE_FLAGS_HOOKT_EXEC  NPT_PTE_FLAGS_LEAF4K_RWX
 
 //视图标识与固定ASID配对(ASID=0保留host, §15.25.1)
 #define GNPT_VIEW_PRIMARY      0

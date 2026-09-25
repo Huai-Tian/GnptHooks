@@ -61,6 +61,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	FlMarkEntryDone();
 
 	//示例hook: NtClose(单寄存器参数; 系统高频路径=双NPT视图切换引擎压力面)
+	//TRANSPARENT=1: 读透明模式(M4.6——db/PG只见原始字节, 每命中2exit)
 	{
 		GNPT_HOOK demo = { 0 };
 		UNICODE_STRING name;
@@ -69,6 +70,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 		demo.Callback = DemoNtCloseHook;
 		demo.Context = NULL;
 		demo.StackArgs = 0;
+		demo.Flags = HOOK_TRANSPARENT;
 		NTSTATUS hst = GnptHookInstall(&demo);
 		FlLog("[Entry] NtClose示例hook安装%s(目标=%p)",
 			NT_SUCCESS(hst) ? "成功" : "失败", demo.Target);

@@ -53,7 +53,16 @@ typedef struct _GNPT_HOOK
 	ULONG StackArgs;           //目标函数第5+栈参数个数(0=不转发;
 	                          //>0时回调收StackArgs指针+CallOriginal
 	                          //自动转发; 超上限Install拒绝)
+	ULONG Flags;               //位0=HOOK_TRANSPARENT: CodePage全权
+	                          //模式(S视图驻留: detour零切换零exit;
+	                          //取指/写均落CodePage; 见hook.c/npt.h)
 } GNPT_HOOK, *PGNPT_HOOK;
+
+//hook模式标志(Flags位)
+#define HOOK_TRANSPARENT        0x1   //CodePage全权(EXEC常驻P|RW):
+                                       //核切S后长期驻留, detour零成本;
+                                       //读hooked页=见CodePage(含跳转码,
+                                       // NPT无read-deny, 读透明未实现)
 
 //安装hook(PASSIVE_LEVEL, 引擎运行中): CodePage构建+双NPT视图布防
 //+全核TLB同步(布防即刻生效)
@@ -80,5 +89,11 @@ VOID GnptHookFreeMemory(VOID);
 //(svm.c按异常留痕)。ExitInfo1/2=VMCB EXITINFO1/2
 BOOLEAN GnptHookNpfEngine(struct _VMCB* Vmcb, ULONG Cpu,
 	ULONG64 ExitInfo1, ULONG64 ExitInfo2);
+
+//TF+#DB单步原语(M4读透明基础件): svm.c的0x41/0x70/0x71三case入口。
+//返回TRUE=已处理(重入guest); FALSE=非单步窗口(svm.c防御留痕)
+BOOLEAN GnptHookStepDbExit(struct _VMCB* Vmcb, ULONG Cpu);
+BOOLEAN GnptHookStepEmuPushf(struct _VMCB* Vmcb, ULONG Cpu);
+BOOLEAN GnptHookStepEmuPopf(struct _VMCB* Vmcb, ULONG Cpu);
 
 #endif // HOOK_H

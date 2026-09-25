@@ -560,6 +560,43 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				vmcb->Control.ExitInfo2, vmcb->Control.ExitInfo1, 0);
 			return 0;    //fault语义: 不推RIP(FlRingExit计数+限流兜底)
 		}
+		case SVM_EXIT_EXCP_DB:    //0x41: 单步窗口#DB认领(IDLE残余=吞)
+		{
+			if (GnptHookStepDbExit(vmcb, cpu))
+			{
+				return 0;
+			}
+			//IDLE残余#DB: 一律吞掉不注入。注入回guest无调试接手
+			//=0x1E(M4.8/M4.9两判例实证, RIP=注入点fault语义)。
+			//引擎设计上guest不合法持有TF(注入TF只在armed窗口内),
+			//此形态=多核窗口撕裂竞态残余, 'D'采样留痕观察
+			static volatile LONG s_dbIdleCnt[64] = { 0 };
+			LONG dbn = InterlockedIncrement(&s_dbIdleCnt[cpu & 63]);
+			if (dbn == 1 || (dbn & 0xFF) == 0)
+			{
+				FlRingPush('D', cpu, SVM_EXIT_EXCP_DB,
+					vmcb->State.Rip, vmcb->State.Dr6, 0);
+			}
+			return 0;    //不推RIP(trap语义RIP已下一条)
+		}
+		case SVM_EXIT_PUSHF:    //0x70: 单步窗口PUSHF仿真(EFLAGS影子)
+		{
+			if (GnptHookStepEmuPushf(vmcb, cpu))
+			{
+				return 0;
+			}
+			SvmAdvanceRip(vmcb);    //非窗口(理论不可达): 推进防原地死循环
+			return 0;
+		}
+		case SVM_EXIT_POPF:    //0x71: 单步窗口POPF仿真(保注入TF)
+		{
+			if (GnptHookStepEmuPopf(vmcb, cpu))
+			{
+				return 0;
+			}
+			SvmAdvanceRip(vmcb);    //非窗口(理论不可达): 推进防原地死循环
+			return 0;
+		}
 		default:    //未知exit: 计数留痕(FlRingExit兜底限流)+推进(观察语义)
 			SvmAdvanceRip(vmcb);
 			return 0;

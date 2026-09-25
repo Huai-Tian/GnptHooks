@@ -48,6 +48,8 @@ extern "C" {
 //Misc2 (+0x010):
 #define INTERCEPT_VMRUN         (1UL << 0)    //一致性检查强制置位
 #define INTERCEPT_VMMCALL       (1UL << 1)
+//InterceptException (+0x008): 向量0-31按位(M4单步窗口用)
+#define EXCP_INTERCEPT_DB       (1UL << 1)    //#DB(TF单步认领; APM页855 DR6.BS=bit14)
 #define INTERCEPT_VMLOAD        (1UL << 2)
 #define INTERCEPT_VMSAVE        (1UL << 3)
 #define INTERCEPT_STGI          (1UL << 4)
