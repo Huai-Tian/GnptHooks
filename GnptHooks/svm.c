@@ -143,8 +143,10 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//---- 嵌套分页布线: NP启用+NCR3(§15.25.3) ----
 	vmcb->Control.NpEnable |= NP_ENABLE_NP;
 	vmcb->Control.NCr3 = g_svmNcr3;
-	//TscOffset/TlbControl/EventInj/VmcbClean=0(分配时已清零; clean bits全0
-	//=vmrun全字段从VMCB加载, 正确性优先, 性能项待定案环境评估)
+	//TlbControl/EventInj/VmcbClean=0(分配时已清零; clean bits全0
+	//=vmrun全字段从VMCB加载, 正确性优先, 性能项待定案环境评估)。
+	//TscOffset=0起步=M6时间轴补偿基线(SvmExitHandler壳每exit负向
+	//累计; clean bit0覆盖TSC offset, 全dirty形态保证每轮vmrun重载)
 }
 
 //==================== 每核发起线程 ====================
@@ -193,7 +195,13 @@ static VOID SvmVcpuThread(PVOID Context)
 	ULONG svmeBack = (ULONG)((__readmsr(MSR_EFER) >> 12) & 1);
 	Vcpu->base.bSvmOn = 0;
 	Vcpu->base.bInGuest = 0;
-	FlLog("SVM: 核%u已去虚拟化(STOP桥返回, SVME回读=%u)", idx, svmeBack);
+	//M6时间轴补偿留痕: offset终值(负值, 绝对值=本核会话root驻留
+	//累计扣除量)。't'环事件(offset lo32/hi32)=补偿循环全程在跑的铁证
+	PVMCB vmcbFinal = (PVMCB)Vcpu->VmcbVa;
+	FlRingPush('t', idx, (ULONG)vmcbFinal->Control.TscOffset,
+		vmcbFinal->Control.TscOffset >> 32, 0, 0);
+	FlLog("SVM: 核%u已去虚拟化(STOP桥返回, SVME回读=%u, TSC补偿累计%llu ticks)",
+		idx, svmeBack, 0ULL - vmcbFinal->Control.TscOffset);
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -446,10 +454,10 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 	return TRUE;
 }
 
-//==================== exit handler(asm调用, GIF=0上下文) ====================
+//==================== exit分派(SvmExitHandler壳内调用, GIF=0上下文) ====================
 //纪律: 全程GIF=0——只FlRingPush/FlRingExit/VMCB写/静态计数, 勿FlLog/睡眠。
 //返回0=vmrun重入guest; 非0=STOP(asm CmSvmStop: 桥经易失r10/r11槽, 非易失全保真)
-ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
+static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 {
 	PVMCB vmcb = (PVMCB)Vcpu->VmcbVa;
 	ULONG cpu = (ULONG)(UCHAR)Vcpu->CpuIndex;
@@ -626,4 +634,64 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 	//内层白名单收窄后不可达; 兜底=推进(保守)
 	SvmAdvanceRip(vmcb);
 	return 0;
+}
+
+//==================== exit handler外壳(asm调用, GIF=0上下文) ====================
+//M6时间轴补偿壳(v0.8b全局水位形态): guest读TSC(RDTSC/RDTSCP直通
+//零exit)=物理TSC+VMCB.TscOffset(硬件加, §15.10控制区语义+App.B
+//"to be added in RDTSC and RDTSCP")。本壳把每次#VMEXIT的root驻留
+//时长从guest时间线扣除——guest时间线上"exit从未发生"。
+//
+//v0.8a判例(事故): 每核独立负向累计=跨核偏差无界增长——31s内热核
+//(单步窗口风暴19K exits/s)滞后9ms、冷核0.09ms, 线程迁移即遭遇
+//最高9ms的RDTSC倒退; Windows裸rdtsc使用者(GPU驱动/DWM栈)依赖
+//跨核同步契约→UI饥饿+DWM重启循环。借阅[GeptHooks]跨核跳变审计
+//结论时未重推导前提(其前提=稳态零exit, 本架构=持续非对称exit流)。
+//
+//v0.8b: 全局虚拟时间线水位g_svmTscWm(单调只升, cmpxchg免锁max)。
+//每exit三步: ①扣驻留(本核单调性保持: 扣除窗[T0,T1]含于真实不可
+//见窗, 相邻guest读间扣除总和≤物理差→本核永不倒退) ②virt对水位
+//做max提升 ③落后水位>ε则前跳重挂共享时间线。效果: 热核不再自己
+//累积滞后, 而是从全局(实际=最冷核)时间线借时——跨核发散从
+//"无界永久"变为"有界瞬态"(≈水位两次推进间他核扣除量+ε,
+//活跃集内≈ε)。前跳=单调安全方向。
+//残余(接受并记录): 共享时间线整体滞后物理=最冷核累计驻留(均匀
+//不可分核); 钳制成本按欠补偿方向泄漏(亚μs/s级)。
+//STOP路径不补偿(无vmrun, offset此后不再作用于本核)。
+#define GNPT_TSC_CC_EPS  1024    //跨核钳制余量(ticks, ≈320ns@3.2GHz P0)
+static volatile LONG64 g_svmTscWm = 0;   //全局虚拟TSC水位(单调只升)
+ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
+{
+	Vcpu->ExitTsc = __rdtsc();              //T0: root驻留起点
+	ULONG stop = SvmExitDispatch(Vcpu, Regs);
+	if (stop == 0)
+	{
+		PVMCB vmcb = (PVMCB)Vcpu->VmcbVa;
+		ULONG64 t1 = __rdtsc();             //T1: root驻留终点
+		vmcb->Control.TscOffset -= t1 - Vcpu->ExitTsc;
+		//本核此刻虚拟读数(mod 2^64; 负offset自然回绕)
+		ULONG64 virt = t1 + vmcb->Control.TscOffset;
+		//水位提升(cmpxchg自旋max; 败者以最新值重判)
+		if (virt > (ULONG64)g_svmTscWm)
+		{
+			ULONG64 cmp = (ULONG64)g_svmTscWm;
+			while (virt > cmp)
+			{
+				ULONG64 prev = (ULONG64)_InterlockedCompareExchange64(
+					&g_svmTscWm, (LONG64)virt, (LONG64)cmp);
+				if (prev == cmp)
+				{
+					break;    //提升成功
+				}
+				cmp = prev;
+			}
+		}
+		//跨核钳制: 落后共享时间线>ε→前跳重挂(单调安全, 仅写本核VMCB)
+		ULONG64 w = (ULONG64)g_svmTscWm;    //提升后新鲜读(单调量免锁)
+		if (w - virt > GNPT_TSC_CC_EPS)
+		{
+			vmcb->Control.TscOffset += (w - virt) - GNPT_TSC_CC_EPS;
+		}
+	}
+	return stop;
 }

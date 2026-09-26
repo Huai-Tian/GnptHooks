@@ -127,6 +127,8 @@ typedef struct _GNPT_RING_ENTRY
 //    清TF类指令把窗口卡死, 防御体系按use收尾)
 //  I=INTn步进帧清洗(a=RIP b=帧内RFLAGS清洗后值——int压入活
 //    RFLAGS含注入TF, 不清则handler iret弹回=TF复活)
+//  t=TSC时间轴补偿终值(卸载留痕, rsn=offset低32位, a=offset高32位
+//    ——负值累计量=本核会话root驻留总扣除, 补偿循环活性铁证)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -213,7 +215,7 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.7e"
+#define GNPT_BUILD_TAG "v0.8b"
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 
 #ifdef __cplusplus

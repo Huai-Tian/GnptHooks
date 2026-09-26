@@ -177,6 +177,8 @@ typedef struct _GNPT_VCPU_SVM
 	PVOID ThreadObj;               //+0x68
 	CHAR CpuIndex;                 //+0x70
 	CHAR Pad[7];
+	ULONG64 ExitTsc;               //+0x78 C专用(asm不引用): #VMEXIT入口
+	                               //TSC样本(时间轴补偿T0, SvmExitHandler壳)
 } GNPT_VCPU_SVM, *PGNPT_VCPU_SVM;
 
 extern GNPT_VCPU_SVM g_svmVcpu[64];
