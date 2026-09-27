@@ -2,6 +2,7 @@
 #include"vmcb.h"
 #include"npt.h"
 #include"hook.h"
+#include"msr.h"
 
 //==================== 常驻全局 ====================
 volatile LONG g_gnptVcpuCpu = -1;      //观测锚点核(-1=未启动)
@@ -133,6 +134,10 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	__svm_vmsave((void*)(ULONG_PTR)Vcpu->VmcbPa);    //参数=VMCB物理地址(按指针值传递, MSVC契约)
 	//---- 拦截配置(最小集; INTR不拦=中断直通) ----
 	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID;    //0x72观测采样
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_MSR_PROT;  //MSRPM生效总开关
+	                                   //(M7.1 API面; 位图全0=零exit,
+	                                   //开关在位图; 范围外MSR自动exit
+	                                   //→0x7C case真值回放兜底)
 	//#DB拦截常驻: 单步窗口外的任何#DB=残余TF泄漏→
 	//guest可见=0x3B/0x1E致命; 常驻+IDLE吞+清TF=最后一道网
 	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB;
@@ -559,10 +564,57 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 		{
 			int info[4] = { 0 };
 			__cpuidex(info, (int)Regs->rax, (int)Regs->rcx);
+			//RAX走VMCB(asm契约: 帧rax槽恢复时跳过, vmrun从VMCB
+			//加载——写Regs->rax无效; v0.9b判例: M1以来EAX未达guest)
+			vmcb->State.Rax = (ULONG64)(ULONG)info[0];
 			Regs->rax = (ULONG64)(ULONG)info[0];
 			Regs->rbx = (ULONG64)(ULONG)info[1];
 			Regs->rcx = (ULONG64)(ULONG)info[2];
 			Regs->rdx = (ULONG64)(ULONG)info[3];
+			SvmAdvanceRip(vmcb);
+			return 0;
+		}
+		case SVM_EXIT_MSR:    //0x7C: MSR拦截API面(M7.1)
+		{
+			//EXITINFO1 bit0=0读/1写(位义见msr.h); MSR号在ECX。
+			//hook命中→回调(读=伪造值/写=放行或静默丢弃); 未hook
+			//(位图竞态/范围外MSR自动exit)→真值回放=裸机等价
+			ULONG32 msr = (ULONG32)Regs->rcx;
+			BOOLEAN isWrite = ((vmcb->Control.ExitInfo1 & 1) != 0);
+			{
+				static volatile LONG s_msrCnt[64] = { 0 };
+				LONG mn = InterlockedIncrement(&s_msrCnt[cpu & 63]);
+				if (mn == 1 || (mn & 0xFFF) == 0)
+				{
+					FlRingPush('m', cpu, SVM_EXIT_MSR,
+						msr, (ULONG64)(ULONG)isWrite, (ULONG64)mn);
+				}
+			}
+			if (isWrite)
+			{
+				ULONG64 val = (ULONG64)(ULONG)Regs->rax |
+					((ULONG64)(ULONG)Regs->rdx << 32);
+				if (!GnptMsrDispatchWrite(msr, val))
+				{
+					SvmAdvanceRip(vmcb);
+					return 0;    //回调拒绝: 静默丢弃(guest认为写成功)
+				}
+				__writemsr(msr, val);    //放行代写(root真写)
+			}
+			else
+			{
+				ULONG64 val = 0;
+				if (!GnptMsrDispatchRead(msr, &val))
+				{
+					val = __readmsr(msr);    //未hook真值回放
+				}
+				//RAX=低32走VMCB(asm契约: 帧rax槽vmrun时被VMCB.RAX
+				//覆盖——v0.9a判例: 低32停留在rdmsr时刻线程EAX);
+				//RDX=高32是帧GPR正常路径
+				vmcb->State.Rax = val & 0xFFFFFFFFULL;
+				Regs->rax = val & 0xFFFFFFFFULL;
+				Regs->rdx = val >> 32;
+			}
 			SvmAdvanceRip(vmcb);
 			return 0;
 		}

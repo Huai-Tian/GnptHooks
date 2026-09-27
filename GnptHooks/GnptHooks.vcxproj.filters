@@ -37,6 +37,9 @@
     <ClCompile Include="hook.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="msr.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="common.h">
@@ -49,6 +52,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="hook.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="msr.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="svm.h">

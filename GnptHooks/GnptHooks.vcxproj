@@ -86,6 +86,7 @@
     <ClCompile Include="LDasm.c" />
     <ClCompile Include="npt.c" />
     <ClCompile Include="hook.c" />
+    <ClCompile Include="msr.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="svm.c" />
   </ItemGroup>
@@ -94,6 +95,7 @@
     <ClInclude Include="LDasm.h" />
     <ClInclude Include="npt.h" />
     <ClInclude Include="hook.h" />
+    <ClInclude Include="msr.h" />
     <ClInclude Include="svm.h" />
     <ClInclude Include="vmcb.h" />
   </ItemGroup>
