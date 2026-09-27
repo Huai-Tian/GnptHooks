@@ -568,7 +568,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 		}
 		case SVM_EXIT_NPF:    //0x400嵌套页故障: 双NPT视图切换引擎(hook布防产物)
 		{
-			//引擎处理hook布防引发的NPF(取指进Secondary/写回Primary);
+				//引擎处理hook布防引发的NPF(取指进Secondary/写回Primary);
 			//未处理=异常信号(fault语义不推RIP, 'N'环留痕)
 			if (GnptHookNpfEngine(vmcb, cpu,
 				vmcb->Control.ExitInfo1, vmcb->Control.ExitInfo2))
@@ -695,3 +695,4 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 	}
 	return stop;
 }
+

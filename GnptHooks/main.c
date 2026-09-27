@@ -6,67 +6,62 @@
 //本文件=框架使用示例(面向二次开发者):
 //  DriverEntry  -> SvmStartAllCpus接管全核 -> 安装自己的hook
 //  DriverUnload -> 移除hook -> SvmShutdownAllCpus关停并释放资源
+//框架细节(资源分配/串行启动/互斥仲裁/内置隐藏/日志)全在svm.c,
+//使用者只需关心hook回调本身。API契约见hook.h头注释
 
-//示例hook: ZwPowerInformation桩 TRANSPARENT detour。
-//选桩理由: 用户态syscall绕过Zw桩直达SSDT体→桩冷(仅内核显式
-//调用者); 桩页=nt .text(PG广域校验可能覆盖→浸泡期READ_TRANS
-//面包屑=读透明证据); 自触发=无需用户操作(SetSystemTime类路径
-//嵌套下拉黑)。回调IRQL纪律: Interlocked+无锁环+CallOriginal
+//demo目标: NtClose(演示期间全系统句柄关闭都会被拦截)
+static PVOID g_demoNtClose = NULL;
 static volatile LONG64 g_demoCalls = 0;
-static ULONG64 DemoTransHook(PVOID Context, ULONG64 Arg1,
+
+//demo回调(detour语义, 返回值=新函数返回值)。
+//回调运行在任意线程/任意IRQL(含DISPATCH级): 只做IRQL安全操作,
+//禁止FlLog/DbgPrint/分页内存/阻塞(完整纪律见hook.h)
+static ULONG64 DemoNtCloseCallback(PVOID Context, ULONG64 Handle,
 	ULONG64 Arg2, ULONG64 Arg3, ULONG64 Arg4, ULONG64* StackArgs)
 {
 	UNREFERENCED_PARAMETER(Context);
 	UNREFERENCED_PARAMETER(StackArgs);
-	LONG64 n = InterlockedIncrement64(&g_demoCalls);
-	FlRingPush('h', KeGetCurrentProcessorNumber(),
-		(ULONG)(Arg1 & 0xFFFFFFFFULL), (ULONG64)n, 0, 0);
-	return GnptCallOriginal(Arg1, Arg2, Arg3, Arg4);
+	InterlockedIncrement64(&g_demoCalls);    //IRQL安全计数(卸载总结读)
+	//示例=透传原函数并返回其结果(零副作用监控)。
+	//拦截=直接return STATUS_INVALID_HANDLE;
+	//篡改=修改Handle/Arg后经GnptCallOriginal转发改写值
+	return GnptCallOriginal(Handle, Arg2, Arg3, Arg4);
 }
 
-//自触发线程: 调Zw桩3次(1s间隔)=四视图舞步全链路自验证
-//(取指fault→EXEC+TF→#DB→HIDE; 参数无效→体报错, 无害)
-typedef NTSTATUS(*PFN_ZW_POWER)(ULONG, PVOID, ULONG, PVOID, ULONG);
-static PVOID g_demoTarget = NULL;
-static KEVENT g_demoTrigDone;
-static BOOLEAN g_demoTrigArmed = FALSE;
-
-static VOID DemoTriggerThread(PVOID Context)
+static VOID DemoHookInstall(VOID)
 {
-	UNREFERENCED_PARAMETER(Context);
-	LARGE_INTEGER iv;
-	iv.QuadPart = -3LL * 10000000LL;    //3s: 等安装落定/系统稳定
-	KeDelayExecutionThread(KernelMode, FALSE, &iv);
-	PFN_ZW_POWER zw = (PFN_ZW_POWER)g_demoTarget;
-	for (ULONG i = 0; i < 3; i++)
+	//detour hook: 目标=内核函数地址。Flags=0普通模式(HOOKS视图
+	//驻留=触发0-exit+同页邻居免费+外部读自带读透明单步;
+	//TRANSPARENT模式见hook.h——页级单步窗口只适合低频目标)
+	UNICODE_STRING name;
+	RtlInitUnicodeString(&name, L"NtClose");
+	g_demoNtClose = MmGetSystemRoutineAddress(&name);
+	if (g_demoNtClose == NULL)
 	{
-		NTSTATUS st = STATUS_UNSUCCESSFUL;
-		if (zw != NULL)
-		{
-			st = zw(0, NULL, 0, NULL, 0);    //经桩=舞步自触发
-		}
-		FlLog("[Demo] 自触发#%u: 状态=0x%X 累计=%lld",
-			i + 1, (ULONG)st, g_demoCalls);
-		iv.QuadPart = -10000000LL;    //1s
-		KeDelayExecutionThread(KernelMode, FALSE, &iv);
+		FlLog("[Demo] NtClose解析失败, 无hook");
+		return;
 	}
-	KeSetEvent(&g_demoTrigDone, IO_NO_INCREMENT, FALSE);
-	PsTerminateSystemThread(STATUS_SUCCESS);
+	GNPT_HOOK demo = { 0 };
+	demo.Target = g_demoNtClose;
+	demo.Callback = DemoNtCloseCallback;
+	demo.Context = NULL;
+	demo.StackArgs = 0;
+	demo.Flags = 0;
+	NTSTATUS st = GnptHookInstall(&demo);
+	FlLog("[Demo] detour hook NtClose(%p): %s(触发计数=卸载总结)",
+		g_demoNtClose, NT_SUCCESS(st) ? "OK" : "FAIL(见[Hook]行)");
 }
 
 VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
 {
 	UNREFERENCED_PARAMETER(pDriverObject);
-	//自触发线程收尾等待(有界5s, 防在途回调竞态)
-	if (g_demoTrigArmed)
+	//按目标移除(未显式移除的hook由关停流程统一清理)
+	FlLog("[Unload] Demo NtClose触发计数=%lld", g_demoCalls);
+	if (g_demoNtClose != NULL)
 	{
-		LARGE_INTEGER to;
-		to.QuadPart = -5LL * 10000000LL;
-		KeWaitForSingleObject(&g_demoTrigDone, Executive,
-			KernelMode, FALSE, &to);
+		GnptHookRemove(g_demoNtClose);
 	}
 	//关停: 移除残余hook(引擎仍在位=在途回调安全完成)→全核去虚拟化→释放资源
-	FlLog("[Unload] TRANSPARENT示例hook触发计数=%lld", g_demoCalls);
 	GnptHookRemoveAll();
 	if (SvmShutdownAllCpus())
 	{
@@ -98,51 +93,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	//放行T2的Desktop镜像(加载窗口期已过)
 	FlMarkEntryDone();
 
-	//示例hook: ZwPowerInformation桩 TRANSPARENT(自触发验证,
-	//见文件头注释)。安装后自触发3次; 随后驻留浸泡(PG读桩页→
-	//READ_TRANS面包屑+无0x109=读透明证据)
-	{
-		GNPT_HOOK demo = { 0 };
-		UNICODE_STRING name;
-		RtlInitUnicodeString(&name, L"ZwPowerInformation");
-		demo.Target = MmGetSystemRoutineAddress(&name);
-		FlLog("[Entry] 目标解析 ZwPowerInformation = %p", demo.Target);
-		if (demo.Target != NULL)
-		{
-			demo.Callback = DemoTransHook;
-			demo.Context = NULL;
-			demo.StackArgs = 0;
-			demo.Flags = HOOK_TRANSPARENT;
-			NTSTATUS hst = GnptHookInstall(&demo);
-			FlLog("[Entry] TRANSPARENT示例hook安装%s(目标=%p)",
-				NT_SUCCESS(hst) ? "成功" : "失败", demo.Target);
-			if (NT_SUCCESS(hst))
-			{
-				//自触发线程(异步): 3s后调桩×3
-				g_demoTarget = demo.Target;
-				KeInitializeEvent(&g_demoTrigDone,
-					NotificationEvent, FALSE);
-				g_demoTrigArmed = TRUE;
-				HANDLE th = NULL;
-				NTSTATUS tst = PsCreateSystemThread(&th, 0, NULL,
-					NULL, NULL, DemoTriggerThread, NULL);
-				if (NT_SUCCESS(tst))
-				{
-					ZwClose(th);    //句柄即弃(线程对象自持有引用)
-				}
-				else
-				{
-					g_demoTrigArmed = FALSE;
-					FlLog("[Entry] 自触发线程创建失败=0x%X(手动触发退路: 内核态ZwPowerInformation)", (ULONG)tst);
-				}
-			}
-		}
-		else
-		{
-			FlLog("[Entry] ZwPowerInformation=NULL, 无hook");
-		}
-	}
-
+	//接管成功, 安装演示hook
+	DemoHookInstall();
 	FlLog("[Entry] 完成(%s)", GNPT_BUILD_TAG);
 	return STATUS_SUCCESS;
 }

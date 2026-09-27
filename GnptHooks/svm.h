@@ -212,6 +212,8 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 #define GNPT_VMCALL_KEEP  3    //KEEP放行(落地探针第二段)
 #define GNPT_VMCALL_NPTSYNC 4  //NPT改动全核TLB同步(exit handler置TLB_CONTROL=3)
 
+//==== 时钟源传感器(M6.2调查已定案: 164采样窗双零=不封堵, 代码已移除) ====
+
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)
