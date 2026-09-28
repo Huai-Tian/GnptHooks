@@ -35,9 +35,8 @@
 //     运行期会合法写的MSR(如GS base)慎用, 监控场景用TRUE放行
 //  4. Remove后新触发立即停止; 在途exit(已查表)安全完成
 //
-//EXITINFO1位义(0x7C): bit0=0读/1写。APM附录A仅一行描述未载位
-//义, 此处=NOIRVisor/SimpleSvm交叉共识, 首测验证(读hook触发时
-//bit0应=0, 判据见NOTES M7.1)
+//EXITINFO1位义(0x7C): bit0=0读/1写(APM附录A未载此位义, 为
+//执行级验证结论)
 //====================================================================
 
 //读回调: 返回值=rdmsr可见值(伪造)。需要真值→GnptMsrReadReal
@@ -54,9 +53,9 @@ typedef struct _GNPT_MSR_HOOK
 	GNPT_MSR_WRITE_CB OnWrite; //NULL=写不拦截(写位不置)
 } GNPT_MSR_HOOK, *PGNPT_MSR_HOOK;
 
-//安装(PASSIVE_LEVEL, 引擎运行中): 全核MSRPM位图root直写(纯内存
-//写, 无vmcall无TLB同步——位图内容硬件每指令现查, 基址不变无
-//clean bit问题)。同MSR重复安装=拒绝
+//安装(PASSIVE_LEVEL, 引擎运行中): 全核MSRPM位图经vmmcall root
+//原语操作(隐蔽生效后guest态直写无效; 位图内容硬件每指令现查,
+//基址不变无clean bit/TLB问题)。同MSR重复安装=拒绝
 NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook);
 
 //移除(PASSIVE_LEVEL): 先标Removed(分发立即停止命中)再清位图;
@@ -75,5 +74,8 @@ ULONG64 GnptMsrReadReal(ULONG32 Msr);
 BOOLEAN GnptMsrDispatchRead(ULONG32 Msr, ULONG64* OutValue);
 //写分发: TRUE=允许代写(未hook/回调放行), FALSE=回调拒绝(静默丢弃)
 BOOLEAN GnptMsrDispatchWrite(ULONG32 Msr, ULONG64 Value);
+//root位图原语(svm.c的0x81 MSRBIT case调用, GIF=0直访物理):
+//全核MSRPM位操作(自我隐蔽配套)
+VOID GnptMsrBitmapRootAllCpus(ULONG32 Msr, BOOLEAN IsWrite, BOOLEAN Set);
 
 #endif //GNPTMSR_H

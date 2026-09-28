@@ -182,6 +182,15 @@ typedef struct _GNPT_VCPU_SVM
 } GNPT_VCPU_SVM, *PGNPT_VCPU_SVM;
 
 extern GNPT_VCPU_SVM g_svmVcpu[64];
+extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; v0.9u起恒=全部核)
+extern volatile LONG64 g_svmLastExitTsc[64];   //v0.9v哨兵: 各核最后#VMEXIT的TSC(HB心跳检停泊)
+
+//v0.9t: root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——
+//仅虚拟化核合法: 裸机兄弟核EFER.SVME=0→vmmcall=#UD→0x7E(v0.9s实测:
+//DriverEntry线程被调度到兄弟核, 首个NPTSET即崩)。调用线程调度核
+//不可控→原语前调用本函数钉到虚拟化核集(0..count-1), 用完以返回值
+//还原亲和。返回旧掩码; 0=引擎未起(调用方按失败处理)
+KAFFINITY SvmPinVirtualizedCpus(VOID);
 extern ULONG64 g_svmFeatBits;       //Fn8000_000A_EDX快照(降级决策)
 extern KEVENT g_svmShutdownEvent;   //卸载: 唤醒全部发起线程
 
@@ -211,9 +220,13 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 #define GNPT_VMCALL_STOP  1    //卸载: 发起线程自guest内请求本核去虚拟化
 #define GNPT_VMCALL_KEEP  3    //KEEP放行(落地探针第二段)
 #define GNPT_VMCALL_NPTSYNC 4  //NPT改动全核TLB同步(exit handler置TLB_CONTROL=3)
-
-//==== 时钟源传感器(M6.2调查已定案: 164采样窗双零=不封堵, 代码已移除) ====
-
+//==== root写原语(自我隐蔽配套; 隐蔽生效后guest态直写NPT/MSRPM
+//页=落零页静默丢失, 一切动态写必经此族; exit handler(GIF=0)root
+//态直访物理。自发vmmcall=发起线程PASSIVE语义, 原语内池分配(现场
+//拆分)合法) ====
+#define GNPT_VMCALL_NPTSET 5   //写视图PTE: rdx=gpa r8=pa|(view<<48) r9=flags
+#define GNPT_VMCALL_NPTRES 6   //恢复恒等: rdx=gpa r8=view(0-3单树/0xF四树)
+#define GNPT_VMCALL_MSRBIT 7   //全核MSRPM位操作: rdx=msr r8=(isWrite<<1)|set
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)

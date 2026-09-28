@@ -23,6 +23,22 @@
 #define HOOK_REPLAY_BUF      96         //重定位跳板缓冲(最坏prologue+尾跳)
 #define NPF_SWITCH_LOOP_MAX  16         //同(gpa)连续切换逃生阈值
 
+//root写原语包装(隐蔽配套): 隐蔽生效后guest态直写NPT页=落零页
+//静默丢失, Install/Remove(PASSIVE guest态)的PTE写必经vmmcall进
+//exit handler(GIF=0 root态直访物理)。exit handler内的写(视图切换/
+//临时RW)本就root态, 无需此路
+static VOID HookNptSetPteRoot(ULONG View, ULONG64 Gpa, ULONG64 Pa,
+	ULONG64 Flags)
+{
+	CmVmmCall(GNPT_VMCALL_NPTSET, Gpa,
+		(Pa & 0x0000FFFFFFFFFFFFULL) | ((ULONG64)View << 48), Flags);
+}
+
+static VOID HookNptRestoreRoot(ULONG View, ULONG64 Gpa)
+{
+	CmVmmCall(GNPT_VMCALL_NPTRES, Gpa, View, 0);
+}
+
 //NPF错误码位(§15.25.6)
 #define NPF_ERR_RW           (1ULL << 1)
 #define NPF_ERR_ID           (1ULL << 4)
@@ -46,10 +62,44 @@ static volatile LONG g_hookLive = 0;      //已安装未移除数(引擎快速�
 static PUCHAR g_slotPool = NULL;           //跳板槽池(1页, 懒分配)
 static volatile LONG g_slotUsed = 0;
 
-//每核当前视图(0=Primary 1=Secondary)+detour上下文(嵌套save-restore)
+//每核当前视图(0=Primary 1=Secondary)
 static volatile LONG g_view[64];
-static PGNPT_ENTRY volatile g_curHook[64];
-static PGUEST_REGS volatile g_curRegs[64];
+
+//detour上下文环(迁移安全): 每核槽位方案在回调跨核迁移时失配
+//(丢调用或误调他hook原函数)。改用全局序号环按发起线程解析——
+//同线程顺序执行, 其最大序号条目=当前最内层分发; 嵌套=内层序号
+//更大, 跨核迁移天然正确。环深度上界=并发在途回调数(16核×浅
+//嵌套<<128); 超环覆写=降级为丢调用(非误调), 概率可忽略
+#define HOOK_CTX_RING  128             //2的幂(槽位掩码)
+typedef struct _HOOK_CTX
+{
+	volatile LONG64 seq;            //0=空; 发布序号(最后写=发布点)
+	PVOID volatile   thread;        //发起线程(分发期有效)
+	PGNPT_ENTRY volatile hook;
+	PGUEST_REGS volatile regs;
+} HOOK_CTX;
+static HOOK_CTX g_ctx[HOOK_CTX_RING];
+static volatile LONG64 g_ctxSeq = 0;
+
+//TRANSPARENT页热治理(双层防线): 页级单步的稳态成本=整页执行频率×
+//2 exit/指令(页粒度+无exec-only的原理性代价), 故可行性前提=页冷;
+//而"页冷"是运行时性质(Nt体按字母序聚簇, 邻域热函数=整页风暴;
+//且页可在任意时刻变热)——静态断言不可靠, 必须实测。
+//①安装期热探测: 布防后250ms实测窗口, NPF超限=拒绝安装(选型=
+//  测量而非猜测; 候选链自动降级)
+//②运行期速率脱落: ≈700ms桶内NPF超限→exit handler内解除布防
+//  (捕获安装后才变热的页)。损伤有界=2×桶上限(构造性保证)
+//脱落处置: 三树恒等(Install已拆分该页=纯PTE写无分配)+Removed原子
+//发布(CAS胜者独占live递减与留痕)+本核TLB冲净+重执行直通; 他核残留
+//翻译由引擎P态取指自愈分支冲净
+#define HOOK_TSTORM_GATE_NPF   1500LL     //安装窗口(250ms)拒绝阈
+#define HOOK_TSTORM_BUCKET     1024LL     //运行桶(≈700ms)脱落阈
+                                          //(实测4000档=UI关键路径可感知
+                                          //停顿~1.4s→黑屏闪; 1024档损伤
+                                          //≈2ms级不可感)
+static volatile LONG64 s_tstormCnt[GNPT_MAX_HOOKS];        //累计NPF
+static volatile LONG64 s_tstormBucket[GNPT_MAX_HOOKS];     //当前桶计数
+static volatile LONG64 s_tstormBucketId[GNPT_MAX_HOOKS];   //rdtsc>>31
 
 //hook-asm.asm入口
 extern VOID GnptStubEntry(VOID);
@@ -118,23 +168,52 @@ ULONG64 GnptCallbackDispatch(PVOID EntryPtr, PGUEST_REGS Regs)
 			FlRingPush('H', cpu, 0, (ULONG64)(ULONG_PTR)e->pub.Target, (ULONG64)dn, 0);
 		}
 	}
-	PGNPT_ENTRY prevHook = g_curHook[cpu];
-	PGUEST_REGS prevRegs = g_curRegs[cpu];
-	g_curHook[cpu] = e;
-	g_curRegs[cpu] = Regs;
+	//发布detour上下文到全局序号环(线程键; seq最后写=发布点,
+	//读者以seq双重校验条目未被覆写/回收)
+	LONG64 mySeq = InterlockedIncrement64(&g_ctxSeq);
+	HOOK_CTX* slot = &g_ctx[mySeq & (HOOK_CTX_RING - 1)];
+	slot->thread = PsGetCurrentThread();
+	slot->hook = e;
+	slot->regs = Regs;
+	slot->seq = mySeq;
 	ULONG64* stackArgs = (e->pub.StackArgs != 0)
 		? (ULONG64*)(Regs->rsp + 0x28) : NULL;
 	ULONG64 ret = e->pub.Callback(e->pub.Context,
 		Regs->rcx, Regs->rdx, Regs->r8, Regs->r9, stackArgs);
-	g_curHook[cpu] = prevHook;
-	g_curRegs[cpu] = prevRegs;
+	//回收(条目未被环覆写才清; 此时本线程已无扫描者, 清序无害)
+	if (slot->seq == mySeq)
+	{
+		slot->thread = NULL;
+		slot->seq = 0;
+	}
 	return ret;
 }
 
 ULONG64 GnptCallOriginal(ULONG64 Arg1, ULONG64 Arg2, ULONG64 Arg3, ULONG64 Arg4)
 {
 	ULONG cpu = KeGetCurrentProcessorNumber();
-	PGNPT_ENTRY e = g_curHook[cpu];
+	//解析当前线程最内层分发: 环内该线程最大序号条目(跨核迁移/
+	//嵌套均正确; seq双重校验排除覆写与回收竞态)
+	PVOID tid = PsGetCurrentThread();
+	PGNPT_ENTRY e = NULL;
+	PGUEST_REGS regs = NULL;
+	LONG64 best = 0;
+	for (ULONG i = 0; i < HOOK_CTX_RING; i++)
+	{
+		HOOK_CTX* s = &g_ctx[i];
+		LONG64 sq = s->seq;
+		if (sq <= best)
+		{
+			continue;    //空槽或已有更新条目
+		}
+		if (s->thread != tid || s->seq != sq)
+		{
+			continue;    //他线程条目或已被覆写/回收
+		}
+		best = sq;
+		e = s->hook;
+		regs = s->regs;
+	}
 	if (e == NULL)
 	{
 		//非回调上下文调用(用户误用): 静默返回0+一次性留痕
@@ -154,13 +233,13 @@ ULONG64 GnptCallOriginal(ULONG64 Arg1, ULONG64 Arg2, ULONG64 Arg3, ULONG64 Arg4)
 			FlRingPush('O', cpu, 0, (ULONG64)(ULONG_PTR)e->ReplayVA, (ULONG64)on, 0);
 		}
 	}
-	if (e->pub.StackArgs != 0 && g_curRegs[cpu] != NULL)
+	if (e->pub.StackArgs != 0 && regs != NULL)
 	{
 		//StackArgs>0: GnptCallOrigAsm桩重建完整x64调用帧, 栈参源=
 		//触发帧上实参(回调可能已改写)
 		GNPT_ORIG_CALL oc;
 		oc.Target = (ULONG64)e->ReplayVA;
-		oc.StackArgs = g_curRegs[cpu]->rsp + 0x28;
+		oc.StackArgs = regs->rsp + 0x28;
 		oc.Count = e->pub.StackArgs;
 		oc.Arg1 = Arg1;
 		oc.Arg2 = Arg2;
@@ -400,7 +479,7 @@ static VOID HookSwitchView(PVMCB Vmcb, ULONG Cpu, ULONG View);    //前向(定�
 #define RFLAGS_FIXED1           (1ULL << 1)
 //POPF合法可写位掩码(CF..IOPL..AC..ID; RF弹值忽略, VM/VIF/VIP/NT清0)
 #define RFLAGS_POPF_WRITEABLE   0x0000000000243FD7ULL
-#define DR6_BS                  (1ULL << 14)   //bit14=单步引发(APM页855)
+#define DR6_BS                  (1ULL << 14)   //bit14=单步引发(APM Vol2 §13.1.1.3)
 #define STEP_WINDOW_INTERCEPTS  (INTERCEPT_PUSHF | INTERCEPT_POPF)
 
 //单步用途
@@ -702,10 +781,56 @@ VOID GnptHookStepLeakCheck(PVMCB Vmcb, ULONG Cpu)
 	}
 }
 
+//运行期脱落(exit handler上下文, root态): 三树恒等直写+Removed
+//CAS发布(与安装期拒绝路径互斥竞争, 胜者独占live递减)+本核冲净。
+//条目内存到FreeMemory才释放, 在途单步窗口的'e'收尾仍可安全读条目
+static VOID HookTstormDisarmEngine(PGNPT_ENTRY e, PVMCB Vmcb, ULONG Cpu)
+{
+	SvmNptRestoreIdentity(GNPT_VIEW_PRIMARY, e->TargetPa);
+	SvmNptRestoreIdentity(GNPT_VIEW_HIDE, e->TargetPa);
+	SvmNptRestoreIdentity(GNPT_VIEW_EXEC, e->TargetPa);
+	if (InterlockedCompareExchange(&e->Removed, 1, 0) == 0)
+	{
+		InterlockedDecrement(&g_hookLive);
+		FlRingPush('F', Cpu, 0x400, (ULONG64)(ULONG_PTR)e->pub.Target,
+			s_tstormCnt[e - g_hooks], 0);
+	}
+	Vmcb->Control.TlbControl = 3;
+}
+
+//NPF账目+速率脱落: TRUE=已脱落(调用方重执行直通)
+static BOOLEAN HookTstormAccount(PGNPT_ENTRY e, PVMCB Vmcb, ULONG Cpu)
+{
+	ULONG ti = (ULONG)(e - g_hooks);
+	InterlockedIncrement64(&s_tstormCnt[ti]);
+	LONG64 b = (LONG64)(__rdtsc() >> 31);    //桶宽≈700ms@3GHz
+	if (b != s_tstormBucketId[ti])
+	{
+		s_tstormBucketId[ti] = b;
+		s_tstormBucket[ti] = 0;
+	}
+	if (InterlockedIncrement64(&s_tstormBucket[ti]) < HOOK_TSTORM_BUCKET)
+	{
+		return FALSE;
+	}
+	HookTstormDisarmEngine(e, Vmcb, Cpu);
+	return TRUE;
+}
+
 BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 ExitInfo2)
 {
 	if (g_hookLive == 0)
 	{
+		//无live hook≠无布防痕迹: 最后一个hook刚被脱落/移除的微窗口内,
+		//他核陈旧翻译(残留P=0/NX项)的fault仍会到达——非P视图回P,
+		//P视图冲净后重执行(fault语义留痕给真fault)。不处理=该核在
+		//'N'路径(不推RIP不冲净)无限重试=单核冻结
+		if (g_view[Cpu] != GNPT_VIEW_PRIMARY)
+		{
+			HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
+			return TRUE;
+		}
+		Vmcb->Control.TlbControl = 3;
 		return FALSE;
 	}
 	//hooked页判定(物理页基址键)
@@ -742,6 +867,10 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 		{
 			if (hit->pub.Flags & HOOK_TRANSPARENT)
 			{
+				if (HookTstormAccount(hit, Vmcb, Cpu))
+				{
+					return TRUE;    //页热脱落(重执行直通)
+				}
 				HookSwitchView(Vmcb, Cpu, GNPT_VIEW_EXEC);
 				HookStepArm(Vmcb, Cpu, STEP_REHIDE,
 					(ULONG)(hit - g_hooks));
@@ -765,7 +894,12 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 			HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
 			return TRUE;
 		}
-		return FALSE;    //Primary态非hooked取指fault=未覆盖/异常→留痕
+		//P态非hooked取指fault: 恒等树(512GB覆盖)下唯一现实来源=
+		//布防解除竞态的残留NX翻译(他核'F'解除后本核陈旧TLB)——
+		//冲净本核重执行(已恢复的恒等RWX直通); 持续fault由'X'环路
+		//计数限流留痕(真实未覆盖fault本就不可恢复, 行为不变劣)
+		Vmcb->Control.TlbControl = 3;
+		return TRUE;
 	}
 	//TRANSPARENT潜伏态(HIDE)的非取指fault(P=0拦数据访问, 读透明):
 	//外部读→切P+TF读原始字节(#DB归返HIDE); 外部写→切P惰性落原页。
@@ -773,6 +907,10 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 	if (hit != NULL && g_view[Cpu] == GNPT_VIEW_HIDE &&
 		(hit->pub.Flags & HOOK_TRANSPARENT))
 	{
+		if (HookTstormAccount(hit, Vmcb, Cpu))
+		{
+			return TRUE;    //读风暴同护(重执行直通)
+		}
 		g_stepRetView[Cpu] = GNPT_VIEW_HIDE;
 		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
 		if ((ExitInfo1 & NPF_ERR_RW) == 0)
@@ -783,7 +921,7 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 	}
 	//数据NPF(读写fault分流; 仅常规hook可达——
 	//TRANSPARENT潜伏态由上分支拦截, EXEC窗口内数据访问不fault):
-	//自读/自写判定: faulting RIP与目标同4K页(纯VA比较; 同页⇔代码流
+	//自读/自写判定: faulting RIP与目标同4K页(纯VA比较; 同页<=>代码流
 	//在hooked页=hook自身代码, CallOriginal走池页ReplayVA不在此)
 	if (hit != NULL && g_view[Cpu] == GNPT_VIEW_SECONDARY)
 	{
@@ -799,7 +937,7 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 				HookStepArm(Vmcb, Cpu, STEP_TEMP_RW, idx);
 				return TRUE;
 			}
-			//外部写: M3惰性(切Primary落真实页, 下次取指自愈切回)
+			//外部写: 惰性处理(切Primary落真实页, 下次取指自愈切回)
 			HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
 			return TRUE;
 		}
@@ -831,6 +969,14 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 			return TRUE;
 		}
 	}
+	//非Primary视图的非hooked数据fault: 布防解除(脱落/移除)竞态的
+	//陈旧翻译形态——回P(切视图即冲净)重执行; P树512GB恒等下再fault
+	//=真异常('N'路径留痕)。不补此分支=陈旧翻译上无限重试=单核活锁
+	if (g_view[Cpu] != GNPT_VIEW_PRIMARY)
+	{
+		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
+		return TRUE;
+	}
 	return FALSE;
 }
 
@@ -850,6 +996,23 @@ static ULONG_PTR NTAPI HookSyncIpi(ULONG_PTR Ignored)
 static VOID HookSyncAllCpus(VOID)
 {
 	(VOID)KeIpiGenericCall(HookSyncIpi, 0);
+}
+
+//安装期热探测拒绝(guest/PASSIVE): 三树恒等还原(root原语)+Removed
+//CAS发布(与运行期脱落路径互斥竞争)+全核同步。PTE还原幂等, 双路径
+//并发执行无害
+static VOID HookTstormRejectInstall(PGNPT_ENTRY e, LONG64 Heat)
+{
+	HookNptRestoreRoot(GNPT_VIEW_PRIMARY, e->TargetPa);
+	HookNptRestoreRoot(GNPT_VIEW_HIDE, e->TargetPa);
+	HookNptRestoreRoot(GNPT_VIEW_EXEC, e->TargetPa);
+	HookSyncAllCpus();
+	if (InterlockedCompareExchange(&e->Removed, 1, 0) == 0)
+	{
+		InterlockedDecrement(&g_hookLive);
+	}
+	FlLog("[Hook] Install拒绝: 页热(%lld次NPF/250ms——页级单步成本不可承受, 换目标)",
+		Heat);
 }
 
 NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
@@ -917,6 +1080,10 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	e->pub = *Hook;
 	e->Used = 1;
 	e->Removed = 0;
+	//条目复用: 页热账目重置
+	s_tstormCnt[e - g_hooks] = 0;
+	s_tstormBucket[e - g_hooks] = 0;
+	s_tstormBucketId[e - g_hooks] = 0;
 	//LDE重定位跳板(MinLen=14=CodePage跳转覆盖长度, 两者同源同长)
 	e->ReplayVA = HookBuildRelocTrampoline((ULONG64)Hook->Target, 14,
 		&e->ReplayLen);
@@ -954,35 +1121,70 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	e->TargetPa = MmGetPhysicalAddress(
 		(PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1))).QuadPart;
-	//多视图PTE布防(静态一次写死, 运行时零PTE写):
+	//root原语前置(v0.9t): 钉到虚拟化核集(SMT隔离下裸机兄弟核
+	//vmmcall=#UD→0x7E); 完事还原亲和
+	KAFFINITY oldAff = SvmPinVirtualizedCpus();
+	if (oldAff == 0)
+	{
+		ExFreePoolWithTag(e->CodePageVa, HOOK_POOL_TAG);
+		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+		e->Used = 0;
+		FlLog("[Hook] Install失败: 引擎未起(无虚拟化核)");
+		return STATUS_NOT_SUPPORTED;
+	}
+	//多视图PTE布防(静态一次写死, 运行时零PTE写; root原语=隐蔽生效):
 	//  P: 原页可读可写不可执行(取指NPF→进detour视图)
 	//  常规hook   → HOOKS树=CodePage只读可执行(写NPF→回P转发)
 	//  TRANSPARENT→ HIDE树=P=0潜伏 + EXEC树=CodePage全权
 	if (Hook->Flags & HOOK_TRANSPARENT)
 	{
-		SvmNptSetPte(GNPT_VIEW_HIDE, e->TargetPa, e->CodePagePa,
+		HookNptSetPteRoot(GNPT_VIEW_HIDE, e->TargetPa, e->CodePagePa,
 			NPT_PTE_FLAGS_HOOKT_HIDE);
-		SvmNptSetPte(GNPT_VIEW_EXEC, e->TargetPa, e->CodePagePa,
+		HookNptSetPteRoot(GNPT_VIEW_EXEC, e->TargetPa, e->CodePagePa,
 			NPT_PTE_FLAGS_HOOKT_EXEC);
 	}
 	else
 	{
-		SvmNptSetPte(GNPT_VIEW_SECONDARY, e->TargetPa, e->CodePagePa,
+		HookNptSetPteRoot(GNPT_VIEW_SECONDARY, e->TargetPa, e->CodePagePa,
 			NPT_PTE_FLAGS_HOOKS);
 	}
-	SvmNptSetPte(GNPT_VIEW_PRIMARY, e->TargetPa, e->TargetPa,
+	HookNptSetPteRoot(GNPT_VIEW_PRIMARY, e->TargetPa, e->TargetPa,
 		NPT_PTE_FLAGS_HOOKP);
 	//全核TLB同步=布防即刻生效
 	HookSyncAllCpus();
-	InterlockedIncrement(&g_hookLive);
+	InterlockedIncrement(&g_hookLive);    //先发布(live>0=引擎处置脱落)
+	if (Hook->Flags & HOOK_TRANSPARENT)
+	{
+		//安装期热探测: 页冷是TRANSPARENT唯一可行性前提, 而"冷"是
+		//运行时性质(邻域热函数/运行中变热)——静态断言不可靠, 布防后
+		//实测250ms窗口。超限=拒绝(运行期脱落可能已先行解除, 均归拒)
+		LARGE_INTEGER w;
+		w.QuadPart = -250LL * 10000LL;    //250ms
+		KeDelayExecutionThread(KernelMode, FALSE, &w);
+		LONG64 heat = s_tstormCnt[e - g_hooks];
+		if (heat > HOOK_TSTORM_GATE_NPF || e->Removed)
+		{
+			HookTstormRejectInstall(e, heat);
+			KeSetSystemAffinityThread(oldAff);
+			return STATUS_UNSUCCESSFUL;
+		}
+		FlLog("[Hook] 热探测通过: %lld次NPF/250ms(页冷实测确认)", heat);
+	}
 	FlLog("[Hook] Install OK: 目标=%p 回调=%p 跳板槽=%p 重定位跳板=%p(%uB) CodePage=%p(PA=%llX) 栈参=%u",
 		Hook->Target, Hook->Callback, e->Slot, e->ReplayVA, e->ReplayLen,
 		e->CodePageVa, e->CodePagePa, Hook->StackArgs);
+	KeSetSystemAffinityThread(oldAff);
 	return STATUS_SUCCESS;
 }
 
 NTSTATUS GnptHookRemove(PVOID Target)
 {
+	//root原语前置(v0.9t): 钉到虚拟化核集(还原路径同发NPTRES)
+	KAFFINITY oldAff = SvmPinVirtualizedCpus();
+	if (oldAff == 0)
+	{
+		return STATUS_NOT_SUPPORTED;
+	}
 	for (ULONG i = 0; i < GNPT_MAX_HOOKS; i++)
 	{
 		PGNPT_ENTRY e = &g_hooks[i];
@@ -994,17 +1196,17 @@ NTSTATUS GnptHookRemove(PVOID Target)
 		//  尚持旧TLB翻译的核此刻也只见原始字节=hook死透
 		ULONG off = (ULONG)((ULONG_PTR)Target & (PAGE_SIZE - 1));
 		RtlCopyMemory(e->CodePageVa + off, (PUCHAR)Target, e->ReplayLen);
-		//②布防树PTE恒等还原(按条目模式: 不触碰未布防树
-		//  =不烧无关树的拆分区配额)
-		SvmNptRestoreIdentity(GNPT_VIEW_PRIMARY, e->TargetPa);
+		//②布防树PTE恒等还原(root原语, 按条目模式: 不触碰未布防树
+		//=不烧无关树的拆分区配额)
+		HookNptRestoreRoot(GNPT_VIEW_PRIMARY, e->TargetPa);
 		if (e->pub.Flags & HOOK_TRANSPARENT)
 		{
-			SvmNptRestoreIdentity(GNPT_VIEW_HIDE, e->TargetPa);
-			SvmNptRestoreIdentity(GNPT_VIEW_EXEC, e->TargetPa);
+			HookNptRestoreRoot(GNPT_VIEW_HIDE, e->TargetPa);
+			HookNptRestoreRoot(GNPT_VIEW_EXEC, e->TargetPa);
 		}
 		else
 		{
-			SvmNptRestoreIdentity(GNPT_VIEW_SECONDARY, e->TargetPa);
+			HookNptRestoreRoot(GNPT_VIEW_SECONDARY, e->TargetPa);
 		}
 		//③全核TLB同步(残留CodePage翻译被冲净)
 		HookSyncAllCpus();
@@ -1012,8 +1214,10 @@ NTSTATUS GnptHookRemove(PVOID Target)
 		InterlockedDecrement(&g_hookLive);
 		FlLog("[Hook] Remove OK: 目标=%p 还原%uB+双视图PTE恒等+全核TLB同步(在途回调安全完成)",
 			Target, e->ReplayLen);
+		KeSetSystemAffinityThread(oldAff);
 		return STATUS_SUCCESS;
 	}
+	KeSetSystemAffinityThread(oldAff);
 	return STATUS_NOT_FOUND;
 }
 

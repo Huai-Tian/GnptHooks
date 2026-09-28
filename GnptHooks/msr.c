@@ -16,9 +16,9 @@
 //  - Remove: 先标Removed(分发立即停止命中)再清位图; 在途exit
 //    (已过查表)的回调安全完成(与detour hook同款语义)
 //
-//位图写方式(与GeptMsr的vmcall root直写差异): 我们无自我隐蔽,
-//MSRPM页=root池内存, PASSIVE上下文直接VA位运算即可。位图改动
-//即时生效(硬件每指令现查位图, 基址不变无clean bit/TLB问题)
+//位图写方式: 隐蔽生效后MSRPM页guest态直写=落零页静默丢失——
+//Install/Remove的位图操作必经vmmcall root原语。位图改动即时
+//生效(硬件每指令现查位图, 基址不变无clean bit/TLB问题)
 //====================================================================
 
 #define GNPT_MSR_MAX 16
@@ -87,8 +87,10 @@ static BOOLEAN GnptMsrLocate(ULONG32 Msr, PULONG OutByteOff, UCHAR* OutBit)
 	return TRUE;
 }
 
-//全核MSRPM位操作(0=清/1=置)。PASSIVE持锁内调用
-static VOID GnptMsrBitmapAllCpus(ULONG32 Msr, BOOLEAN IsWrite, BOOLEAN Set)
+//全核MSRPM位操作(root原语形态): 隐蔽生效后MSRPM页guest态
+//直写=落零页静默丢失——必经vmmcall(7)进exit handler(GIF=0 root
+//态直访物理)。isWrite=写位/set=置位。导出给svm.c的0x81 case调用
+VOID GnptMsrBitmapRootAllCpus(ULONG32 Msr, BOOLEAN IsWrite, BOOLEAN Set)
 {
 	ULONG byteOff;
 	UCHAR bit;
@@ -122,6 +124,13 @@ static VOID GnptMsrBitmapAllCpus(ULONG32 Msr, BOOLEAN IsWrite, BOOLEAN Set)
 			map[byteOff] &= (UCHAR)~mask;
 		}
 	}
+}
+
+//guest侧包装: 经vmmcall root原语全核位操作(Install/Remove调用)
+static VOID GnptMsrBitmapAllCpus(ULONG32 Msr, BOOLEAN IsWrite, BOOLEAN Set)
+{
+	ULONG64 op = (ULONG64)((IsWrite ? 1 : 0) << 1) | (Set ? 1 : 0);
+	CmVmmCall(GNPT_VMCALL_MSRBIT, Msr, op, 0);
 }
 
 //回调内取真实值(保留MSR勿调——root态真读=#GP蓝屏)
@@ -200,6 +209,13 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 		FlLog("[MSR] Install拒绝: 零核in-guest(引擎未运行), 无处拦截");
 		return STATUS_NOT_SUPPORTED;
 	}
+	//root原语前置(v0.9t): 位图vmmcall前钉到虚拟化核集(SMT隔离下
+	//裸机兄弟核vmmcall=#UD→0x7E); 须在锁外(锁内DISPATCH)
+	KAFFINITY oldAff = SvmPinVirtualizedCpus();
+	if (oldAff == 0)
+	{
+		return STATUS_NOT_SUPPORTED;
+	}
 	//查重复+找空槽
 	GnptMsrLock();
 	LONG slot = -1;
@@ -217,6 +233,7 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 		{
 			GnptMsrUnlock();
 			FlLog("[MSR] Install拒绝: MSR=0x%X已安装(Remove后可重装)", Hook->Msr);
+			KeSetSystemAffinityThread(oldAff);
 			return STATUS_UNSUCCESSFUL;
 		}
 	}
@@ -224,6 +241,7 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 	{
 		GnptMsrUnlock();
 		FlLog("[MSR] Install拒绝: %u槽已满", (ULONG)GNPT_MSR_MAX);
+		KeSetSystemAffinityThread(oldAff);
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	PGNPT_MSR_ENTRY e = &s_msr[slot];
@@ -232,7 +250,7 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 	e->Context = Hook->Context;
 	e->OnRead = Hook->OnRead;
 	e->OnWrite = Hook->OnWrite;
-	//全核位图root直写(纯内存写, 即时生效; 无vmcall无TLB同步)
+	//全核位图置位: 经vmmcall root原语(隐蔽生效后guest态直写无效)
 	if (Hook->OnRead != NULL)
 	{
 		GnptMsrBitmapAllCpus(Hook->Msr, FALSE, TRUE);
@@ -246,11 +264,18 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 	FlLog("[MSR] Install OK: MSR=0x%X 读=%s 写=%s 上下文=%p(root直写位图)",
 		Hook->Msr, Hook->OnRead != NULL ? "拦截" : "直通",
 		Hook->OnWrite != NULL ? "拦截" : "直通", Hook->Context);
+	KeSetSystemAffinityThread(oldAff);
 	return STATUS_SUCCESS;
 }
 
 NTSTATUS GnptMsrHookRemove(ULONG32 Msr)
 {
+	//root原语前置(v0.9t): 同Install——清位图vmmcall前钉虚拟化核集
+	KAFFINITY oldAff = SvmPinVirtualizedCpus();
+	if (oldAff == 0)
+	{
+		return STATUS_NOT_SUPPORTED;
+	}
 	GnptMsrLock();
 	PGNPT_MSR_ENTRY found = NULL;
 	for (ULONG i = 0; i < GNPT_MSR_MAX; i++)
@@ -264,6 +289,7 @@ NTSTATUS GnptMsrHookRemove(ULONG32 Msr)
 	if (found == NULL)
 	{
 		GnptMsrUnlock();
+		KeSetSystemAffinityThread(oldAff);
 		return STATUS_NOT_FOUND;
 	}
 	//先标Removed(分发立即停止命中)再清位图; 在途回调安全完成
@@ -272,10 +298,11 @@ NTSTATUS GnptMsrHookRemove(ULONG32 Msr)
 	GnptMsrBitmapAllCpus(Msr, TRUE, FALSE);
 	GnptMsrUnlock();
 	FlLog("[MSR] Remove OK: MSR=0x%X(root直写清位, 在途回调安全完成)", Msr);
+	KeSetSystemAffinityThread(oldAff);
 	return STATUS_SUCCESS;
 }
 
-//枚举live MSR hook——与GeptMsrHookEnumerate同款语义
+//枚举live MSR hook
 //(Buffer=NULL→*InOutCount=数量; 容量不足→STATUS_BUFFER_TOO_SMALL
 //并回填所需数量)。条目字段逐个复制(不拷Removed——那是内部状态)
 NTSTATUS GnptMsrHookEnumerate(GNPT_MSR_HOOK* Buffer, ULONG* InOutCount)

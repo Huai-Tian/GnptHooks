@@ -26,6 +26,18 @@
 //     栈参数个数(≤GNPT_MAX_STACK_ARGS)→回调收到StackArgs指针
 //     (指向触发帧上实参, 可读可写——写后GnptCallOriginal按改写值
 //     转发)+GnptCallOriginal自动转发; StackArgs=0=仅4寄存器参
+//  5. 目标选型(PatchGuard): 普通模式驻留视图可读——外部读者
+//     (PatchGuard/内核扫描器)读到的是CodePage跳转码, 对SSDT/
+//     系统服务等PG覆盖目标=0x109蓝屏(PG检查周期随机, 短浸泡
+//     不触发不代表安全)。高频且非PG覆盖的普通内核函数用Flags=0;
+//     PG覆盖目标用HOOK_TRANSPARENT(外部读=原始字节, 仅低频)。
+//     AMD NPT无exec-only权限位, 普通模式无免费读透明
+//  6. TRANSPARENT页热纪律: 布防是**页级**的——同页一切执行都走
+//     单步窗口(2 exit/指令), 且"页冷"是运行时性质(Nt体按字母序
+//     聚簇, 名字冷≠页冷; 页可运行中变热)。引擎双层防线: 安装期
+//     热探测(布防后实测250ms窗口, NPF超限=拒绝安装)+运行期速率
+//     脱落(≈700ms桶超限=自动解除布防, 'F'环留痕)。预算线≈页执行
+//     ≤5000次/s持续; 目标函数冷≠达标——页邻域实测说了算
 //
 //硬件要求: 引擎运行中(全核in-guest)才可安装; 目标prologue含相对
 //  分支/RIP-relative超±2GB=Install拒绝(日志[Reloc]行留痕)
@@ -63,8 +75,8 @@ typedef struct _GNPT_HOOK
 #define HOOK_TRANSPARENT        0x1   //读透明: 每核S副本潜伏P=0,
                                        //取指→执行窗口(#DB复位潜伏);
                                        //外部读→切P读原始字节。
-                                       //低频目标专用(高频=NtClose式
-                                       //每指令2exit风暴)
+                                       //低频目标专用(高频目标=每指令
+                                       //2exit风暴, 见使用纪律5)
 
 //安装hook(PASSIVE_LEVEL, 引擎运行中): CodePage构建+双NPT视图布防
 //+全核TLB同步(布防即刻生效)

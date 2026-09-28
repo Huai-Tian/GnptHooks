@@ -76,6 +76,31 @@ VOID SvmNptSetPte(ULONG View, ULONG64 Gpa, ULONG64 Pa, ULONG64 Flags);
 //把视图内gpa的4KB条目恢复恒等(P|RW|US|A|D, 指回原物理页)
 VOID SvmNptRestoreIdentity(ULONG View, ULONG64 Gpa);
 
+//==== NPT自我隐蔽 ====
+//语义: 把全部框架私有物理页(四棵NPT树页/VMCB/HSAVE/IOPM/MSRPM/
+//VMM栈, 每核)在四视图统一改译共享零页(P=1,RW=0,X=0)——guest
+//物理内存扫描只见零; root与NPT硬件walker按HPA直访页表页不受
+//影响(§15.25: 硬件walker物理寻址; vmrun加载VMCB/位图均按
+//VMCB内物理基址)。
+//时序契约: 须在全部核资源分配后+首核launch前调用(裸机root态
+//直访物理=写隐蔽页自免疫; launch后guest态写NPT页须走vmmcall
+//root原语)。
+//零页翻译flags=P|US|A(RW=0,X=0): guest读=静默零(理想隐蔽);
+//写/执行该gpa→NPF→'O'兜底恢复该页(自愈优先)。
+BOOLEAN SvmNptConcealAll(VOID);    //登记+四树改译零页(PASSIVE)
+//诊断: 零页PA(0=未隐蔽)/登记页数/'O'恢复计数/登记页访问
+ULONG64 SvmNptHideZeroPa(VOID);
+ULONG SvmNptConcealCount(VOID);
+ULONG SvmNptConcealHits(VOID);
+ULONG64 SvmNptConcealPa(ULONG Index);  //登记页gpa(卸载恢复迭代)
+//'O'兜底(exit handler): faulting页已隐蔽→四树恢复恒等+留痕。
+//返回TRUE=已处置(重执行=访问自愈)。须在NPF分发的最前(先于
+//hook引擎: 隐蔽页gpa不是hook目标, 但泄漏态自愈分支会误切)
+BOOLEAN SvmNptConcealFaultFix(ULONG64 Gpa);
+//只读查PTE(不拆分; 'O'兜底判定用): 返回视图内gpa的4KB条目
+//现值(未拆分区返回2MB大页条目值; 非法gpa返回0)
+ULONG64 SvmNptPeekPte(ULONG View, ULONG64 Gpa);
+
 #ifdef __cplusplus
 }
 #endif

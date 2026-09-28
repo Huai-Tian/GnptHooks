@@ -133,14 +133,25 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//---- FS/GS/TR/LDTR+系统MSR集: 硬件真值预同步 ----
 	__svm_vmsave((void*)(ULONG_PTR)Vcpu->VmcbPa);    //参数=VMCB物理地址(按指针值传递, MSVC契约)
 	//---- 拦截配置(最小集; INTR不拦=中断直通) ----
-	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID;    //0x72观测采样
-	vmcb->Control.InterceptMisc1 |= INTERCEPT_MSR_PROT;  //MSRPM生效总开关
-	                                   //(M7.1 API面; 位图全0=零exit,
-	                                   //开关在位图; 范围外MSR自动exit
-	                                   //→0x7C case真值回放兜底)
+	//v0.9r=CPUID观测采样移除: v0.9p/q判读=CPUID拦截面在场5/5渐进死
+	//(DWM/GPU崩溃循环, 内核活), 不在(v0.9o)全活——无论真因是exit
+	//频率本身(硬件怪癖)还是它驱动的TSC全局水位补偿壳高频运作
+	//(参照系无对应物; NOIRVisor同类时间操纵因"Timer/GPU/NIC全乱"
+	//被整体移除=同签名先例), CPUID拦截仅观测采样非功能必需→移除。
+	//MSRPM(demo的LSTAR hook面)+复位类观测(SHUTDOWN/INIT)保留
+	vmcb->Control.InterceptMisc1 = INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT;
 	//#DB拦截常驻: 单步窗口外的任何#DB=残余TF泄漏→
 	//guest可见=0x3B/0x1E致命; 常驻+IDLE吞+清TF=最后一道网
-	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB;
+	//#MC观测(EXCP_INTERCEPT_MC, 同上: 静默复位转化器)
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB | EXCP_INTERCEPT_MC;
+	//v0.9w: V_INTR_MASKING回退为0(v0.9v教训, M8.26): kov.dev修法
+	//的前提是**拦截INTR**(物理中断→#VMEXIT→host ISR); 我们type-2
+	//in-place=INTR直通, 置位+host IF=1=物理中断无视guest cli直接
+	//投递=中断插入临界区=数据腐败=瞬间bugcheck(v0.9v实测30s全核
+	//崩溃路径爬行在被hook的KeBugCheckEx页=整机冻结)。
+	//V_INTR_MASKING=0+INTR直通=中断流与裸机一致(guest IF门控)
+	//=v0.9b以来正确形态; 0x101悬案(v0.9u 30s)另有其因, 哨兵在位
 	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;  //VMRUN位强制(一致性检查)+VMMCALL拦截
 	vmcb->Control.IopmBasePa = Vcpu->IopmPa;     //位图全0=不拦任何端口
 	vmcb->Control.MsrpmBasePa = Vcpu->MsrpmPa;   //位图全0=不拦任何MSR
@@ -149,8 +160,8 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	vmcb->Control.NpEnable |= NP_ENABLE_NP;
 	vmcb->Control.NCr3 = g_svmNcr3;
 	//TlbControl/EventInj/VmcbClean=0(分配时已清零; clean bits全0
-	//=vmrun全字段从VMCB加载, 正确性优先, 性能项待定案环境评估)。
-	//TscOffset=0起步=M6时间轴补偿基线(SvmExitHandler壳每exit负向
+	//=vmrun全字段从VMCB加载, 正确性优先)。
+	//TscOffset=0起步=时间轴补偿基线(SvmExitHandler壳每exit负向
 	//累计; clean bit0覆盖TSC offset, 全dirty形态保证每轮vmrun重载)
 }
 
@@ -200,7 +211,7 @@ static VOID SvmVcpuThread(PVOID Context)
 	ULONG svmeBack = (ULONG)((__readmsr(MSR_EFER) >> 12) & 1);
 	Vcpu->base.bSvmOn = 0;
 	Vcpu->base.bInGuest = 0;
-	//M6时间轴补偿留痕: offset终值(负值, 绝对值=本核会话root驻留
+	//时间轴补偿留痕: offset终值(负值, 绝对值=本核会话root驻留
 	//累计扣除量)。't'环事件(offset lo32/hi32)=补偿循环全程在跑的铁证
 	PVMCB vmcbFinal = (PVMCB)Vcpu->VmcbVa;
 	FlRingPush('t', idx, (ULONG)vmcbFinal->Control.TscOffset,
@@ -265,14 +276,45 @@ static VOID SvmStopAndFree(ULONG n, const char* why)
 		SvmFreeContig(v->VmmStack);
 		RtlZeroMemory(v, sizeof(GNPT_VCPU_SVM));    //资源清零: 观测残留不跨加载
 	}
+	g_svmVcpuCount = 0;    //引擎已关: root原语钉核失效(v0.9t)
 	FlLog("%s: 完成(泄漏核掩码=%X)", why, leaked);
 }
 
 //==================== 生命周期 ====================
+//虚拟化核数(0=引擎未起; v0.9u起恒=全部核, SMT隔离路线已废弃)
+volatile ULONG g_svmVcpuCount = 0;
+//v0.9v哨兵: 各核最后#VMEXIT的TSC——HB心跳检查"核在VMRUN里停泊
+//过久"(idle停泊正常=guest真实hlt; >2s且系统活动=IPI丢失嫌疑现场)
+volatile LONG64 g_svmLastExitTsc[64] = { 0 };
+
+KAFFINITY SvmPinVirtualizedCpus(VOID)
+{
+	ULONG n = g_svmVcpuCount;
+	if (n == 0)
+	{
+		return 0;
+	}
+	KAFFINITY mask = (n >= 64) ? ~(KAFFINITY)0
+		: (((KAFFINITY)1 << n) - 1);
+	//KeSetSystemAffinityThread返回VOID(WDK)——旧亲和自存自还:
+	//取当前线程亲和(新掩码写入前的值), 由调用方经
+	//KeSetSystemAffinityThread(oldAff)还原
+	KAFFINITY oldAff = KeQueryActiveProcessors();
+	KeSetSystemAffinityThread(mask);
+	return oldAff;
+}
+
 NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 {
 	UNREFERENCED_PARAMETER(DriverObject);
 	ULONG cpuCount = KeQueryActiveProcessorCount(NULL);
+	//v0.9u=全核接管回退(SMT隔离终裁放弃, M8.24): 部分虚拟化=
+	//不一致性根源(蓝pill公理"every core has to go under";
+	//v0.9s/t两轮实测: vmmcall#UD+#DB逃逸均因裸机兄弟核)。
+	//SvmPinVirtualizedCpus/g_svmVcpuCount保留为API(全核时
+	//掩码=全核集, 调用无害), 未来若重启部分虚拟化需先解决
+	//TF窗口迁移/hook布防一致性问题
+	g_svmVcpuCount = cpuCount;    //root原语钉核依据(v0.9t, 全核值)
 	if (cpuCount > 64)
 	{
 		FlLog("GNPT: 拒绝启动: %u核超64(单组上限)", cpuCount);
@@ -361,6 +403,14 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		}
 	}
 	KeInitializeEvent(&g_svmShutdownEvent, NotificationEvent, FALSE);
+	//NPT自我隐蔽: 全部核资源已分配+零核launch(此刻本线程纯裸机
+	//root态=写NPT页直访物理自免疫); 首核launch后guest态动态写须走
+	//vmmcall root原语(见svm.h功能码注释)。失败=无隐蔽(非致命, 记日志)
+	//v0.9r=隐蔽回归(v0.9q判读: 无隐蔽仍死→隐蔽无罪; 全功能恢复)
+	if (!SvmNptConcealAll())
+	{
+		FlLog("[Entry] 自我隐蔽失败(内存不足?), 无隐蔽继续(功能不受影响)");
+	}
 	//每核发起线程
 	ULONG created = 0;
 	for (ULONG i = 0; i < cpuCount; i++)
@@ -498,9 +548,10 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 	GnptHookStepLeakCheck(vmcb, cpu);
 	switch ((ULONG)exitCode)
 	{
-		case SVM_EXIT_VMMCALL:    //0x81: 探针/KEEP/STOP桥+签名门
+		case SVM_EXIT_VMMCALL:    //0x81: 探针/KEEP/STOP桥+签名门+root写原语族
 		{
 			ULONG func = (ULONG)Regs->rcx;
+			ULONG64 arg1 = Regs->rdx, arg2 = Regs->r8, arg3 = Regs->r9;
 			//签名门+CPL门+功能码白名单: 不符='u'采样+#UD注入(裸机vmmcall
 			//等价语义), RIP不推进(fault指向引发指令; §15.20注入不经拦截
 			//检查)。CPL取VMCB.Cpl(§15.6回写恒真); 用户态vmmcall=外来者
@@ -509,7 +560,9 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				Regs->r10 != GNPT_VMMCALL_SIG0 ||
 				Regs->r11 != GNPT_VMMCALL_SIG1 ||
 				(func != GNPT_PROBE_MAGIC && func != GNPT_VMCALL_KEEP &&
-					func != GNPT_VMCALL_STOP && func != GNPT_VMCALL_NPTSYNC))
+					func != GNPT_VMCALL_STOP && func != GNPT_VMCALL_NPTSYNC &&
+					func != GNPT_VMCALL_NPTSET && func != GNPT_VMCALL_NPTRES &&
+					func != GNPT_VMCALL_MSRBIT))
 			{
 				static volatile LONG s_sigCnt[64] = { 0 };    //每核计数
 				LONG sn = InterlockedIncrement(&s_sigCnt[cpu & 63]);
@@ -555,6 +608,40 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					FlRingPush('i', cpu, GNPT_VMCALL_NPTSYNC, 0, 0, 0);    //每核同步确认(触发链面包屑)
 					SvmAdvanceRip(vmcb);
 					return 0;
+				case GNPT_VMCALL_NPTSET:    //root写原语: 视图PTE(隐蔽后动态写唯一正道)
+					SvmNptSetPte((ULONG)(arg2 >> 48) & 0xF, arg1,
+						arg2 & 0x0000FFFFFFFFFFFFULL, arg3);
+					FlRingPush('n', cpu, GNPT_VMCALL_NPTSET, arg1, arg2, arg3);
+					SvmAdvanceRip(vmcb);
+					return 0;
+				case GNPT_VMCALL_NPTRES:    //root恢复原语: 单树(0-3)/四树(0xF)恒等
+				{
+					ULONG vw = (ULONG)arg2 & 0xF;
+					if (vw == 0xF)
+					{
+						for (ULONG v = 0; v < GNPT_VIEW_COUNT; v++)
+						{
+							SvmNptRestoreIdentity(v, arg1);
+						}
+					}
+					else
+					{
+						SvmNptRestoreIdentity(vw, arg1);
+					}
+					FlRingPush('n', cpu, GNPT_VMCALL_NPTRES, arg1, arg2, 0);
+					SvmAdvanceRip(vmcb);
+					return 0;
+				}
+				case GNPT_VMCALL_MSRBIT:    //root位图原语: 全核MSRPM位操作
+				{
+					ULONG32 msr = (ULONG32)arg1;
+					BOOLEAN isWrite = ((arg2 & 2) != 0);
+					BOOLEAN set = ((arg2 & 1) != 0);
+					GnptMsrBitmapRootAllCpus(msr, isWrite, set);
+					FlRingPush('b', cpu, GNPT_VMCALL_MSRBIT, arg1, arg2, 0);
+					SvmAdvanceRip(vmcb);
+					return 0;
+				}
 				default:
 					break;    //白名单已收窄, 不可达
 			}
@@ -565,7 +652,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			int info[4] = { 0 };
 			__cpuidex(info, (int)Regs->rax, (int)Regs->rcx);
 			//RAX走VMCB(asm契约: 帧rax槽恢复时跳过, vmrun从VMCB
-			//加载——写Regs->rax无效; v0.9b判例: M1以来EAX未达guest)
+			//加载——写Regs->rax无效)
 			vmcb->State.Rax = (ULONG64)(ULONG)info[0];
 			Regs->rax = (ULONG64)(ULONG)info[0];
 			Regs->rbx = (ULONG64)(ULONG)info[1];
@@ -574,7 +661,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			SvmAdvanceRip(vmcb);
 			return 0;
 		}
-		case SVM_EXIT_MSR:    //0x7C: MSR拦截API面(M7.1)
+		case SVM_EXIT_MSR:    //0x7C: MSR拦截API面
 		{
 			//EXITINFO1 bit0=0读/1写(位义见msr.h); MSR号在ECX。
 			//hook命中→回调(读=伪造值/写=放行或静默丢弃); 未hook
@@ -609,7 +696,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					val = __readmsr(msr);    //未hook真值回放
 				}
 				//RAX=低32走VMCB(asm契约: 帧rax槽vmrun时被VMCB.RAX
-				//覆盖——v0.9a判例: 低32停留在rdmsr时刻线程EAX);
+				//覆盖——不写VMCB则低32停留在rdmsr时刻线程EAX);
 				//RDX=高32是帧GPR正常路径
 				vmcb->State.Rax = val & 0xFFFFFFFFULL;
 				Regs->rax = val & 0xFFFFFFFFULL;
@@ -620,7 +707,14 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 		}
 		case SVM_EXIT_NPF:    //0x400嵌套页故障: 双NPT视图切换引擎(hook布防产物)
 		{
-				//引擎处理hook布防引发的NPF(取指进Secondary/写回Primary);
+			//隐蔽页写/执行fault兜底(须最前置: 先于hook引擎
+			//——隐蔽页gpa非hook目标, 但泄漏态自愈分支会误切视图)
+			if (SvmNptConcealFaultFix(vmcb->Control.ExitInfo2))
+			{
+				vmcb->Control.TlbControl = 3;    //恢复后冲净零页翻译
+				return 0;    //重执行=访问自愈
+			}
+			//引擎处理hook布防引发的NPF(取指进Secondary/写回Primary);
 			//未处理=异常信号(fault语义不推RIP, 'N'环留痕)
 			if (GnptHookNpfEngine(vmcb, cpu,
 				vmcb->Control.ExitInfo1, vmcb->Control.ExitInfo2))
@@ -679,6 +773,20 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			vmcb->Control.InterceptMisc1 &= ~(INTERCEPT_PUSHF | INTERCEPT_POPF);
 			return 0;
 		}
+		case SVM_EXIT_SHUTDOWN:    //0x7F: guest triple fault(硬件复位级)
+		case SVM_EXIT_INIT:        //0x63: 外部INIT(复位类IPI; 含带引擎重启)
+		case SVM_EXIT_EXCP_MC:     //0x52: 机器检查(#MC)
+			//观测轮(v0.9o): 静默硬复位转化器——命中即留痕+标记蓝屏
+			//(0xDEADDEAD, P1=exit码 P2=cpu P3=RIP P4=Info1)。同OS
+			//设计=exit handler即OS上下文, KeBugCheckEx任意IRQL合法;
+			//dump含内核内存='Y'环条目与VMCB全量可析。注意: 带引擎
+			//重启(INIT)也会触发——重启前sc stop本就是纪律
+			FlRingPush('Y', cpu, (ULONG)exitCode, vmcb->State.Rip,
+				vmcb->Control.ExitInfo1, vmcb->Control.ExitInfo2);
+			KeBugCheckEx(0xDEADDEAD, (ULONG_PTR)(ULONG)exitCode, cpu,
+				(ULONG_PTR)vmcb->State.Rip,
+				(ULONG_PTR)vmcb->Control.ExitInfo1);
+			return 0;    //不可达(bugcheck不归)
 		default:    //未知exit: 计数留痕(FlRingExit兜底限流)+推进(观察语义)
 			SvmAdvanceRip(vmcb);
 			return 0;
@@ -689,18 +797,14 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 }
 
 //==================== exit handler外壳(asm调用, GIF=0上下文) ====================
-//M6时间轴补偿壳(v0.8b全局水位形态): guest读TSC(RDTSC/RDTSCP直通
+//TSC时间轴补偿壳(全局水位形态): guest读TSC(RDTSC/RDTSCP直通
 //零exit)=物理TSC+VMCB.TscOffset(硬件加, §15.10控制区语义+App.B
 //"to be added in RDTSC and RDTSCP")。本壳把每次#VMEXIT的root驻留
 //时长从guest时间线扣除——guest时间线上"exit从未发生"。
 //
-//v0.8a判例(事故): 每核独立负向累计=跨核偏差无界增长——31s内热核
-//(单步窗口风暴19K exits/s)滞后9ms、冷核0.09ms, 线程迁移即遭遇
-//最高9ms的RDTSC倒退; Windows裸rdtsc使用者(GPU驱动/DWM栈)依赖
-//跨核同步契约→UI饥饿+DWM重启循环。借阅[GeptHooks]跨核跳变审计
-//结论时未重推导前提(其前提=稳态零exit, 本架构=持续非对称exit流)。
-//
-//v0.8b: 全局虚拟时间线水位g_svmTscWm(单调只升, cmpxchg免锁max)。
+//设计约束: 每核独立负向累计=跨核偏差无界增长, 线程迁移即遭遇
+//RDTSC倒退(Windows裸rdtsc使用者依赖跨核同步契约)——故用全局
+//虚拟时间线水位g_svmTscWm(单调只升, cmpxchg免锁max)。
 //每exit三步: ①扣驻留(本核单调性保持: 扣除窗[T0,T1]含于真实不可
 //见窗, 相邻guest读间扣除总和≤物理差→本核永不倒退) ②virt对水位
 //做max提升 ③落后水位>ε则前跳重挂共享时间线。效果: 热核不再自己
@@ -715,6 +819,8 @@ static volatile LONG64 g_svmTscWm = 0;   //全局虚拟TSC水位(单调只升)
 ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 {
 	Vcpu->ExitTsc = __rdtsc();              //T0: root驻留起点
+	g_svmLastExitTsc[(ULONG)(UCHAR)Vcpu->CpuIndex & 63] =
+		Vcpu->ExitTsc;                      //v0.9v哨兵刷新(核号取VCPU)
 	ULONG stop = SvmExitDispatch(Vcpu, Regs);
 	if (stop == 0)
 	{

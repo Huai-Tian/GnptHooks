@@ -606,11 +606,30 @@ static VOID FlThreadProcT1(PVOID Context)
 				if (g_svmVcpu[c].base.bLaunchFailed)  failMsk  |= (1UL << c);
 				if (g_svmVcpu[c].base.bSvmOn)         onMsk    |= (1UL << c);
 			}
+			//v0.9v停泊哨兵: 各核距上次#VMEXIT的时长(仅虚拟化核);
+			//parked掩码=超2s无exit的核(idle停泊属正常, 但系统死前
+			//该掩码的形态=IPI丢失现场定位)。TSC频率≈标称GHz, 2s
+			//阈值保守(3.4e9*2)
+			ULONG parkedX = 0;
+			ULONG64 nowTsc = __rdtsc();
+			for (ULONG c = 0; c < cpuCnt && c < 64; c++)
+			{
+				if (!g_svmVcpu[c].base.bSvmOn)
+				{
+					continue;
+				}
+				LONG64 le = g_svmLastExitTsc[c];
+				if (le != 0 && nowTsc > (ULONG64)le &&
+					nowTsc - (ULONG64)le > 6800000000ULL)
+				{
+					parkedX |= (1UL << c);
+				}
+			}
 			RtlStringCbPrintfA(hbb, sizeof(hbb),
-				"[HB%llu] up=%us lag=%ld wf=%ld/%ld g:%X f:%X o:%X p:%X vcpu=%d pend=%d exits:",
+				"[HB%llu] up=%us lag=%ld wf=%ld/%ld g:%X f:%X o:%X p:%X pk:%X vcpu=%d pend=%d exits:",
 				++hb, (ULONG)(KeQueryUnbiasedInterruptTime() / 10000000ULL),
 				g_flT1Lag, g_flWriteFailsT1, g_flWriteFailsT2,
-				guestMsk, failMsk, onMsk, g_gnptParkedMask,
+				guestMsk, failMsk, onMsk, g_gnptParkedMask, parkedX,
 				(int)g_gnptVcpuCpu,
 				(g_gnptVcpuCpu >= 0) ? (int)g_svmVcpu[g_gnptVcpuCpu].base.PendingIntrCount : 0);
 			{

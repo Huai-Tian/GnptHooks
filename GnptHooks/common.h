@@ -114,14 +114,21 @@ typedef struct _GNPT_RING_ENTRY
 //  E=#VMEXIT采样(rsn=exit code) R=vmrun一致性失败 W=落地探针
 //  Q=KEEP放行 S=STOP桥通过(卸载留痕, rsn=0x81, a=1)
 //  u=vmmcall签名门拒绝(rsn=0x81, b=试探的功能码) B=#UD注入采样(rsn=引发exit)
-//  D=同(code,rip)环路 X=NPF风暴逃生(rsn=0x400) T/Z/U=预留(park/未知exit族)
+//  D=同(code,rip)环路 X=NPF风暴逃生(rsn=0x400) T/U=预留(park/未知exit族)
 //  i=NPTSYNC每核TLB同步确认(rsn=0x81, 安装/移除布防面包屑)
 //  V=NPT视图切换采样(a=视图 b=每核计数) H=detour分发入口(a=目标)
 //  O=CallOriginal入口(a=重定位跳板) N=NPF留痕(rsn=0x400, a=gpa, b=错误码)
 //  h=hook命中采样(用户回调发出, rsn=Arg1低32位, a=命中计数) w=CallOriginal误用警告(非回调上下文)
 //  s=单步arm(rsn=用途1读透明/2临时RW/3REHIDE, a=hook条目, b=采样计数; 读透明链起点)
 //  e=单步#DB收尾(rsn=用途, a=0(BS=1 TF引发)/1(BS=0 Dr断点抢入), b=计数; 链终点)
-//  b=EXITINTINFO.V=1重放(guest事件递送途中被拦, a=EXITINTINFO值)
+//  b=MSRBIT root位图原语(rsn=0x81, a=msr, b=op)
+//  n=NPT root原语(rsn=功能码5/6, a=gpa, b=pa|view或view, c=flags)
+//  m=MSR exit采样(rsn=0x7C, a=msr, b=读写1位, c=计数; 首条+每4096条)
+//  Z=自我隐蔽完成(rsn=0, a=零页pa, b=登记页数, c=页表页数; 一次)
+//  o=隐蔽页兜底恢复(rsn=0x400, a=隐蔽页pa, b=faulting gpa, c=累计次数)
+//  F=TRANSPARENT风暴自保护解除(rsn=0x400, a=目标, b=累计NPF数)
+//  Y=复位类事件命中(rsn=exit码0x7F/0x63/0x52, a=RIP, b/c=Info; 随后
+//    0xDEADDEAD标记蓝屏——把无痕迹硬复位变成带dump可分析崩溃)
 //  P=pushf仿真(窗口内) p=popf仿真(窗口内)
 //  L=单步窗口泄漏收口(rsn=用途 a=RIP b=RFLAGS——armed而TF已失,
 //    清TF类指令把窗口卡死, 防御体系按use收尾)
@@ -215,7 +222,7 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9b"
+#define GNPT_BUILD_TAG "v0.9w"
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 
 #ifdef __cplusplus
