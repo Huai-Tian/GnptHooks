@@ -31,11 +31,26 @@ The redirection is performed purely by nested-page-table translation. The *Prima
 - **Write-transparency by construction**
   The Secondary view maps the hook page as read-only: any guest write to the page faults (NPF) and the engine forwards it to the Primary view, where the write lands on the real original page — hook bookkeeping pages stay coherent while callers never observe the shadow copy.
 
+- **Target-selection boundary (PatchGuard)**
+  The Secondary view stays **readable** in normal mode: external readers (PatchGuard, kernel scanners) see the CodePage jump bytes there — for PatchGuard-covered targets (SSDT / system services) this ends in a 0x109 bugcheck (PG checks fire on a randomized schedule; surviving a short soak proves nothing — v0.9d ran with NtClose hooked for ~74 minutes before being killed). Use normal mode only on non-PG-covered ordinary kernel functions; for covered targets use the TRANSPARENT mode below (low-traffic only). AMD NPT has no exec-only permission bit, so normal mode cannot get read-transparency for free.
+
 - **TRANSPARENT mode: read-transparency for scanner-grade stealth**
   Install with `HOOK_TRANSPARENT` and the engine arms **four static NPT views** (P / HOOKS / HIDE / EXEC, one ASID each — view switches are pure NCR3+ASID writes: zero PTE writes, zero TLB flushes). In the hiding state the hook page is simply *not present*: any external read (PatchGuard, scanners) faults and is served the **original bytes** through a single-step window — AMD has no MTF, so the engine injects TF, claims the #DB, and re-hides. Executing the target opens a one-instruction EXEC window that detours, then re-hides. A leak-defense net (per-exit window liveness check, permanent #DB intercept, interrupt-frame TF scrubbing) makes sure the single-step machinery can never surface a guest-visible #DB. Best for low-traffic targets — each stepped instruction costs 2 VM-Exits.
 
 - **Observability governed by build configuration**
   The whole observation stack (writer threads, binary event ring, BSOD black-box watchdog) is governed by the build type: **Debug builds = full observability** (authoritative log in `C:\Windows\Temp\gnpt_log.txt`, desktop mirror; if logging stalls for 30 s the watchdog deliberately bugchecks to capture a memory dump — a debugging aid, never part of a delivery build); **Release builds = zero logging code in the binary**. Deliberately no runtime/registry switch — a registry value is both a static signature an AV/EDR can flag and a footprint left on the target.
+
+- **MSR interception API (read forge / write monitor)**
+  Per-core MSR permission bitmaps (MSRPM) let your hook trap RDMSR/WRMSR on any MSR inside the three architecturally-covered ranges: a read callback returns the value the guest sees (forge LSTAR, EFER, whatever), a write callback either passes the write through (faithfully re-executed in root, semantics identical to passthrough) or silently swallows it. Out-of-range MSRs (e.g. 0x40000000+) auto-exit and are replayed with true values — bare-metal equivalent, guaranteed by the dispatcher. Un-hooked MSRs cost zero exits (hardware walks the bitmap).
+
+- **NPT self-concealment**
+  After takeover the engine remaps its own page-table pages (~2,100 pages) to a zero page in the guest's view — the entire nested-paging hierarchy that betrays the hypervisor's presence reads back as zeros to any guest-side scanner, with no exit in steady state. Installation runs on the launch thread before the first core enters the guest (pure root mode, physical access immune), later dynamic writes go through the `vmmcall` root primitive.
+
+- **TSC timeline compensation**
+  Every VM-exit burns cycles the guest can measure with RDTSC pairs. The engine maintains a TSC-offset watermark: exit paths account for their own cost and the offset is clamped cross-core so no core's guest timeline ever runs *ahead* of real time — timing-based hypervisor detection sees a uniformly slowed clock, never a negative delta.
+
+- **Two-tier BSOD black box + per-core DPC sentinel**
+  Debug builds carry two crash-forensics layers: the classic write-stall watchdog (bugcheck 0xDEADC0DE with the last 20 log lines embedded in the bugcheck parameters) and the **DPC sentinel** — a per-core DPC heartbeat checked by the logger thread; a core that stops answering DPCs for 12 s is confirmed wedged and the system is deliberately bugchecked (0xDEADC1DE, hung-core mask as parameter) while the surviving cores can still write the dump. You get the full scene of the hang, not a frozen silent death.
 
 - **Clean delivery form**
   The driver entry runs only the framework lifecycle (resource allocation → per-core virtualization launch → resident) plus one demo hook (`main.c` is yours to replace). The framework is consumed as source — add the files to your own driver project.
@@ -158,7 +173,7 @@ On unload, remove all hooks **before** SVM teardown (`GnptHookRemoveAll` — in-
 
 ## 🧪 Capability Verification Matrix
 
-Core paths verified on nested AMD SVM (VMware guest, Windows 10 x64) — base engine at v0.3c (2-core), single-step & stealth suite at v0.7d (4-core):
+Core paths verified on nested AMD SVM (VMware guest, Windows 10 x64) — base engine at v0.3c (2-core), single-step & stealth suite at v0.7d (4-core); physical-hardware rows follow:
 
 | Capability | Measured evidence |
 |---|---|
@@ -174,11 +189,24 @@ Core paths verified on nested AMD SVM (VMware guest, Windows 10 x64) — base en
 | Atomic unload | All cores STOP bridge with SVME read-back = 0; zero leaked cores; NPT pages fully released (accounting exact) |
 | Release delivery form | Log-free build compiles clean (Fl\* macros collapse to no-ops) |
 
-Physical-hardware final verification (NPF-counter criteria, ASID no-flush switching) is on the roadmap — see Project Status.
+Physical-hardware verification (Ryzen 7 5800H, Windows 10 22H2, all 16 cores):
+
+| Capability | Measured evidence |
+|---|---|
+| All-core takeover + clean unload on 16 cores | repeated across versions; unload leaves SVME read-back = 0 on every core, zero leaked cores, NPT accounting exact (even mid-death unload verified once: system dying of an unrelated power-policy stress, driver still tore down 16 cores cleanly) |
+| Steady-state zero-exit interception (physical) | 4.6M+ ordinary-mode trigger hits (two rounds), NPF counter pinned per-core |
+| TRANSPARENT single-step chain (physical) | self-triggered windows + PG-guarded target (KeBugCheckEx-page candidates) exercised across full-feature rounds |
+| Page-hot disarmament | install-time per-target NPF heat probe rejects hot pages (rejected KeBugCheckEx at 1,024–1,592 NPF/250 ms) and the tstorm shed logic auto-drops a hook whose page turns hot at runtime (measured: first-minute shed at 1,606–1,763 NPF) — both leave audit lines |
+| NPT self-concealment (physical) | 2,284 page-table pages remapped to a zero page; PatchGuard-runs-clean soak verified |
+| MSR interception (physical) | LSTAR read forge + self-trigger thread ×3 verified per session |
+| Stability under adversarial power policy | full-feature rounds: deep-idle round 30 min green, **C0-pinned round 30 min green** (historically 3/3 dead before the root-cause fix below) |
+| Root-caused & fixed: the three-body race | 11-round isolation matrix (single-factor/dual-factor/combination builds) pinned CLOCK_WATCHDOG_TIMEOUT (0x101) deaths on a hardware-level race between **NPT self-concealment (remapped PT pages) × MSRPM read interception × passthrough WRMSR**: write-passthrough died in 107 s, write-intercepted (root re-executes the write) green — one-variable life/death flip, fix verified by the full accelerated suite (both rounds green, C-round first-ever pass) |
+
+The stability story is documented as case law (NOTES.md, in-repo) — every claim above has a log-level evidence chain.
 
 ## ⚠️ Project Status
 
-Milestones M0 (skeleton + observation stack), M1 (SVM world switch), M2 (NPT identity mapping), M3 (dual-NPT hook engine), M4 (TF+#DB single-step primitives) and M5 (four-view TRANSPARENT stealth suite with leak defenses) have graduated from staged testing **on nested virtualization** — the v0.7d build passed a full end-to-end run: 20 real interceptions over a 265 s soak, every single-step window closed, clean unload with zero leaked cores. Remaining: long-duration PatchGuard soak, physical-hardware final verification, M6 clock domains, M7 root hardening + release. The framework is research-grade: a hypervisor-level bug may still bugcheck the system — always test on a disposable machine.
+Milestones M0–M5 (engine, dual-NPT hook, TF+#DB single-step primitives, four-view TRANSPARENT suite), M6 (TSC timeline compensation + clock-domain investigation), M7 (MSR hook face via MSRPM bitmaps), M8 (NPT self-concealment + a stability campaign that ended with the page-hot defenses and a full-core/SMT-threads verdict) and M9 (three-body race root-caused and fixed — see the matrix above) have all graduated **on physical hardware** (Ryzen 7 5800H). The current build (v0.9y) is the most stable form to date: accelerated Full suite double-green (deep-idle + C0-pinned, 30 min each) with clean unload, plus a per-core DPC sentinel for automatic crash forensics. The framework remains research-grade: a hypervisor-level bug may still bugcheck the system — always test on a disposable machine.
 
 ## 🚫 Non-Commercial Statement
 
