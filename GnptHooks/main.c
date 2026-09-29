@@ -48,6 +48,19 @@ static ULONG64 DemoLstarOnRead(PVOID Context, ULONG32 Msr)
 	return GnptMsrReadReal(Msr);
 }
 
+//v0.9y写回调(M9.6定罪修复): 计数+忠实放行——写位拦截后由
+//exit handler root代写(斩断"直通写×读exit×隐蔽"三体竞态;
+//x8验证: 写直通死107s→写拦截绿15min+)
+static volatile LONG64 g_demoWrmsr = 0;
+static BOOLEAN DemoLstarOnWrite(PVOID Context, ULONG32 Msr, ULONG64 Value)
+{
+	UNREFERENCED_PARAMETER(Context);
+	UNREFERENCED_PARAMETER(Msr);
+	UNREFERENCED_PARAMETER(Value);
+	InterlockedIncrement64(&g_demoWrmsr);   //IRQL安全计数
+	return TRUE;    //放行代写(root真写, 与直通语义等价)
+}
+
 //MSR自触发线程: 内核线程在guest内rdmsr LSTAR×3(运行期系统
 //几乎无人读LSTAR, 自触发=机制验证不依赖自然触发)。返回值比对=
 //真值直读(virtual含root内读, 恒等自检)
@@ -106,8 +119,49 @@ static VOID DemoPgTriggerThread(PVOID Context)
 //KeServiceDescriptorTable(链接不可得), 运行时定位器(LSTAR→
 //KiSystemCall64模式扫描)依赖未经目标机验证的内部形态, 不做;
 //demo候选均选可直解析的导出名
+//M9.2拆分(v2): MSR面独立安装函数(原在DemoHookInstall内,
+//x5构建缺陷=不调用DemoHookInstall则MSR永不装——拆出修复)
+static VOID DemoMsrInstall(VOID)
+{
+	//MSR hook: 读写双拦+自触发线程验证。
+	//v0.9y(M9.6定罪): 写位必须拦截(OnWrite=忠实放行代写)——
+	//"写直通×读exit×NPT改译隐蔽"三体竞态=0x101系列死亡根因
+	//(x5_v2写直通钉C0死107s vs x8写拦截绿15min+, 单变量翻转);
+	//"系统运行期无人写LSTAR"假设被证伪(PG KiErrata420Present
+	//周期性写)。OnWrite放行=语义与直通等价(计数后root真写)
+	{
+		GNPT_MSR_HOOK msrHook = { 0 };
+		msrHook.Msr = 0xC0000082;    //IA32_LSTAR
+		msrHook.OnRead = DemoLstarOnRead;
+		msrHook.OnWrite = DemoLstarOnWrite;   //v0.9y: 写也拦截(忠实代写, 斩断竞态)
+		NTSTATUS mst = GnptMsrHookInstall(&msrHook);
+		FlLog("[Demo] MSR hook LSTAR(0xC0000082): %s(触发计数=卸载总结)",
+			NT_SUCCESS(mst) ? "OK" : "FAIL(见[MSR]行)");
+		if (NT_SUCCESS(mst))
+		{
+			KeInitializeEvent(&g_demoMsrDone,
+				NotificationEvent, FALSE);
+			g_demoMsrArmed = TRUE;
+			HANDLE th = NULL;
+			NTSTATUS tst = PsCreateSystemThread(&th, 0, NULL,
+				NULL, NULL, DemoMsrTriggerThread, NULL);
+			if (NT_SUCCESS(tst))
+			{
+				ZwClose(th);    //句柄即弃(线程对象自持有引用)
+			}
+			else
+			{
+				FlLog("[Demo] MSR自触发线程创建失败=0x%X", (ULONG)tst);
+			}
+		}
+	}
+
+}
+
 static VOID DemoHookInstall(VOID)
 {
+	//M9.2变体: detour块=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7)
+#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 3 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 7
 	//detour hook(TRANSPARENT模式): 目标=按序尝试的候选链(首个安装
 	//成功者胜出; 引擎安装期热探测拒绝热页=正常降级, [Hook]行留痕)。
 	//prologue不可重定位=[Reloc]拒绝取下一候选
@@ -177,33 +231,7 @@ static VOID DemoHookInstall(VOID)
 			FlLog("[Demo] TRANSPARENT自触发线程创建失败=0x%X", (ULONG)tst);
 		}
 	}
-	//MSR hook: 读拦截(wrmsr不拦=系统运行期无人写LSTAR,
-	//写位不置=零额外exit面)+自触发线程验证
-	{
-		GNPT_MSR_HOOK msrHook = { 0 };
-		msrHook.Msr = 0xC0000082;    //IA32_LSTAR
-		msrHook.OnRead = DemoLstarOnRead;
-		NTSTATUS mst = GnptMsrHookInstall(&msrHook);
-		FlLog("[Demo] MSR hook LSTAR(0xC0000082): %s(触发计数=卸载总结)",
-			NT_SUCCESS(mst) ? "OK" : "FAIL(见[MSR]行)");
-		if (NT_SUCCESS(mst))
-		{
-			KeInitializeEvent(&g_demoMsrDone,
-				NotificationEvent, FALSE);
-			g_demoMsrArmed = TRUE;
-			HANDLE th = NULL;
-			NTSTATUS tst = PsCreateSystemThread(&th, 0, NULL,
-				NULL, NULL, DemoMsrTriggerThread, NULL);
-			if (NT_SUCCESS(tst))
-			{
-				ZwClose(th);    //句柄即弃(线程对象自持有引用)
-			}
-			else
-			{
-				FlLog("[Demo] MSR自触发线程创建失败=0x%X", (ULONG)tst);
-			}
-		}
-	}
+#endif
 }
 
 VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
@@ -226,8 +254,8 @@ VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
 			KernelMode, FALSE, &to);
 	}
 	//按目标移除(未显式移除的hook由关停流程统一清理)
-	FlLog("[Unload] Demo TRANSPARENT触发计数=%lld, LSTAR读拦截=%lld次",
-		g_demoCalls, g_demoRdmsr);
+	FlLog("[Unload] Demo TRANSPARENT触发计数=%lld, LSTAR读拦截=%lld次, 写拦截=%lld次",
+		g_demoCalls, g_demoRdmsr, g_demoWrmsr);
 	GnptMsrHookRemove(0xC0000082);
 	if (g_demoTarget != NULL)
 	{
@@ -265,10 +293,34 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	//放行T2的Desktop镜像(加载窗口期已过)
 	FlMarkEntryDone();
 
+	//M9.2变体形态标识(横幅外第二证据, 防测错形态)
+#if GNPT_M92_VARIANT == 1
+	FlLog("[Entry] M9.2鉴别构建: 全停基座(隐蔽/hook/MSR全停; 引擎+哨兵+TSC钳制在位)");
+#elif GNPT_M92_VARIANT == 2
+	FlLog("[Entry] M9.2鉴别构建: 裸隐蔽(hook/MSR停)");
+#elif GNPT_M92_VARIANT == 3
+	FlLog("[Entry] M9.2鉴别构建: 裸hook(隐蔽/MSR停)");
+#elif GNPT_M92_VARIANT == 4
+	FlLog("[Entry] M9.2鉴别构建: 裸MSR(隐蔽/hook停)");
+#elif GNPT_M92_VARIANT == 5
+	FlLog("[Entry] M9.2鉴别构建: 隐蔽+MSR(hook停)——死亡时刻活跃面复刻");
+#elif GNPT_M92_VARIANT == 6
+	FlLog("[Entry] M9.2鉴别构建: 隐蔽+hook(MSR停)");
+#elif GNPT_M92_VARIANT == 7
+	FlLog("[Entry] M9.2鉴别构建: hook+MSR(隐蔽停)");
+#endif
+
 	//接管成功, 安装演示hook
 	//v0.9p=全功能恢复轮: demo回归(v0.9n-v0.9o鉴别期停用)——
 	//与隐蔽/MSR/CPUID面一起, 在新BIOS+加速框架下补测"全功能"格
+	//M9.2变体: hook开启=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7)
+#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 3 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 7
 	DemoHookInstall();
+#endif
+	//M9.2(v2): MSR面独立调用(全功能/裸MSR/隐蔽+MSR/hook+MSR)
+#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 4 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 7
+	DemoMsrInstall();
+#endif
 	FlLog("[Entry] 完成(%s)", GNPT_BUILD_TAG);
 	return STATUS_SUCCESS;
 }

@@ -222,7 +222,16 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9w"
+#define GNPT_BUILD_TAG "v0.9y"
+//v0.9y=M9.6定罪修复版: demo MSR hook写位拦截(OnWrite忠实放行,
+//斩断"直通写×读exit×隐蔽"三体竞态=0x101系列根因)+哨兵v2转正
+//(DPC往返挂死核检测, 运行时开关, 见GNPT_DPC_SENTINEL)。
+//变体开关(v0.9x系鉴别脚手架, 正式版恒0; 0=全功能):
+//0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR
+//6=隐蔽+hook 7=hook+MSR 8=机制轮(历史: 写双拦验证)
+#define GNPT_M92_VARIANT 0
+//哨兵v2运行时开关(默认开; 0=关——纯引擎最小观测面场景)
+#define GNPT_DPC_SENTINEL 1
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 
 #ifdef __cplusplus

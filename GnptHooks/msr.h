@@ -34,6 +34,14 @@
 //  3. 写回调返回FALSE=静默丢弃: guest读到"写成功"假象。对系统
 //     运行期会合法写的MSR(如GS base)慎用, 监控场景用TRUE放行
 //  4. Remove后新触发立即停止; 在途exit(已查表)安全完成
+//  5. **v0.9y竞态纪律(M9.6定罪, 违反=0x101概率死)**: NPT自我
+//     隐蔽在场时, 对"置了读拦截"的MSR, 其写路径**禁止直通**
+//     (OnWrite=NULL)——"直通WRMSR×读exit×改译页"三体竞态
+//     =CLOCK_WATCHDOG_TIMEOUT系列根因(x5_v2直通钉C0死107s
+//     vs x8双拦绿15min+, 单变量翻转实证)。正确形态=OnWrite
+//     忠实放行回调(TRUE+root代写, 语义与直通等价)。MSR被
+//     系统周期性写是常态(LSTAR=PG KiErrata420Present目标),
+//     "运行期无人写"假设不可依赖
 //
 //EXITINFO1位义(0x7C): bit0=0读/1写(APM附录A未载此位义, 为
 //执行级验证结论)

@@ -407,10 +407,15 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	//root态=写NPT页直访物理自免疫); 首核launch后guest态动态写须走
 	//vmmcall root原语(见svm.h功能码注释)。失败=无隐蔽(非致命, 记日志)
 	//v0.9r=隐蔽回归(v0.9q判读: 无隐蔽仍死→隐蔽无罪; 全功能恢复)
+	//M9.2变体: 隐蔽开启=全功能(0)/裸隐蔽(2)/隐蔽+MSR(5)/隐蔽+hook(6)/x8机制轮(8)
+#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 2 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 8
 	if (!SvmNptConcealAll())
 	{
 		FlLog("[Entry] 自我隐蔽失败(内存不足?), 无隐蔽继续(功能不受影响)");
 	}
+#else
+	FlLog("[Entry] M9.2鉴别: 自我隐蔽停用(本轮无零页改译)");
+#endif
 	//每核发起线程
 	ULONG created = 0;
 	for (ULONG i = 0; i < cpuCount; i++)

@@ -541,6 +541,60 @@ static VOID FlDrainLines(HANDLE hFile, PLONG pCursor, volatile LONG* pFails)
 	*pCursor = head;
 }
 
+//===== M9.2 x8哨兵v2: DPC往返挂死核检测(变体8专用) =====
+//动机: x5_v2死107s无dump——现有看门狗(0xDEADC0DE)只盯写盘游标
+//停滞, 全机级冻结时看门狗线程自己也死。哨兵v2思路: 每核DPC心跳
+//(健康核毫秒级应答; 核楔死在root/客户态cli循环=DPC永不运行),
+//T1侧发现某核25s无应答→立即KeBugCheckEx取证(此时其余核还活着,
+//dump能写出=拿到挂死核的完整现场)。
+//IRQL纪律: DPC例程DISPATCH级只写时间戳(无FlLog/无锁)
+#if GNPT_DPC_SENTINEL
+static volatile LONG64 g_flDpcBeat[64];    //每核最近DPC应答TSC
+static KDPC g_flDpcObj[64];
+static volatile LONG g_flDpcArmed = 0;
+static ULONG g_flDpcCount = 0;
+
+static VOID FlDpcBeatProc(PKDPC Dpc, PVOID Def, PVOID Sys1, PVOID Sys2)
+{
+	UNREFERENCED_PARAMETER(Dpc);
+	UNREFERENCED_PARAMETER(Def);
+	UNREFERENCED_PARAMETER(Sys1);
+	UNREFERENCED_PARAMETER(Sys2);
+	ULONG c = KeGetCurrentProcessorNumber();
+	if (c < 64)
+	{
+		g_flDpcBeat[c] = __rdtsc();
+	}
+}
+
+static VOID FlDpcArm(VOID)
+{
+	ULONG n = KeQueryActiveProcessorCount(NULL);
+	if (n > 64) n = 64;
+	ULONG64 now = __rdtsc();
+	for (ULONG c = 0; c < n; c++)
+	{
+		g_flDpcBeat[c] = now;
+		KeInitializeDpc(&g_flDpcObj[c], FlDpcBeatProc, NULL);
+		KeSetTargetProcessorDpc(&g_flDpcObj[c], (CCHAR)c);
+	}
+	g_flDpcCount = n;
+	InterlockedExchange(&g_flDpcArmed, 1);
+	FlEnqueueLine("[哨兵v2] DPC心跳已武装(每10s往返, 25s无应答=蓝屏取证)");
+}
+
+static VOID FlDpcDisarm(VOID)
+{
+	if (InterlockedExchange(&g_flDpcArmed, 0) != 0)
+	{
+		for (ULONG c = 0; c < g_flDpcCount; c++)
+		{
+			KeRemoveQueueDpc(&g_flDpcObj[c]);
+		}
+	}
+}
+#endif
+
 //T1线程: 排空二进制环->行环 + 250ms心跳 + Temp排空。文件由T1自己打开
 static VOID FlThreadProcT1(PVOID Context)
 {
@@ -567,6 +621,9 @@ static VOID FlThreadProcT1(PVOID Context)
 		DbgPrint("[fl]T1: Temp文件打开失败, Temp落盘禁用(仅DbgView)\n");
 	}
 	FlEnqueueLine("T1线程启动(Temp+心跳, 已钉离cpu0)");
+#if GNPT_DPC_SENTINEL
+	FlDpcArm();    //哨兵v2: DPC往返挂死核检测(变体8)
+#endif
 	FlDrainTempLocked();
 	//心跳250ms: [HB]提供存活证明+状态快照
 	timeout.QuadPart = -2500000LL;     //250毫秒
@@ -586,6 +643,9 @@ static VOID FlThreadProcT1(PVOID Context)
 			KernelMode, FALSE, g_flLaunchHot ? &hotWait : &timeout);
 		if (g_flStop)
 		{
+#if GNPT_DPC_SENTINEL
+			FlDpcDisarm();    //停机路径先撤哨兵(卸载期HB停顿防误判)
+#endif
 			break;
 		}
 		FlDrainBinRing();
@@ -625,6 +685,63 @@ static VOID FlThreadProcT1(PVOID Context)
 					parkedX |= (1UL << c);
 				}
 			}
+#if GNPT_DPC_SENTINEL
+			//哨兵v2: 每5s(20心跳)全核DPC往返; >6s无应答=预警(边沿
+			//触发一次); >12s无应答=挂死核实锤→立即蓝屏取证(此时
+			//本核(T1)还活着, dump写出=挂死核完整现场)
+			if (g_flDpcArmed)
+			{
+				static ULONG dpcTick = 0;
+				if (++dpcTick >= 20)
+				{
+					dpcTick = 0;
+					for (ULONG c = 0; c < g_flDpcCount; c++)
+					{
+						KeInsertQueueDpc(&g_flDpcObj[c], NULL, NULL);
+					}
+				}
+				ULONG64 perSec = (ULONG64)g_flWdTscPerSec;
+				if (perSec > 100000000ULL)
+				{
+					ULONG staleMask = 0, warnMask = 0;
+					ULONG64 oldestUs = 0;
+					for (ULONG c = 0; c < g_flDpcCount; c++)
+					{
+						ULONG64 beat = (ULONG64)g_flDpcBeat[c];
+						if (beat != 0 && nowTsc > beat)
+						{
+							ULONG64 ageUs = (nowTsc - beat) * 1000000ULL / perSec;
+							if (ageUs > oldestUs) oldestUs = ageUs;
+							if (ageUs > 6000000ULL)  warnMask |= (1UL << c);
+							if (ageUs > 12000000ULL) staleMask |= (1UL << c);
+						}
+					}
+					if (warnMask && !staleMask)
+					{
+						static ULONG warned = 0;
+						if ((warned & warnMask) != warnMask)
+						{
+							warned |= warnMask;
+							char w[96];
+							RtlStringCbPrintfA(w, sizeof(w),
+								"[哨兵v2] 预警: DPC晚到核%X(>6s)", warnMask);
+							FlEnqueueLine(w);
+						}
+					}
+					if (staleMask)
+					{
+						char s[128];
+						RtlStringCbPrintfA(s, sizeof(s),
+							"[哨兵v2] 挂死核确认: %X无应答>12s(最老%u.%usec)→蓝屏取证",
+							staleMask, (ULONG)(oldestUs / 1000000ULL),
+							(ULONG)(oldestUs / 1000000ULL % 1000000ULL));
+						FlEnqueueLine(s);
+						KeBugCheckEx(0xDEADC1DE, staleMask,
+							oldestUs / 1000ULL, parkedX, 0);
+					}
+				}
+			}
+#endif
 			RtlStringCbPrintfA(hbb, sizeof(hbb),
 				"[HB%llu] up=%us lag=%ld wf=%ld/%ld g:%X f:%X o:%X p:%X pk:%X vcpu=%d pend=%d exits:",
 				++hb, (ULONG)(KeQueryUnbiasedInterruptTime() / 10000000ULL),
