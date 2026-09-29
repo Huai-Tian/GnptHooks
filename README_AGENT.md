@@ -263,6 +263,7 @@ GnptHookRemove(hook.Target);            // PASSIVE_LEVEL
 - 回调签名 `ULONG64 (*)(Context, Arg1..Arg4, StackArgs*)`，返回值 = hook 的新返回值（完整 detour 控制权）。
 - `GnptCallOriginal(Arg1..Arg4)`：仅回调上下文有效（否则静默 0+'w' 环留痕）；栈参自动转发（回调对 StackArgs 的改写一并生效）。
 - 嵌套语义：回调内调用其他 hook 目标正常触发（detour 语义）。
+- **目标解析=调用者责任（EPT 契约，M10.11 终裁）**：`Target` 是普通函数指针，名字→地址由调用者完成（导出例程走 `MmGetSystemRoutineAddress`）。框架零 Windows 内部结构依赖——无 SSDT 定位器、无特征码扫描（v2-v6 五轮判例已证伪入口判别路线并留档版本无关架构方案；**勿"顺手实现"SSDT 定位**——那是调用者侧的事，且重开须先过判例 M10.11）。
 - 上限：条目 16 个 hook / 槽池 64 槽 / 拆分区 16 个 2MB 区每树。
 - **回调上下文纪律**：运行在原函数的任意线程、任意 IRQL（含 DISPATCH 级）。只允许 Interlocked 操作 / 无锁环事件 / GnptCallOriginal。禁止 FlLog/DbgPrint/分页内存/阻塞（= §2.B 铁律的来源）。
 - 卸载三段式（RL-22）。

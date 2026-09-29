@@ -229,6 +229,19 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 //变体开关(v0.9x系鉴别脚手架, 正式版恒0; 0=全功能):
 //0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR
 //6=隐蔽+hook 7=hook+MSR 8=机制轮(历史: 写双拦验证)
+//9=M10.2 CPUID回归决策轮: 全功能(v0.9y基线)+CPUID拦截位
+//   (handler为既有死代码复活, 单变量)——裁"CPUID独立有害"
+//   旧定罪(v0.9i-q系5/5相关, 但均被三体竞态混杂; 唯v0.9q
+//   无隐蔽死A轮未被竞态覆盖)。绿=CPUID面可回归(Hyper-V
+//   spoof铺路); 死=CPUID面真毒, caveat转正罪。
+//   实测(M10.3): 拖动负载→r72风暴→DWM崩溃循环(自愈型)=
+//   CPUID条件性真毒, 但毒在哪一环未定(exit本身/handler/壳)。
+//10=M10.5 毒位细分轮: 全功能+CPUID拦截+CPUID exit完全绕过
+//   TSC壳——终态见M10.9(三因子画像)与SvmExitHandler顶部
+//   短路路径(正式版CPUID位移除, 短路保留)。
+//11=M10.11 SSDT定位器轮——**已终裁移除**(EPT契约对齐: 目标
+//   解析=调用者责任, GNPT_HOOK.Target直接传指针; 判例M10.11
+//   完整留档v2-v6五轮与版本无关架构, 重开此题从v6起步)。
 #define GNPT_M92_VARIANT 0
 //哨兵v2运行时开关(默认开; 0=关——纯引擎最小观测面场景)
 #define GNPT_DPC_SENTINEL 1

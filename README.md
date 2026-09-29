@@ -22,6 +22,9 @@ The redirection is performed purely by nested-page-table translation. The *Prima
 - **Detour with full control**
   Your callback receives the original arguments, can call the original function (`GnptCallOriginal`), modify arguments or return values, or swallow the call entirely. No prologue replay at hook time — the shadow page carries the relocated prologue; the original page is never written.
 
+- **Target resolution is the caller's responsibility (EPT-contract)**
+  `GNPT_HOOK.Target` is a plain function pointer — you resolve the name to an address yourself (e.g. `MmGetSystemRoutineAddress` for exported routines). The framework deliberately carries **zero Windows-internal-structure dependencies**: no SSDT locator, no version-chasing signature scanning. Anything exported by name resolves through the public API; unexported Nt-routine resolution, if you need it, belongs in your code where you control the version risk. Same contract as the sibling project GeptHooks.
+
 - **Stack-argument forwarding (5th argument and beyond)**
   Declare the target's stack-argument count in `GNPT_HOOK.StackArgs` (up to 32); your callback receives a `StackArgs` pointer to the live arguments on the trigger stack — readable and **writable**, with modifications forwarded through `GnptCallOriginal`. No argument gaps when hooking multi-parameter kernel functions.
 

@@ -139,8 +139,21 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//(参照系无对应物; NOIRVisor同类时间操纵因"Timer/GPU/NIC全乱"
 	//被整体移除=同签名先例), CPUID拦截仅观测采样非功能必需→移除。
 	//MSRPM(demo的LSTAR hook面)+复位类观测(SHUTDOWN/INIT)保留
+	//M10.2(变体9): 该定罪被M9.6三体竞态混杂污染(5死轮均含隐蔽
+	//或MSRPM; M8.28 caveat)——CPUID位条件回归重测, 单变量裁决
+	//M10.5(变体10): 毒位细分——同9但CPUID exit绕过TSC壳
+	//v0.9z(M10.6定罪转正): CPUID位回归正式版——毒源已定罪为
+	//TSC壳的水位/钳制与高频exit的交互(非CPUID本身; x9进壳拖动
+	//崩 vs xa绕壳更强拖动绿, 单变量翻转), exit handler顶部短路
+	//路径(见SvmExitHandler)消除交互→拦截位安全回归。
+	//CPUID面解锁=leaf伪装/Hyper-V签名铺路
+#if GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10 || GNPT_M92_VARIANT == 0
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT;
+#else
 	vmcb->Control.InterceptMisc1 = INTERCEPT_MSR_PROT |
 		INTERCEPT_SHUTDOWN | INTERCEPT_INIT;
+#endif
 	//#DB拦截常驻: 单步窗口外的任何#DB=残余TF泄漏→
 	//guest可见=0x3B/0x1E致命; 常驻+IDLE吞+清TF=最后一道网
 	//#MC观测(EXCP_INTERCEPT_MC, 同上: 静默复位转化器)
@@ -407,8 +420,8 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	//root态=写NPT页直访物理自免疫); 首核launch后guest态动态写须走
 	//vmmcall root原语(见svm.h功能码注释)。失败=无隐蔽(非致命, 记日志)
 	//v0.9r=隐蔽回归(v0.9q判读: 无隐蔽仍死→隐蔽无罪; 全功能恢复)
-	//M9.2变体: 隐蔽开启=全功能(0)/裸隐蔽(2)/隐蔽+MSR(5)/隐蔽+hook(6)/x8机制轮(8)
-#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 2 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 8
+	//M9.2变体: 隐蔽开启=全功能(0)/裸隐蔽(2)/隐蔽+MSR(5)/隐蔽+hook(6)/x8机制轮(8)/M10.2决策轮(9)/M10.5细分轮(10)
+#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 2 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 8 || GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10 || GNPT_M92_VARIANT == 11
 	if (!SvmNptConcealAll())
 	{
 		FlLog("[Entry] 自我隐蔽失败(内存不足?), 无隐蔽继续(功能不受影响)");
@@ -823,6 +836,22 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 static volatile LONG64 g_svmTscWm = 0;   //全局虚拟TSC水位(单调只升)
 ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 {
+	//v0.9z(M10.6定罪修复转正): CPUID exit短路于TSC壳——
+	//不进T0/T1/扣除/水位/钳制(哨兵照常刷新, dispatch/观测/计数
+	//照常走)。毒源=壳的水位/钳制与CPUID高频exit的交互(x9进壳
+	//拖动崩vs xa绕壳更强拖动绿, 单变量翻转); CPUID exit本身
+	//无罪(kov.dev反例吻合)。exit成本(~1500周期)guest可见=
+	//CPUID自然延迟范围(100-3000)内, kov.dev同款tradeoff;
+	//CPUID核滞后累计无界但下一非CPUID exit钳制前跳=单调安全
+	//(M6判例), 拖动风暴期滞后率~200K周期/s有界瞬态。
+	{
+		PVMCB vmcbFast = (PVMCB)Vcpu->VmcbVa;
+		if (vmcbFast->Control.ExitCode == SVM_EXIT_CPUID)
+		{
+			g_svmLastExitTsc[(ULONG)(UCHAR)Vcpu->CpuIndex & 63] = __rdtsc();
+			return SvmExitDispatch(Vcpu, Regs);
+		}
+	}
 	Vcpu->ExitTsc = __rdtsc();              //T0: root驻留起点
 	g_svmLastExitTsc[(ULONG)(UCHAR)Vcpu->CpuIndex & 63] =
 		Vcpu->ExitTsc;                      //v0.9v哨兵刷新(核号取VCPU)

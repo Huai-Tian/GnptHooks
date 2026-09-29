@@ -308,17 +308,24 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	FlLog("[Entry] M9.2鉴别构建: 隐蔽+hook(MSR停)");
 #elif GNPT_M92_VARIANT == 7
 	FlLog("[Entry] M9.2鉴别构建: hook+MSR(隐蔽停)");
+#elif GNPT_M92_VARIANT == 9
+	FlLog("[Entry] M10.2决策轮: 全功能(v0.9y基线)+CPUID拦截回归(单变量)");
+#elif GNPT_M92_VARIANT == 10
+	FlLog("[Entry] M10.5细分轮: 全功能+CPUID拦截+CPUID exit绕过TSC壳(毒位裁决)");
 #endif
 
 	//接管成功, 安装演示hook
 	//v0.9p=全功能恢复轮: demo回归(v0.9n-v0.9o鉴别期停用)——
 	//与隐蔽/MSR/CPUID面一起, 在新BIOS+加速框架下补测"全功能"格
-	//M9.2变体: hook开启=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7)
-#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 3 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 7
+	//M10.11终裁(SSDT定位器移除): 目标解析=调用者责任(EPT契约
+	//对齐——GeptHooks同款, GNPT_HOOK.Target直接传指针; 判例
+	//M10.11完整留档v2-v6五轮与版本无关架构, 重开此题从v6起步)
+	//M9.2变体: hook开启=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7)/M10.2决策轮(9)/M10.5细分轮(10)
+#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 3 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 7 || GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10
 	DemoHookInstall();
 #endif
-	//M9.2(v2): MSR面独立调用(全功能/裸MSR/隐蔽+MSR/hook+MSR)
-#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 4 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 7
+	//M9.2(v2): MSR面独立调用(全功能/裸MSR/隐蔽+MSR/hook+MSR/M10.2决策轮/M10.5细分轮)
+#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 4 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 7 || GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10
 	DemoMsrInstall();
 #endif
 	FlLog("[Entry] 完成(%s)", GNPT_BUILD_TAG);
