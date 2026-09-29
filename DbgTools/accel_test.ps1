@@ -1,12 +1,20 @@
 ﻿<#
 =====================================================================
- GNPT 加速测试自动化脚本 v4  accel_test.ps1
- 用途: 高频 idle<->活跃切换放大 C-state 竞态触发率 (加速轮A/对照轮C)
+ GNPT 加速测试自动化脚本 v5  accel_test.ps1
+ 用途: 放大 idle/电源/负载相关竞态触发率 (加速轮A/负载轮B/Full)
  用法(管理员 PowerShell):
    powershell -ExecutionPolicy Bypass -File .\accel_test.ps1
    .\accel_test.ps1 -Minutes 60                 # 加速轮A加长
-   .\accel_test.ps1 -Mode C                     # 对照轮C(核钉C0)
+   .\accel_test.ps1 -Mode C                     # 负载轮C(忙负载+默认idle, 真实形态)
    .\accel_test.ps1 -Mode Full                  # A + C 连跑
+ v5 变更:
+   - C轮重定义: IDLEDISABLE(钉C0, 历史死亡复现器, 三体竞态已修复
+     而退役)→忙负载+默认idle——测真实使用形态, 此格史上未正经测
+   - WRONGVER门禁修复: 版本复核限定"本轮会话内新写"的日志文件
+     (CreationTime门禁), 不再捞上轮旧日志误报
+   - DWM自愈型崩溃检测(v0.9x9判例"脚本绿≠系统绿"): summary新增
+     Application日志 DWM/Desktop Window Manager 错误事件计数
+     (自愈型黑屏-恢复循环的客观判据, 用户肉眼之外的第二传感面)
  v4 变更:
    - 日志根多候选自动定位: 提权会话API桌面≠logger桌面——依次探测
      Public Desktop→用户桌面→兜底, 修复"全程盯错目录"的假超时
@@ -17,9 +25,6 @@
    - 版本门禁降级: 服务运行40s即开跑(日志不可读时警告), sc stop后
      文件解锁再验版本, 不符则标记本轮无效
    - 超时前自动输出诊断(服务状态/桌面文件清单)
- 已知缺陷(待v5): 同boot二跑 WRONGVER 假警报——上轮日志仍在桌面,
-   Get-GnptLogs 时间窗(-3min)可捞到旧文件复核出"版本不符"。
-   数据有效, 忽略该标签即可。
  崩溃后: 重启完直接再跑本脚本 = 自动收集上轮现场
  产物: Desktop\gnpt_accel_<标签>_<时间戳>\ 文件夹
 =====================================================================
@@ -87,10 +92,15 @@ function Read-TailText([string]$path, [int]$lines) {
 }
 
 # gnpt 日志识别: gnpt_log.txt(T2镜像, 首行[Entry]) 或 "^L<行号> "形态 或 头部含GNPT/[Entry]/T2:
-function Get-GnptLogs([datetime]$since) {
+# v5: CreationTime门禁(本轮会话内新建)——LastWriteTime窗(-3min)会捞到
+# 上轮旧日志导致WRONGVER假警报(v4已知缺陷); T2镜像为append复用文件,
+# CreationTime判断对它不生效, 用LastWriteTime保底, 但版本复核只信
+# 新建文件(T2的版本在"就绪门禁"阶段已验过头部)
+function Get-GnptLogs([datetime]$since, [switch]$NewOnly) {
     Get-ChildItem $Desk -Filter *.txt -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -ge $since.AddMinutes(-3) } |
         Where-Object {
+            if ($NewOnly -and $_.CreationTime -lt $since.AddMinutes(-1)) { return $false }
             if ($_.Name -eq 'gnpt_log.txt') { return $true }
             if ($_.Name -match '^L\d+ ') { return $true }
             $h = Read-HeadText $_.FullName 8
@@ -148,6 +158,15 @@ function Collect-Artifacts([datetime]$since, [string]$tag, [string]$note) {
             ForEach-Object { '{0} | {1} | ID={2}' -f $_.TimeCreated, $_.ProviderName, $_.Id })
     } catch {}
     if ($evLines.Count -gt 0) { $evLines | Set-Content (Join-Path $dir 'events.txt') -Encoding UTF8 }
+    # v5: DWM自愈型崩溃检测("脚本绿≠系统绿"判例)——Application日志
+    # DWM/桌面渲染相关错误事件计数与摘录(黑屏-恢复循环的客观判据)
+    $dwmLines = @()
+    try {
+        $dwmLines = @(Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$since; Level=2} -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -match 'Desktop Window Manager|Application Error|Windows Error Reporting' } |
+            ForEach-Object { '{0} | {1} | ID={2}' -f $_.TimeCreated, $_.ProviderName, $_.Id })
+    } catch {}
+    if ($dwmLines.Count -gt 0) { ($dwmLines | Select-Object -First 40) | Set-Content (Join-Path $dir 'dwm_events.txt') -Encoding UTF8 }
     if (Test-Path $ProgF) { Copy-Item $ProgF $dir -Force }
 
     $lastHb = ''
@@ -165,6 +184,7 @@ function Collect-Artifacts([datetime]$since, [string]$tag, [string]$note) {
         ('日志文件  : {0} 个' -f $logs.Count)
         ('Minidump  : {0} 个{1}' -f $dmps.Count, $(if ($dmps) { ' ' + ($dmps.Name -join ', ') }))
         ('关键事件  : {0} 条' -f $evLines.Count)
+        ('DWM/应用崩溃事件: {0} 条{1}' -f $dwmLines.Count, $(if ($dwmLines.Count -gt 0) { '  <<< 非零=自愈型崩溃循环在场(脚本绿≠系统绿)' } else { '' }))
         '最后HB行  : ' + $lastHb
     )
     $sum | Set-Content (Join-Path $dir 'summary.txt') -Encoding UTF8
@@ -193,8 +213,10 @@ function Invoke-Round([string]$roundMode, [int]$minutes) {
             Log '电源: IDLEDEMOTE=0 (空闲立即降最深C-state, 放大转换频率)'
             Set-Power -demote 0 -disable -1
         } else {
-            Log '电源: IDLEDISABLE=1 (核钉C0, idle竞态对照轮)'
-            Set-Power -demote -1 -disable 1
+            # v5: C轮重定义——IDLEDISABLE(钉C0)是三体竞态时代的死亡复现器,
+            # 竞态已修复(v0.9y写拦截)而退役; 改为忙负载+默认idle=真实使用形态
+            # (此格v1-v4从未正经测过: 当时C轮与IDLEDISABLE绑定)
+            Log '电源: 保持默认(v5: C轮=忙负载+默认idle, 真实形态)'
         }
 
         # 驱动: 干净重启
@@ -286,9 +308,12 @@ function Invoke-Round([string]$roundMode, [int]$minutes) {
         powercfg /setactive SCHEME_CURRENT | Out-Null
         Save-State $testStart $roundMode $true
 
-        # 版本复核(文件已解锁)
+        # 版本复核(文件已解锁); v5: NewOnly门禁——只信本轮新建的
+        # 日志文件(T2镜像为append复用, 其版本已在就绪门禁验过头部),
+        # 不再捞上轮旧文件误报WRONGVER
         $verBad = $false
-        $newest = Get-GnptLogs $testStart | Select-Object -Last 1
+        $newest = Get-GnptLogs $testStart -NewOnly | Select-Object -Last 1
+        if (-not $newest) { $newest = Get-GnptLogs $testStart | Select-Object -Last 1 }
         if ($newest) {
             $h = Read-HeadText $newest.FullName 8
             if ($null -ne $h -and $h -notmatch [regex]::Escape($ExpectTag)) { $verBad = $true }
