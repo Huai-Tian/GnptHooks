@@ -222,10 +222,11 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9y"
-//v0.9y=M9.6定罪修复版: demo MSR hook写位拦截(OnWrite忠实放行,
-//斩断"直通写×读exit×隐蔽"三体竞态=0x101系列根因)+哨兵v2转正
-//(DPC往返挂死核检测, 运行时开关, 见GNPT_DPC_SENTINEL)。
+#define GNPT_BUILD_TAG "v0.9ac"
+//v0.9ac=M11.2b方向一补格微轮: 候选池缩为真冷单T(MmGetSystemRoutine
+//Address, 探针0NPF实证)存活至16核普查——HOOKS驻留核上TΔ=0=互偷
+//方向一, 差距清单③最后一格; NtRWRP三度脱落定罪撤池。引擎零改动;
+//M10.12修复在位(正式版CPUID拦截位移除)。
 //变体开关(v0.9x系鉴别脚手架, 正式版恒0; 0=全功能):
 //0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR
 //6=隐蔽+hook 7=hook+MSR 8=机制轮(历史: 写双拦验证)

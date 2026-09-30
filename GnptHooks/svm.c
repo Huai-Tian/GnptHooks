@@ -146,8 +146,13 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//TSC壳的水位/钳制与高频exit的交互(非CPUID本身; x9进壳拖动
 	//崩 vs xa绕壳更强拖动绿, 单变量翻转), exit handler顶部短路
 	//路径(见SvmExitHandler)消除交互→拦截位安全回归。
-	//CPUID面解锁=leaf伪装/Hyper-V签名铺路
-#if GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10 || GNPT_M92_VARIANT == 0
+	//M10.7-10.9终裁反转: 短路修复不完全——v0.9z视频级实测仍崩
+	//(0x8898009b=DXGI设备移除=GPU驱动时序敏感路径), 毒=CPUID风暴×
+	//切换器级C-state高频转换×GPU渲染三因子同场; 真实使用形态安全但
+	//accel Full+视频门槛不过→正式版拦截位退回移除(v0.9r形态), 短路
+	//快路径保留为遗产。回归验收=accel Full+视频叠加双绿(leaf伪装/
+	//Hyper-V签名铺路届时重开)
+#if GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10
 	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
 		INTERCEPT_SHUTDOWN | INTERCEPT_INIT;
 #else
