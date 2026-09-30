@@ -60,6 +60,7 @@ extern "C" {
 #define SVM_FEAT_GMET           (1ULL << 17)
 #define SVM_FEAT_x2AVIC         (1ULL << 18)
 #define SVM_FEAT_VNMI           (1ULL << 25)
+#define SVM_FEAT_IBSVIRT        (1ULL << 26)  //IBS虚拟化(APM §15.38; VMCB 0xB8 bit2配套)
 
 //===== exit codes (APM Appendix C Table C-1) =====
 //CR/DR读写: 0x00-0x0F=CR[0-15]读 0x10-0x1F=CR写 0x20-0x2F=DR读 0x30-0x3F=DR写
@@ -182,14 +183,14 @@ typedef struct _GNPT_VCPU_SVM
 } GNPT_VCPU_SVM, *PGNPT_VCPU_SVM;
 
 extern GNPT_VCPU_SVM g_svmVcpu[64];
-extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; v0.9u起恒=全部核)
-extern volatile LONG64 g_svmLastExitTsc[64];   //v0.9v哨兵: 各核最后#VMEXIT的TSC(HB心跳检停泊)
+extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; 恒=全部核)
+extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(HB心跳检停泊)
 
-//v0.9t: root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——
-//仅虚拟化核合法: 裸机兄弟核EFER.SVME=0→vmmcall=#UD→0x7E(v0.9s实测:
-//DriverEntry线程被调度到兄弟核, 首个NPTSET即崩)。调用线程调度核
-//不可控→原语前调用本函数钉到虚拟化核集(0..count-1), 用完以返回值
-//还原亲和。返回旧掩码; 0=引擎未起(调用方按失败处理)
+//root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——仅虚拟化
+//核合法: 裸机核EFER.SVME=0→vmmcall=#UD→蓝屏(调用线程调度核不可控,
+//DriverEntry线程可能落在裸机核, 首个原语即崩)。原语前调用本函数钉到
+//虚拟化核集(0..count-1), 用完以返回值还原亲和。返回旧掩码;
+//0=引擎未起(调用方按失败处理)
 KAFFINITY SvmPinVirtualizedCpus(VOID);
 extern ULONG64 g_svmFeatBits;       //Fn8000_000A_EDX快照(降级决策)
 extern KEVENT g_svmShutdownEvent;   //卸载: 唤醒全部发起线程
@@ -213,6 +214,10 @@ ULONG64 CmGetRflags(VOID);     //pushfq全宽读取(VMCB.Rflags源; MSVC无x64�
 
 //世界开关(svm-asm.asm): 见文件头注释
 VOID CmSvmEnter(PGNPT_VCPU_SVM Vcpu);   //发起接管; 返回=本核已guest化
+//裸vmmcall探针(svm-asm.asm): r10/r11无签名→签名门'u'+#UD=裸机#UD
+//语义的执行级自证(故事面探针专用; x64无MSVC intrinsic 0F 01 D9,
+//故asm实现)
+VOID CmSvmVmmCallRaw(VOID);
 ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 //返回0=重入guest; 非0=STOP(卸载: 桥值已填GUEST_REGS)
 

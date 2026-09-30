@@ -10,25 +10,22 @@
 //框架细节(资源分配/串行启动/互斥仲裁/内置隐藏/日志)全在svm.c,
 //使用者只需关心hook回调本身。API契约见hook.h头注释
 
-//demo目标: 混装/多hook验证轮(M11.2b=方向一补格: 真冷单T存活至
-//16核普查, HOOKS驻留核上TΔ=0=互偷方向一; M11.2已闭双T并存格)。
-//本文件仍=面向二次开发者的使用示例; 仍为demo层扩展(引擎零改动):
-//  阶段A: 候选链装TRANSPARENT目标(M11.2判读: NtRWRP三度脱落定罪
-//    撤池; MmGetSystemRoutineAddress实证真冷[探针0NPF]+可重定位
-//    =T必存活至普查; MmGetPhysicalMemoryRanges prologue含相对
-//    call=[Reloc]拒的演示件, 候选三条件=冷+导出+可重定位)→触发证liveness
-//  阶段B 16核互偷普查: 普通模式N(KeInitializeDpc, Flags=0)与活T
-//    并存, 逐核先T后N各触发一次并记Δ——(T增,N不增)=P/HIDE驻留,
-//    (T不增,N增)=HOOKS驻留, 双向互偷拓扑一次取齐(M11.1教训:
-//    钉单核的期望序会被自然流量先行占用, 普查不依赖预设驻留);
-//    核间1s隔=防普查自身打满tstorm桶(单次T触发≈百级exit×16连发
-//    会破1024/700ms桶)
-//候选纪律(沿用): 热探针实测筛选+自触发安全+非wait家族+同页防御
-//跳过(NPF引擎按TargetPa首匹配)。候选写面分析: MmGetSystem
-//RoutineAddress(1参=合法UNICODE_STRING→无命中返回NULL零写),
-//MmGetPhysicalMemoryRanges(0参, 返回池数组须调用方ExFreePool
-//收尾——本轮实际被[Reloc]拒, 留池作安全门演示)。普通模式目标
-//选Ke*普通内核函数(hook.h使用纪律5: PG不覆盖类)
+//demo目标(框架使用示例的两项扩展验证):
+//  ①"SVM未激活"自洽故事面探针(DriverEntry内联): 三MSR读+EFER回写+
+//    SVM指令族11条逐条执行, 全走guest硬件路径=与真实探测器同型
+//  ②混装/多hook验证轮: TRANSPARENT与普通模式并存+逐核视图驻留普查
+//本文件仍=面向二次开发者的使用示例(demo层扩展, 引擎零改动):
+//  阶段A: 候选链装TRANSPARENT目标(候选三条件=冷+按名导出+可重定位;
+//    MmGetSystemRoutineAddress=真冷目标必存活; MmGetPhysicalMemory
+//    Ranges因prologue含相对call被[Reloc]拒, 留池作重定位安全门演示)
+//  阶段B 16核驻留普查: 普通模式N(KeInitializeDpc, Flags=0)与活T并存,
+//    逐核先T后N各触发一次并记Δ——(T增,N不增)=P/HIDE驻留,
+//    (T不增,N增)=HOOKS驻留, 双向拓扑一次取齐(不依赖预设驻留:
+//    钉单核的期望序会被自然流量先行占用); 核间1s隔=防普查自身
+//    打满tstorm桶(单次T触发≈百级exit×16连发会破1024/700ms桶)
+//候选纪律: 热探针筛选+自触发安全+非wait家族+同页防御跳过
+//(NPF引擎按TargetPa首匹配)。普通模式目标选Ke*普通内核函数
+//(hook.h使用纪律5: PG不覆盖类)
 #define DEMO_T_MAX 2
 static PVOID g_demoT[DEMO_T_MAX];               //live TRANSPARENT目标(触发/移除键)
 static const char* g_demoTName[DEMO_T_MAX];     //窄名(日志)
@@ -64,9 +61,8 @@ static ULONG64 DemoLstarOnRead(PVOID Context, ULONG32 Msr)
 	return GnptMsrReadReal(Msr);
 }
 
-//v0.9y写回调(M9.6定罪修复): 计数+忠实放行——写位拦截后由
-//exit handler root代写(斩断"直通写×读exit×隐蔽"三体竞态;
-//x8验证: 写直通死107s→写拦截绿15min+)
+//写回调: 计数+忠实放行——写位拦截后由exit handler root代写
+//(斩断"直通写×读exit×隐蔽"三体竞态, 详见msr.h使用纪律5)
 static volatile LONG64 g_demoWrmsr = 0;
 static BOOLEAN DemoLstarOnWrite(PVOID Context, ULONG32 Msr, ULONG64 Value)
 {
@@ -79,7 +75,7 @@ static BOOLEAN DemoLstarOnWrite(PVOID Context, ULONG32 Msr, ULONG64 Value)
 
 //MSR自触发线程: 内核线程在guest内rdmsr LSTAR×3(运行期系统
 //几乎无人读LSTAR, 自触发=机制验证不依赖自然触发)。返回值比对=
-//真值直读(virtual含root内读, 恒等自检)
+//真值直读(恒等自检)
 static KEVENT g_demoMsrDone;
 static BOOLEAN g_demoMsrArmed = FALSE;
 static VOID DemoMsrTriggerThread(PVOID Context)
@@ -138,21 +134,19 @@ static VOID DemoFireN(VOID)
 //KeServiceDescriptorTable(链接不可得), 运行时定位器(LSTAR→
 //KiSystemCall64模式扫描)依赖未经目标机验证的内部形态, 不做;
 //demo候选均选可直解析的导出名
-//M9.2拆分(v2): MSR面独立安装函数(原在DemoHookInstall内,
-//x5构建缺陷=不调用DemoHookInstall则MSR永不装——拆出修复)
+//MSR面独立安装函数(与hook面解耦: 不调用hook安装则MSR仍可独立装)
 static VOID DemoMsrInstall(VOID)
 {
 	//MSR hook: 读写双拦+自触发线程验证。
-	//v0.9y(M9.6定罪): 写位必须拦截(OnWrite=忠实放行代写)——
-	//"写直通×读exit×NPT改译隐蔽"三体竞态=0x101系列死亡根因
-	//(x5_v2写直通钉C0死107s vs x8写拦截绿15min+, 单变量翻转);
-	//"系统运行期无人写LSTAR"假设被证伪(PG KiErrata420Present
-	//周期性写)。OnWrite放行=语义与直通等价(计数后root真写)
+	//写位必须拦截(OnWrite=忠实放行代写): "写直通×读exit×NPT改译
+	//隐蔽"三体竞态=时钟看门狗蓝屏根因(msr.h使用纪律5); "系统运行期
+	//无人写LSTAR"假设不成立(PatchGuard周期性重写)。OnWrite放行=
+	//语义与直通等价(计数后root真写)
 	{
 		GNPT_MSR_HOOK msrHook = { 0 };
 		msrHook.Msr = 0xC0000082;    //IA32_LSTAR
 		msrHook.OnRead = DemoLstarOnRead;
-		msrHook.OnWrite = DemoLstarOnWrite;   //v0.9y: 写也拦截(忠实代写, 斩断竞态)
+		msrHook.OnWrite = DemoLstarOnWrite;   //写也拦截(忠实代写, 斩断竞态)
 		NTSTATUS mst = GnptMsrHookInstall(&msrHook);
 		FlLog("[Demo] MSR hook LSTAR(0xC0000082): %s(触发计数=卸载总结)",
 			NT_SUCCESS(mst) ? "OK" : "FAIL(见[MSR]行)");
@@ -177,10 +171,104 @@ static VOID DemoMsrInstall(VOID)
 
 }
 
+//======== 故事面探针: 裸机探测器视角自证 ========
+//DriverEntry线程=guest态(全核已in-guest), 以下读写/指令全走guest
+//硬件路径=被测面与真实探测器完全同型:
+//  ①rdmsr三MSR: EFER应SVME=0(伪造)/VM_CR应0x18/HSAVE应0(影子)
+//  ②EFER RMW回写: 写回①读到的伪造值→再读应等值+引擎存活——写路径
+//    "强制SVME=1只写VMCB"的防自锁闭环实测(裸机Windows无人写真EFER,
+//    本探针=唯一合法触发者)
+//  ③SVM指令族8条×两操作数形态, 全部应#UD(kernel SEH捕获, 与裸机
+//    #UD同路)。两形态依据APM §15.9 Table 15-7(SVM族"Checks exceptions
+//    (#GP) before the intercept"):
+//    - 非规范PA形态(VMRUN/VMSAVE/VMLOAD传VA当PA=超MAXPHYADDR):
+//      硬件raise #GP先于拦截位→0x4D处置(case: RIP字节0F 01 D8-DF
+//      族判定→改注入#UD)——探针=处置路径的执行级自证
+//    - 规范PA形态(真物理地址, 页对齐全零哑页): PA检查过→拦截位
+//      触发(0x80/0x82/0x83)→'v' case注入#UD。探针安全性: VMRUN=
+//      must-1位0(引擎在跑=本核位0必活, 探针核同理); VMSAVE=两态
+//      安全(最坏=写自家哑页); VMLOAD=最坏态载零毁guest态→**门控**
+//      (VMSAVE规范PA确认#UD后才探, 同一Misc2表达式先证活)
+//    - VMMCALL(裸, 无签名): 签名门'u'+#UD(路径异于指令族; x64无
+//      MSVC intrinsic 0F 01 D9, svm-asm.asm的CmSvmVmmCallRaw补全)
+//异常码判读: #UD=STATUS_ILLEGAL_INSTRUCTION=0xC000001D
+static UCHAR g_storyDummy[16];    //哑操作数(非规范PA形态: 仅取地址)
+static DECLSPEC_ALIGN(4096) UCHAR g_storyVmcb[4096];  //规范PA哑页(静态全零)
+static ULONG64 g_storyValidPa = 0;                     //哑页真PA(探针入口填)
+static VOID StoryProbeVmrunI(VOID)   { __svm_vmrun((void*)g_storyDummy); }
+static VOID StoryProbeVmsaveI(VOID)  { __svm_vmsave((void*)g_storyDummy); }
+static VOID StoryProbeVmloadI(VOID)  { __svm_vmload((void*)g_storyDummy); }
+static VOID StoryProbeVmrunV(VOID)   { __svm_vmrun((void*)g_storyValidPa); }
+static VOID StoryProbeVmsaveV(VOID)  { __svm_vmsave((void*)g_storyValidPa); }
+static VOID StoryProbeVmloadV(VOID)  { __svm_vmload((void*)g_storyValidPa); }
+static VOID StoryProbeVmmcall(VOID)  { CmSvmVmmCallRaw(); }
+static VOID StoryProbeStgi(VOID)     { __svm_stgi(); }
+static VOID StoryProbeClgi(VOID)     { __svm_clgi(); }
+static VOID StoryProbeSkinit(VOID)   { __svm_skinit(0); }
+static VOID StoryProbeInvlpga(VOID)  { __svm_invlpga((void*)g_storyDummy, 0); }
+
+//返回TRUE=确认#UD(0xC000001D); FALSE=其他异常/未异常(故事破, 已留痕)
+static BOOLEAN DemoStoryTryInstr(const char* name, VOID(*fn)(VOID))
+{
+	ULONG code = 0;
+	__try
+	{
+		fn();
+		FlLog("[S1] %s: 未异常(**故事破**——拦截位/注入链失效, 查'v'/'G'环)", name);
+		return FALSE;
+	}
+	__except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		BOOLEAN ud = (code == 0xC000001D);
+		FlLog("[S1] %s: 异常码%X%s", name, code,
+			ud ? "=#UD(裸机等价)" : "(非#UD——#GP手术/拦截链查'v'/'G'环)");
+		return ud;
+	}
+}
+
+static VOID DemoStoryProbe(VOID)
+{
+	//①三MSR读: 探测器视角(全走MSRPM→exit→伪造/影子)
+	ULONG64 efer = __readmsr(MSR_EFER);
+	ULONG64 vmcr = __readmsr(MSR_VM_CR);
+	ULONG64 hsave = __readmsr(MSR_VM_HSAVE_PA);
+	FlLog("[S1] 探测器视角: EFER=%llX(SVME=%u 应0) VM_CR=%llX(应18) "
+		"HSAVE=%llX(应0)",
+		(unsigned long long)efer, (ULONG)((efer >> 12) & 1),
+		(unsigned long long)vmcr, (unsigned long long)hsave);
+	//②EFER RMW回写探针(写回读到的伪造值→等值回读+存活)
+	__writemsr(MSR_EFER, efer);
+	ULONG64 efer2 = __readmsr(MSR_EFER);
+	FlLog("[S1] EFER回写: 前%llX 后%llX(应等值; 引擎存活见后续探针)",
+		(unsigned long long)efer, (unsigned long long)efer2);
+	//③SVM指令族8条×两形态(非规范PA走0x4D处置/规范PA走拦截0x80/0x82/
+	//0x83/VMMCALL走签名门/其余走0x7A/0x84-0x86; 全部#UD注入→SEH捕获)
+	g_storyValidPa = MmGetPhysicalAddress(g_storyVmcb).QuadPart;
+	DemoStoryTryInstr("VMRUN(非规范PA)", StoryProbeVmrunI);
+	DemoStoryTryInstr("VMSAVE(非规范PA)", StoryProbeVmsaveI);
+	DemoStoryTryInstr("VMLOAD(非规范PA)", StoryProbeVmloadI);
+	DemoStoryTryInstr("VMRUN(规范PA)", StoryProbeVmrunV);
+	if (DemoStoryTryInstr("VMSAVE(规范PA)", StoryProbeVmsaveV))
+	{
+		//门控通过(Misc2表达式已证活)→VMLOAD规范PA最坏态(载零毁)被排除
+		DemoStoryTryInstr("VMLOAD(规范PA)", StoryProbeVmloadV);
+	}
+	else
+	{
+		FlLog("[S1] VMLOAD(规范PA): 跳过(VMSAVE未#UD=拦截位疑失效, 规避载零毁态)");
+	}
+	DemoStoryTryInstr("VMMCALL(无签名)", StoryProbeVmmcall);
+	DemoStoryTryInstr("STGI", StoryProbeStgi);
+	DemoStoryTryInstr("CLGI", StoryProbeClgi);
+	DemoStoryTryInstr("SKINIT", StoryProbeSkinit);
+	DemoStoryTryInstr("INVLPGA", StoryProbeInvlpga);
+	FlLog("[S1] 故事面探针完成(判据①③; 停机S1计数+#GP手术总结另含本探针量)");
+}
+
 static KEVENT g_demoSeqDone;
 static BOOLEAN g_demoSeqArmed = FALSE;
 
-//多hook验证序列线程(PASSIVE; 每步面包屑落盘, 判据见NOTES M11.2)
+//多hook验证序列线程(PASSIVE; 每步面包屑落盘)
 static VOID DemoMultiHookThread(PVOID Context)
 {
 	UNREFERENCED_PARAMETER(Context);
@@ -190,10 +278,9 @@ static VOID DemoMultiHookThread(PVOID Context)
 	KeDelayExecutionThread(KernelMode, FALSE, &iv);
 
 	//======== 阶段A: TRANSPARENT目标(真冷单T存活至普查) ========
-	//M11.2判读: NtRWRP三度脱落定罪撤池; MmGetPhysMemRanges prologue
-	//含相对call被[Reloc]拒(留池=重定位安全门演示件);
-	//MmGetSystemRoutineAddress=实证真冷(探针0NPF)+可重定位→必为T1,
-	//方向一(HOOKS驻留核上T失效)由此可取
+	//wait族候选已剔除(运行期自然流量会打满tstorm脱落); MmGetPhys
+	//MemRanges prologue含相对call被[Reloc]拒(留池=重定位安全门演示);
+	//MmGetSystemRoutineAddress=真冷(热探针零NPF)+可重定位→必为T1
 	static const struct
 	{
 		PCWSTR      Name;
@@ -256,7 +343,7 @@ static VOID DemoMultiHookThread(PVOID Context)
 	else
 	{
 		//双T并存格: 统一钉核1顺序触发(两槽各自独立增长=并存判据;
-		//每核单步窗口在两个hook条目间交替=多hook窗口机制实测);
+		//每核单步窗口在两个hook条目间交替=多hook窗口机制验证);
 		//Install/Remove内置SvmPinVirtualizedCpus会还原亲和——触发段前重钉
 		KeSetSystemAffinityThread((KAFFINITY)1 << 1);
 		if (tLive >= 2)
@@ -316,7 +403,7 @@ static VOID DemoMultiHookThread(PVOID Context)
 			{
 				//16核互偷普查: 每核先T后N各触发一次, 前后快照记Δ——
 				//(TΔ>0, NΔ=0)=该核P/HIDE驻留; (TΔ=0, NΔ>0)=该核HOOKS驻留;
-				//双向拓扑一次取齐, 不依赖预设驻留(M11.1教训: 自然流量先占)。
+				//双向拓扑一次取齐, 不依赖预设驻留(自然流量会先占)。
 				//核间1s隔: 单次T触发≈百级exit, 16核连发会打满tstorm桶
 				//(1024/700ms)致普查中途脱落
 				ULONG cpuCount = KeQueryActiveProcessorCount(NULL);
@@ -427,7 +514,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	//放行T2的Desktop镜像(加载窗口期已过)
 	FlMarkEntryDone();
 
-	//M9.2变体形态标识(横幅外第二证据, 防测错形态)
+	//变体形态标识(横幅外第二证据, 防测错形态)
 #if GNPT_M92_VARIANT == 1
 	FlLog("[Entry] M9.2鉴别构建: 全停基座(隐蔽/hook/MSR全停; 引擎+哨兵+TSC钳制在位)");
 #elif GNPT_M92_VARIANT == 2
@@ -448,17 +535,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	FlLog("[Entry] M10.5细分轮: 全功能+CPUID拦截+CPUID exit绕过TSC壳(毒位裁决)");
 #endif
 
-	//接管成功, 安装演示hook
-	//v0.9p=全功能恢复轮: demo回归(v0.9n-v0.9o鉴别期停用)——
-	//与隐蔽/MSR/CPUID面一起, 在新BIOS+加速框架下补测"全功能"格
-	//M10.11终裁(SSDT定位器移除): 目标解析=调用者责任(EPT契约
-	//对齐——GeptHooks同款, GNPT_HOOK.Target直接传指针; 判例
-	//M10.11完整留档v2-v6五轮与版本无关架构, 重开此题从v6起步)
-	//M9.2变体: hook面门=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7)
-	//——x9/x10虽在旧调用门内, 但旧detour内层门不含=M10轮无hook面;
-	//M11.x序列线程沿用内层门语义(x系鉴别产物判读史保真), 线程恒启动
+	//接管成功, 安装演示hook。
+	//目标解析=调用者责任(GNPT_HOOK.Target直接传函数指针, 无SSDT/
+	//名称定位器——与EPT型框架契约一致)
+	//变体门: hook面=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7);
+	//序列线程沿用内层门语义, 线程恒启动
+	//故事面探针先行(全功能立即自证, 独立于demo hook轮序列)
+	DemoStoryProbe();
 	DemoMultiHookStart();
-	//M9.2(v2): MSR面独立调用(全功能/裸MSR/隐蔽+MSR/hook+MSR/M10.2决策轮/M10.5细分轮)
+	//变体门: MSR面独立调用(全功能/裸MSR/隐蔽+MSR/hook+MSR/CPUID决策轮)
 #if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 4 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 7 || GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10
 	DemoMsrInstall();
 #endif

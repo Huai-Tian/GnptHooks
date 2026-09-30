@@ -110,7 +110,7 @@ typedef struct _GNPT_RING_ENTRY
 	USHORT pad;
 } GNPT_RING_ENTRY, *PGNPT_RING_ENTRY;
 
-//环事件tag含义(日志判读表; 解析器依赖此语义):
+//环事件tag含义(语义表; 日志解析依赖此表):
 //  E=#VMEXIT采样(rsn=exit code) R=vmrun一致性失败 W=落地探针
 //  Q=KEEP放行 S=STOP桥通过(卸载留痕, rsn=0x81, a=1)
 //  u=vmmcall签名门拒绝(rsn=0x81, b=试探的功能码) B=#UD注入采样(rsn=引发exit)
@@ -136,6 +136,10 @@ typedef struct _GNPT_RING_ENTRY
 //    RFLAGS含注入TF, 不清则handler iret弹回=TF复活)
 //  t=TSC时间轴补偿终值(卸载留痕, rsn=offset低32位, a=offset高32位
 //    ——负值累计量=本核会话root驻留总扣除, 补偿循环活性铁证)
+//  v=SVM指令族#UD注入采样(rsn=exit码0x7A/0x80/0x82-0x86, a=RIP;
+//    首条+每4096条——预期个位数=探测器/自触发)
+//  G=#GP拦截处置采样(rsn=0x4D, a=RIP, b=1族字节命中转注入#UD/
+//    0忠实回注; 首条+每4096条)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -222,27 +226,11 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9ac"
-//v0.9ac=M11.2b方向一补格微轮: 候选池缩为真冷单T(MmGetSystemRoutine
-//Address, 探针0NPF实证)存活至16核普查——HOOKS驻留核上TΔ=0=互偷
-//方向一, 差距清单③最后一格; NtRWRP三度脱落定罪撤池。引擎零改动;
-//M10.12修复在位(正式版CPUID拦截位移除)。
-//变体开关(v0.9x系鉴别脚手架, 正式版恒0; 0=全功能):
-//0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR
-//6=隐蔽+hook 7=hook+MSR 8=机制轮(历史: 写双拦验证)
-//9=M10.2 CPUID回归决策轮: 全功能(v0.9y基线)+CPUID拦截位
-//   (handler为既有死代码复活, 单变量)——裁"CPUID独立有害"
-//   旧定罪(v0.9i-q系5/5相关, 但均被三体竞态混杂; 唯v0.9q
-//   无隐蔽死A轮未被竞态覆盖)。绿=CPUID面可回归(Hyper-V
-//   spoof铺路); 死=CPUID面真毒, caveat转正罪。
-//   实测(M10.3): 拖动负载→r72风暴→DWM崩溃循环(自愈型)=
-//   CPUID条件性真毒, 但毒在哪一环未定(exit本身/handler/壳)。
-//10=M10.5 毒位细分轮: 全功能+CPUID拦截+CPUID exit完全绕过
-//   TSC壳——终态见M10.9(三因子画像)与SvmExitHandler顶部
-//   短路路径(正式版CPUID位移除, 短路保留)。
-//11=M10.11 SSDT定位器轮——**已终裁移除**(EPT契约对齐: 目标
-//   解析=调用者责任, GNPT_HOOK.Target直接传指针; 判例M10.11
-//   完整留档v2-v6五轮与版本无关架构, 重开此题从v6起步)。
+#define GNPT_BUILD_TAG "v0.9af"
+//变体开关=开发期单变量鉴别脚手架(正式版恒0=全功能; 各变体仅控制
+//对应的演示面门, 引擎本体不变; 历史实验语义见开发文档, 不入代码):
+//0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR 6=隐蔽+hook
+//7=hook+MSR 8=机制轮 9=+CPUID拦截 10=+CPUID拦截且绕TSC壳 11=已移除
 #define GNPT_M92_VARIANT 0
 //哨兵v2运行时开关(默认开; 0=关——纯引擎最小观测面场景)
 #define GNPT_DPC_SENTINEL 1

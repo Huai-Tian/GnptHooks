@@ -541,12 +541,12 @@ static VOID FlDrainLines(HANDLE hFile, PLONG pCursor, volatile LONG* pFails)
 	*pCursor = head;
 }
 
-//===== M9.2 x8哨兵v2: DPC往返挂死核检测(变体8专用) =====
-//动机: x5_v2死107s无dump——现有看门狗(0xDEADC0DE)只盯写盘游标
-//停滞, 全机级冻结时看门狗线程自己也死。哨兵v2思路: 每核DPC心跳
-//(健康核毫秒级应答; 核楔死在root/客户态cli循环=DPC永不运行),
-//T1侧发现某核25s无应答→立即KeBugCheckEx取证(此时其余核还活着,
-//dump能写出=拿到挂死核的完整现场)。
+//===== DPC哨兵: 每核DPC往返挂死核检测 =====
+//动机: 行环看门狗(0xDEADC0DE)只盯写盘游标停滞, 全机级冻结时
+//看门狗线程自己也死。哨兵思路: 每核DPC心跳(健康核毫秒级应答;
+//核楔死在root/客户态cli循环=DPC永不运行), T1侧发现某核25s
+//无应答→立即KeBugCheckEx取证(此时其余核还活着, dump能写出=
+//拿到挂死核的完整现场)。
 //IRQL纪律: DPC例程DISPATCH级只写时间戳(无FlLog/无锁)
 #if GNPT_DPC_SENTINEL
 static volatile LONG64 g_flDpcBeat[64];    //每核最近DPC应答TSC
@@ -622,7 +622,7 @@ static VOID FlThreadProcT1(PVOID Context)
 	}
 	FlEnqueueLine("T1线程启动(Temp+心跳, 已钉离cpu0)");
 #if GNPT_DPC_SENTINEL
-	FlDpcArm();    //哨兵v2: DPC往返挂死核检测(变体8)
+	FlDpcArm();    //DPC哨兵: 每核往返挂死核检测
 #endif
 	FlDrainTempLocked();
 	//心跳250ms: [HB]提供存活证明+状态快照
@@ -666,7 +666,7 @@ static VOID FlThreadProcT1(PVOID Context)
 				if (g_svmVcpu[c].base.bLaunchFailed)  failMsk  |= (1UL << c);
 				if (g_svmVcpu[c].base.bSvmOn)         onMsk    |= (1UL << c);
 			}
-			//v0.9v停泊哨兵: 各核距上次#VMEXIT的时长(仅虚拟化核);
+			//停泊哨兵: 各核距上次#VMEXIT的时长(仅虚拟化核);
 			//parked掩码=超2s无exit的核(idle停泊属正常, 但系统死前
 			//该掩码的形态=IPI丢失现场定位)。TSC频率≈标称GHz, 2s
 			//阈值保守(3.4e9*2)

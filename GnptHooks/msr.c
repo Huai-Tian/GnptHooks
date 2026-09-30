@@ -7,14 +7,14 @@
 //====================================================================
 // MSR拦截简易API实现(接口契约见msr.h头注释)
 //
-//条目模型(与hook.c同款架构纪律):
+//条目模型(与hook.c一致的架构纪律):
 //  - 静态数组(GNPT_MSR_MAX个, 零动态内存→卸载无需释放流程)
 //  - Install/Remove持自旋锁(PASSIVE); 分发器无锁(条目字段
 //    安装后不可变; Removed用Interlocked发布/撤销)
 //  - 发布顺序: 填字段→置位图→InterlockedExchange(Removed,0)发布;
 //    x64 TSO保证其他核看到Removed=0时字段与位图均已就绪
 //  - Remove: 先标Removed(分发立即停止命中)再清位图; 在途exit
-//    (已过查表)的回调安全完成(与detour hook同款语义)
+//    (已过查表)的回调安全完成(与detour hook同语义)
 //
 //位图写方式: 隐蔽生效后MSRPM页guest态直写=落零页静默丢失——
 //Install/Remove的位图操作必经vmmcall root原语。位图改动即时
@@ -59,7 +59,8 @@ static VOID GnptMsrUnlock(VOID)
 
 //MSR号→MSRPM位定位(APM §15.11 Table 15-8三向量)。
 //FALSE=范围外(0x2000+窗口/0xC0020000+等, 未覆盖)
-static BOOLEAN GnptMsrLocate(ULONG32 Msr, PULONG OutByteOff, UCHAR* OutBit)
+//导出供svm.c故事面布防复用(置EFER/VM_CR/VM_HSAVE_PA读写双拦位)
+BOOLEAN GnptMsrLocate(ULONG32 Msr, PULONG OutByteOff, UCHAR* OutBit)
 {
 	ULONG64 off;
 	ULONG base;
@@ -180,11 +181,25 @@ BOOLEAN GnptMsrDispatchWrite(ULONG32 Msr, ULONG64 Value)
 	return TRUE;
 }
 
+//引擎保留MSR判定: 三MSR属"SVM未激活"自洽故事面, exit 0x7C特判
+//先于公共分发表——用户Install同号=死hook(特判吞掉永不达回调),
+//fail-loud拒绝
+BOOLEAN GnptMsrIsEngineReserved(ULONG32 Msr)
+{
+	return Msr == MSR_EFER || Msr == MSR_VM_CR || Msr == MSR_VM_HSAVE_PA;
+}
+
 NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 {
 	if (Hook == NULL || (Hook->OnRead == NULL && Hook->OnWrite == NULL))
 	{
 		return STATUS_INVALID_PARAMETER;
+	}
+	if (GnptMsrIsEngineReserved(Hook->Msr))
+	{
+		FlLog("[MSR] Install拒绝: MSR=0x%X为引擎保留(S1故事面EFER/VM_CR/"
+			"HSAVE_PA, exit特判先于用户表——用户hook永不达=死hook)", Hook->Msr);
+		return STATUS_NOT_SUPPORTED;
 	}
 	ULONG byteOff;
 	UCHAR bit;
@@ -194,7 +209,7 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 			"(范围外MSR在MSR_PROT下本就自动exit, 无hook语义)", Hook->Msr);
 		return STATUS_NOT_SUPPORTED;
 	}
-	//gate: 引擎运行中(与GnptHookInstall同款判据; 位图对in-guest核生效)
+	//gate: 引擎运行中(与GnptHookInstall相同判据; 位图对in-guest核生效)
 	ULONG cpuCount = KeQueryActiveProcessorCount(NULL);
 	ULONG inGuest = 0;
 	for (ULONG i = 0; i < cpuCount && i < 64; i++)
@@ -209,7 +224,7 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 		FlLog("[MSR] Install拒绝: 零核in-guest(引擎未运行), 无处拦截");
 		return STATUS_NOT_SUPPORTED;
 	}
-	//root原语前置(v0.9t): 位图vmmcall前钉到虚拟化核集(SMT隔离下
+	//root原语前置: 位图vmmcall前钉到虚拟化核集(SMT隔离下
 	//裸机兄弟核vmmcall=#UD→0x7E); 须在锁外(锁内DISPATCH)
 	KAFFINITY oldAff = SvmPinVirtualizedCpus();
 	if (oldAff == 0)
@@ -270,7 +285,7 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 
 NTSTATUS GnptMsrHookRemove(ULONG32 Msr)
 {
-	//root原语前置(v0.9t): 同Install——清位图vmmcall前钉虚拟化核集
+	//root原语前置: 同Install——清位图vmmcall前钉虚拟化核集
 	KAFFINITY oldAff = SvmPinVirtualizedCpus();
 	if (oldAff == 0)
 	{

@@ -94,7 +94,7 @@ static volatile LONG64 g_ctxSeq = 0;
 //翻译由引擎P态取指自愈分支冲净
 #define HOOK_TSTORM_GATE_NPF   1500LL     //安装窗口(250ms)拒绝阈
 #define HOOK_TSTORM_BUCKET     1024LL     //运行桶(≈700ms)脱落阈
-                                          //(实测4000档=UI关键路径可感知
+                                          //(4000档=UI关键路径可感知
                                           //停顿~1.4s→黑屏闪; 1024档损伤
                                           //≈2ms级不可感)
 static volatile LONG64 s_tstormCnt[GNPT_MAX_HOOKS];        //累计NPF
@@ -1121,7 +1121,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	e->TargetPa = MmGetPhysicalAddress(
 		(PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1))).QuadPart;
-	//root原语前置(v0.9t): 钉到虚拟化核集(SMT隔离下裸机兄弟核
+	//root原语前置: 钉到虚拟化核集(SMT隔离下裸机兄弟核
 	//vmmcall=#UD→0x7E); 完事还原亲和
 	KAFFINITY oldAff = SvmPinVirtualizedCpus();
 	if (oldAff == 0)
@@ -1179,7 +1179,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 
 NTSTATUS GnptHookRemove(PVOID Target)
 {
-	//root原语前置(v0.9t): 钉到虚拟化核集(还原路径同发NPTRES)
+	//root原语前置: 钉到虚拟化核集(还原路径同发NPTRES)
 	KAFFINITY oldAff = SvmPinVirtualizedCpus();
 	if (oldAff == 0)
 	{

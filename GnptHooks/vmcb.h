@@ -51,6 +51,10 @@ extern "C" {
 //InterceptException (+0x008): 向量0-31按位(单步窗口用)
 #define EXCP_INTERCEPT_DB       (1UL << 1)    //#DB(TF单步认领; DR6.BS=bit14, APM Vol2 §13.1.1.3)
 #define EXCP_INTERCEPT_MC       (1UL << 18)   //#MC机器检查(观测: 静默复位转化器, 见svm.c)
+#define EXCP_INTERCEPT_GP       (1UL << 13)   //#GP拦截: SVM指令族#GP先于拦截位(Table
+                                              //15-7), 非规范PA形态硬件直raise #GP不经
+                                              //拦截位→须#GP拦截+族字节判定改注入#UD
+                                              //(处置见svm.c的0x4D case)
 #define INTERCEPT_VMLOAD        (1UL << 2)
 #define INTERCEPT_VMSAVE        (1UL << 3)
 #define INTERCEPT_STGI          (1UL << 4)

@@ -236,6 +236,14 @@ CmSvmStop:
     jmp r11                         ;裸机模式继续guest代码(桥: r11=推进后RIP)
 CmSvmEnter ENDP
 
+;----- 裸vmmcall探针: r10/r11不置签名→exit handler签名门判外来
+; →'u'留痕+#UD注入=裸机#UD语义的执行级自证。
+; x64无MSVC intrinsic(0F 01 D9), asm实现; 破坏性零(拦截位/签名门双保险)
+CmSvmVmmCallRaw PROC
+    vmmcall
+    ret
+CmSvmVmmCallRaw ENDP
+
 ;----- 落地探针: VMCB.RIP首指处。vmrun后guest执行的第一段代码。
 ;全程不碰RSP(探针栈=CmSvmEnter保存的T_i现场), 不依赖GPR语义
 ;(r10/r11/rcx重装, 其余在探针栈里)。
