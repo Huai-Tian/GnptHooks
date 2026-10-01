@@ -636,6 +636,15 @@ static VOID FlThreadProcT1(PVOID Context)
 	hotWait.QuadPart = -10000LL;       //1毫秒
 	//心跳按墙钟强制发射: kick不断重置等待会饿死心跳, 改为醒来查墙钟
 	ULONG64 lastHb = KeQueryUnbiasedInterruptTime();
+	//睡眠唤醒诚实告知: biased(含睡眠)-unbiased(去睡眠)差=累计挂起
+	//时长, 唤醒后差值跳增即检测到S3/S4。睡眠的INIT路径不保证引擎
+	//存活(裸核INIT清SVME=静默去隐蔽; guest化核INIT被拦截=蓝屏取证),
+	//唤醒后如实报告, 不自动二次接管
+	ULONG64 sleptBase = 0;
+	if (KeQueryInterruptTime() > KeQueryUnbiasedInterruptTime())
+	{
+		sleptBase = KeQueryInterruptTime() - KeQueryUnbiasedInterruptTime();
+	}
 	for (;;)
 	{
 		//热模式等待超时1ms(见hotWait注释), 常规250ms
@@ -651,6 +660,23 @@ static VOID FlThreadProcT1(PVOID Context)
 		FlDrainBinRing();
 		if (KeQueryUnbiasedInterruptTime() - lastHb >= 2500000LL)
 		{
+			//睡眠唤醒检测(阈值10s): 差值新增量=本次挂起时长;
+			//引擎接管中才有"死"可言
+			ULONG64 biasedNow = KeQueryInterruptTime();
+			ULONG64 unbiasedNow = KeQueryUnbiasedInterruptTime();
+			if (biasedNow > unbiasedNow + sleptBase + 10LL * 10000000LL
+				&& g_svmVcpuCount > 0)
+			{
+				ULONG64 slept = biasedNow - unbiasedNow - sleptBase;
+				sleptBase = biasedNow - unbiasedNow;
+				char s3[192];
+				RtlStringCbPrintfA(s3, sizeof(s3),
+					"[S3] 睡眠唤醒(新增挂起%llus): 引擎不跨睡眠存活"
+					"(硬件INIT清SVME; guest化核INIT=蓝屏取证), "
+					"本会话请卸载后重新加载",
+					(unsigned long long)(slept / 10000000ULL));
+				FlEnqueueLine(s3);
+			}
 			//心跳行: 存活证明+vcpu状态快照+exit计数
 			//g/f/o掩码: bit i = cpu i 的 bInGuest/bLaunchFailed/bSvmOn
 			char hbb[512];
@@ -743,12 +769,13 @@ static VOID FlThreadProcT1(PVOID Context)
 			}
 #endif
 			RtlStringCbPrintfA(hbb, sizeof(hbb),
-				"[HB%llu] up=%us lag=%ld wf=%ld/%ld g:%X f:%X o:%X p:%X pk:%X vcpu=%d pend=%d exits:",
+				"[HB%llu] up=%us lag=%ld wf=%ld/%ld g:%X f:%X o:%X p:%X pk=%X vcpu=%d pend=%d st=%X exits:",
 				++hb, (ULONG)(KeQueryUnbiasedInterruptTime() / 10000000ULL),
 				g_flT1Lag, g_flWriteFailsT1, g_flWriteFailsT2,
 				guestMsk, failMsk, onMsk, g_gnptParkedMask, parkedX,
 				(int)g_gnptVcpuCpu,
-				(g_gnptVcpuCpu >= 0) ? (int)g_svmVcpu[g_gnptVcpuCpu].base.PendingIntrCount : 0);
+				(g_gnptVcpuCpu >= 0) ? (int)g_svmVcpu[g_gnptVcpuCpu].base.PendingIntrCount : 0,
+				(ULONG)g_gnptHookStage);
 			{
 				char one[40];
 				for (ULONG r = 0; r < GNPT_EXIT_REASON_MAX; r++)

@@ -38,6 +38,12 @@
 //     热探测(布防后实测250ms窗口, NPF超限=拒绝安装)+运行期速率
 //     脱落(≈700ms桶超限=自动解除布防, 'F'环留痕)。预算线≈页执行
 //     ≤5000次/s持续; 目标函数冷≠达标——页邻域实测说了算
+//  7. 模式互斥(混装拒绝): TRANSPARENT与普通模式的驻留视图体系
+//     不同, 并存时互相按核静默失效——任一模式驻留期间Install
+//     另一模式=拒绝(fail-loud); 全部Remove后方可换装
+//  8. 单写者契约: Install/Remove/RemoveAll/Enumerate内部无锁
+//     (条目分配/隐蔽登记/树游标均为单写者设计), 调用方须自行
+//     串行化(专用工作线程或互斥); 并发调用=条目与登记表竞态
 //
 //硬件要求: 引擎运行中(全核in-guest)才可安装; 目标prologue含相对
 //  分支/RIP-relative超±2GB=Install拒绝(日志[Reloc]行留痕)
@@ -53,8 +59,9 @@ typedef ULONG64 (*GNPT_CALLBACK)(
 
 //栈参数转发上限(hook-asm.asm GnptCallOrigAsm固定帧=32槽×8B)
 #define GNPT_MAX_STACK_ARGS  32
-//最大同时驻留hook数(条目静态数组)
-#define GNPT_MAX_HOOKS       16
+//最大同时驻留hook数(条目静态数组; 发布后不可变=分发器无锁读。
+//NPF引擎按TargetPa线性首匹配, 超此量级需哈希索引=另行演进)
+#define GNPT_MAX_HOOKS       64
 
 //安装描述(值语义, 安装后内部自持)
 typedef struct _GNPT_HOOK
@@ -78,13 +85,19 @@ typedef struct _GNPT_HOOK
                                        //低频目标专用(高频目标=每指令
                                        //2exit风暴, 见使用纪律5)
 
-//安装hook(PASSIVE_LEVEL, 引擎运行中): CodePage构建+双NPT视图布防
+//安装hook(PASSIVE_LEVEL, 引擎运行中): CodePage构建+多视图布防
+//+CodePage工件隐蔽(身份PTE四视图零页——guest物理扫描不可见)
 //+全核TLB同步(布防即刻生效)
 NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook);
 
-//移除hook(PASSIVE_LEVEL): 双视图PTE恒等还原+全核TLB同步→hook立即
-//失效; 在途回调安全完成(槽/条目延迟到卸载释放)
+//移除hook(PASSIVE_LEVEL): 布防PTE恒等还原+全核TLB同步→hook立即
+//失效; 随后root代写还原CodePage补丁字节+解除工件隐蔽(PFN复用
+//安全)。在途回调安全完成(槽/条目延迟到卸载释放)
 NTSTATUS GnptHookRemove(PVOID Target);
+
+//枚举live hook(Buffer=NULL时*InOutCount返回数量; 容量不足=
+//STATUS_BUFFER_TOO_SMALL并回填所需数量)
+NTSTATUS GnptHookEnumerate(GNPT_HOOK* Buffer, ULONG* InOutCount);
 
 //回调内调用原函数(仅回调上下文有效, 其他上下文返回0):
 //统一经LDE重定位跳板(版本无关, 无prologue硬编码, 视图无关);

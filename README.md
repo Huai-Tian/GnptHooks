@@ -174,6 +174,21 @@ On unload, remove all hooks **before** SVM teardown (`GnptHookRemoveAll` — in-
 - **Build**: Visual Studio 2022 + Windows Driver Kit (WDK)
 - **Runtime**: administrator privileges
 
+## 🖥️ Platform Boundaries
+
+Read this before running a bare-metal hypervisor on AMD laptop hardware.
+
+**The sub-SMM killer (silent hardware reset).** On some AMD mobile platforms (observed: Cezanne / Zen 3 with EOL OEM firmware), a sparse external event below SMM (likely SMU/EC class) silently resets the machine while all cores are guest-parked. Signature: hardware reset with no bugcheck, no WHEA record, no log precursor; the engine can be killed mid-load or even mid-unload, and a machine can reset ~8 seconds after a warm reboot with no driver loaded at all (a self-sustaining reset loop with decreasing intervals). It is not fixable in software: `HWCR.SMMLOCK=1` blocks SMI interception (the only OS-level observation path), making the killer invisible to both the OS and the VMM.
+
+**Operational discipline on affected platforms.** Cold machine + load late after boot + default power plan + short bursts: finish verification and unload within ~2 minutes, stop immediately after, never re-test right after a death (that is when the reset loop is hottest). A cold first run after overnight power-off is the most stable window observed (up to 40 minutes); warm-machine runs die in the 30 s – 600 s range with no pattern.
+
+**Hardware feature boundaries (probed at runtime, reported in the log banner).**
+- **PMC/IBS virtualization** (`Fn8000_000A EDX bit8/bit26`): absent on some Zen 3 consumer APUs. Without it, the PMU side channel (guest performance counters also count root-resident instructions) cannot be closed in hardware on such platforms. LBR virtualization is present and enabled where the CPUID bit exists.
+- **TSC_DEADLINE translation** (`MSR 0x6E0`): enabled only when the LAPIC actually runs in TSC-deadline mode (probed at boot; legacy-LAPIC platforms pass accesses through untouched, which is bare-metal-equivalent). Root-mode code must never access mode-dependent MSRs without a prior bare-metal probe — an illegal MSR access inside a #VMEXIT handler is a physical fault with no SEH protection.
+- **STGI passthrough**: gated on the SKINIT CPUID bit — where the bit is present, a bare-metal STGI executes silently, so injecting #UD would be a detectable deviation; where absent, it stays intercepted.
+
+**Hardware selection guidance.** Check the firmware update pipeline before adopting a platform: AMD microcode reaches consumers only through BIOS/AGESA updates from the OEM (Intel microcode ships via Windows Update; AMD does not). A laptop whose OEM has stopped BIOS updates is a hard risk for any bare-metal hypervisor — errata and power-management fixes released after EOL never reach the machine. Prefer platforms with an active AGESA cadence (desktop boards historically stay updated for years), and verify `SMMLOCK` early if SMI interception is part of your design.
+
 ## 🧪 Capability Verification Matrix
 
 Core paths verified on nested AMD SVM (VMware guest, Windows 10 x64) — base engine at v0.3c (2-core), single-step & stealth suite at v0.7d (4-core); physical-hardware rows follow:
@@ -204,12 +219,18 @@ Physical-hardware verification (Ryzen 7 5800H, Windows 10 22H2, all 16 cores):
 | MSR interception (physical) | LSTAR read forge + self-trigger thread ×3 verified per session |
 | Stability under adversarial power policy | full-feature rounds: deep-idle round 30 min green, **C0-pinned round 30 min green** (historically 3/3 dead before the root-cause fix below) |
 | Root-caused & fixed: the three-body race | 11-round isolation matrix (single-factor/dual-factor/combination builds) pinned CLOCK_WATCHDOG_TIMEOUT (0x101) deaths on a hardware-level race between **NPT self-concealment (remapped PT pages) × MSRPM read interception × passthrough WRMSR**: write-passthrough died in 107 s, write-intercepted (root re-executes the write) green — one-variable life/death flip, fix verified by the full accelerated suite (both rounds green, C-round first-ever pass) |
+| Self-consistent "SVM inactive" story | second instance self-rejects in seconds via forged VM_CR (SVMDIS+LOCK read forge); SVM instruction family #UD injection with #GP surgery (RIP byte family check, faithful reinjection of natural #GP); 0xB8 virtualization group strictly feature-gated |
+| Runtime artifact concealment (S2) | CodePage identity PTEs remapped to the zero page across all four NPT views; Remove via root memcpy with PFN-reuse guard; mixed EPT/NPT-driver installs rejected fail-loud |
+| STGI passthrough gating (v0.9ar) | SKINIT CPUID bit present → STGI not intercepted, executes silently = bare-metal equivalent (r84 exit count = 0); bit absent → stays intercepted with #UD |
+| TSC_DEADLINE mode gating (v0.9ar) | boot-time bare-metal probe: legacy-LAPIC host passes 0x6E0 through untouched (banner reports the exception code); the translation path engages only when the LAPIC actually runs in TSC-deadline mode — root code never touches an unprobed, mode-dependent MSR |
+| Sleep-wake honest reporting (v0.9ar) | T1 heartbeats detect a biased/unbiased clock split > 10 s → honest log line on wake; no automatic re-takeover |
+| Clean unload after the full v0.9ar feature set | 16-core de-virtualization (SVME read-back = 0 × 16), zero leaked cores, NPT pages fully released, S1 account closed (probe traffic exact) |
 
-The stability story is documented as case law (NOTES.md, in-repo) — every claim above has a log-level evidence chain.
+The stability story is documented as case law (NOTES.md, in-repo) — every claim above has a log-level evidence chain. Platform-specific hazards (the sub-SMM silent-reset killer, feature-absent PMU virtualization) are documented in **Platform Boundaries** above.
 
 ## ⚠️ Project Status
 
-Milestones M0–M5 (engine, dual-NPT hook, TF+#DB single-step primitives, four-view TRANSPARENT suite), M6 (TSC timeline compensation + clock-domain investigation), M7 (MSR hook face via MSRPM bitmaps), M8 (NPT self-concealment + a stability campaign that ended with the page-hot defenses and a full-core/SMT-threads verdict) and M9 (three-body race root-caused and fixed — see the matrix above) have all graduated **on physical hardware** (Ryzen 7 5800H). The current build (v0.9y) is the most stable form to date: accelerated Full suite double-green (deep-idle + C0-pinned, 30 min each) with clean unload, plus a per-core DPC sentinel for automatic crash forensics. The framework remains research-grade: a hypervisor-level bug may still bugcheck the system — always test on a disposable machine.
+Milestones M0–M5 (engine, dual-NPT hook, TF+#DB single-step primitives, four-view TRANSPARENT suite), M6 (TSC timeline compensation + clock-domain investigation), M7 (MSR hook face via MSRPM bitmaps), M8 (NPT self-concealment + a stability campaign that ended with the page-hot defenses and a full-core/SMT-threads verdict), M9 (three-body race root-caused and fixed), M10 (CPUID interception verdict) and M11 (self-consistent story, artifact concealment + API closure, TSC_DEADLINE gating, PMU boundary study, and a full platform-hazard characterization — see **Platform Boundaries**) have all graduated **on physical hardware** (Ryzen 7 5800H). The current build (v0.9ar) is the most stable form to date, with a per-core DPC sentinel for automatic crash forensics. The framework remains research-grade: a hypervisor-level bug may still bugcheck the system — always test on a disposable machine.
 
 ## 🚫 Non-Commercial Statement
 

@@ -52,6 +52,14 @@ static ULONG64   s_hideZeroPa = 0;
 static ULONG64   s_concealPa[NPT_CONCEAL_MAX];
 static ULONG     s_concealCount = 0;
 static volatile LONG s_concealHits = 0;      //'O'兜底恢复计数
+//页表页登记游标: g_nptPages[0..游标)已入登记表。运行期树修改
+//(布防拆分/隐蔽改译)新增的页表页从游标起"排水"登记——运行期
+//隐蔽的原语每次调用先排干存量, 失败残留由此自愈
+static ULONG     s_concealPagesReg = 0;
+//root上下文标记(每核): exit handler进出成对置位/清零。置位期间
+//SvmNptAllocPage拒绝触发新arena块分配(Mm连续分配在GIF=0/任意
+//IRQL上下文不可安全调用); 槽切取(纯指针推进)不受限
+static volatile LONG s_nptRootCtx[64];
 
 ULONG64 SvmNptViewNcr3(ULONG View) { return g_nptTree[View & 3].Ncr3; }
 ULONG64 SvmNptCoverageBytes(VOID) { return g_nptCoverage; }
@@ -68,8 +76,20 @@ static ULONG64 SvmNptComputeCoverage(VOID)
 	return cover & ~(0x200000ULL - 1);
 }
 
+//root上下文标记(npt.h契约): 成对调用, 嵌套不支持(冷路径无嵌套)
+VOID SvmNptRootCtxMark(BOOLEAN InRoot)
+{
+	ULONG cpu = KeGetCurrentProcessorNumber();
+	if (cpu < 64)
+	{
+		s_nptRootCtx[cpu] = InRoot ? 1 : 0;
+	}
+}
+
 //分配一页页表页: 从2MB连续arena块切槽(见头注释;
-//同帧第二页起零新拆分)。PASSIVE单线程契约(构建/Install/Conceal)
+//同帧第二页起零新拆分)。PASSIVE单线程契约(构建/Install/Conceal);
+//root上下文(exit handler)内块边界=拒绝(新块须Mm连续分配,
+//IF=0/任意IRQL下不安全)——调用方fail-loud
 static PVOID SvmNptAllocPage(PULONG64 paOut)
 {
 	if (g_nptPageCount >= NPT_MAX_PAGES)
@@ -79,6 +99,11 @@ static PVOID SvmNptAllocPage(PULONG64 paOut)
 	//找空槽: 现块满→新块
 	if ((g_nptArenaUsed % NPT_ARENA_SLOTS) == 0)
 	{
+		ULONG cpu = KeGetCurrentProcessorNumber();
+		if (cpu < 64 && s_nptRootCtx[cpu])
+		{
+			return NULL;    //root上下文禁新块分配(块边界)
+		}
 		ULONG blk = g_nptArenaUsed / NPT_ARENA_SLOTS;
 		if (blk >= NPT_ARENA_BLOCKS)
 		{
@@ -283,6 +308,7 @@ VOID SvmFreeNpt(VOID)
 		s_hideZeroPa = 0;
 	}
 	s_concealCount = 0;
+	s_concealPagesReg = 0;
 }
 
 //==================== NPT自我隐蔽 ====================
@@ -457,6 +483,7 @@ BOOLEAN SvmNptConcealAll(VOID)
 		(ULONG64)s_concealCount, (ULONG64)g_nptPageCount);
 	FlLog("NPT: 自我隐蔽完成(%u页改译零页%llX, 页表页%u)",
 		s_concealCount, s_hideZeroPa, g_nptPageCount);
+	s_concealPagesReg = g_nptPageCount;    //游标就位: 运行期新增页表页自此排水
 	return TRUE;
 }
 
@@ -466,4 +493,109 @@ ULONG SvmNptConcealHits(VOID) { return (ULONG)s_concealHits; }
 ULONG64 SvmNptConcealPa(ULONG Index)
 {
 	return (Index < s_concealCount) ? s_concealPa[Index] : 0;
+}
+
+//==================== 运行期工件隐蔽 ====================
+//登记表移除一页(交换末尾; 纯.data)。'O'兜底按PTE现值判定, 不依赖
+//此表——PTE侧还原走NPTRES(0xF)后调本函数, 顺序不可反(先移除=
+//诊断面与PTE实态短暂不一致)
+VOID SvmNptConcealRemove(ULONG64 Pa)
+{
+	for (ULONG i = 0; i < s_concealCount; i++)
+	{
+		if (s_concealPa[i] == Pa)
+		{
+			s_concealPa[i] = s_concealPa[--s_concealCount];
+			return;
+		}
+	}
+}
+
+//登记一页gpa并入既有隐蔽体系(npt.h契约; 须root上下文——改译PTE
+//写与隐蔽页表页的树修改均不可走guest态)。两阶段全有全无:
+//  阶段1(可失败, 残留无害): 对Pa与登记游标后的全部页表页, 逐页
+//    ×4树LocatePte把改译槽位拆分到位——拆分副产物=新页表页, 并入
+//    下轮, 迭代到不动点。失败源=页表页数组满/arena块边界(root上下
+//    文禁新块)/超512GB覆盖; 已完成的拆分是合法树结构, 留给下次
+//    调用的游标排水自愈
+//  阶段2(先容量检查后落笔, 不可失败): 登记Pa+游标排水页表页, 对
+//    新登记项统一改译零页(P|US|A: 读=静默零, 写/执行=fault→'O'兜底)
+BOOLEAN SvmNptConcealPageRuntime(ULONG64 Pa)
+{
+	if (s_hideZeroVa == NULL || (Pa & 0xFFF) != 0 || Pa == 0 ||
+		(Pa >> 39) != 0)
+	{
+		return FALSE;    //隐蔽未启用/非页基/超PML4[0]覆盖
+	}
+	//已登记(不变量: 登记项PTE已指零页)→跳过改译, 仍排水新增页表页
+	BOOLEAN already = FALSE;
+	for (ULONG i = 0; i < s_concealCount; i++)
+	{
+		if (s_concealPa[i] == Pa)
+		{
+			already = TRUE;
+			break;
+		}
+	}
+	ULONG first = s_concealPagesReg;
+	//阶段1: 拆分到位(不动点迭代; 轮次上限=级联深度界, 超界=拒绝)
+	for (ULONG round = 0; round < 8; round++)
+	{
+		ULONG seen = g_nptPageCount;
+		if (!already)
+		{
+			for (ULONG v = 0; v < GNPT_VIEW_COUNT; v++)
+			{
+				if (SvmNptLocatePte(&g_nptTree[v], Pa) == NULL)
+				{
+					return FALSE;
+				}
+			}
+		}
+		for (ULONG i = first; i < seen; i++)
+		{
+			ULONG64 ptPa = MmGetPhysicalAddress(g_nptPages[i]).QuadPart;
+			for (ULONG v = 0; v < GNPT_VIEW_COUNT; v++)
+			{
+				if (SvmNptLocatePte(&g_nptTree[v], ptPa) == NULL)
+				{
+					return FALSE;
+				}
+			}
+		}
+		if (g_nptPageCount == seen)
+		{
+			break;    //不动点
+		}
+		if (round == 7)
+		{
+			return FALSE;    //级联超界(防御: 聚簇下实际2-3轮收敛)
+		}
+	}
+	//阶段2: 容量检查(全有全无)→登记→改译
+	ULONG processed = s_concealCount;
+	ULONG newEnt = (already ? 0 : 1) + (g_nptPageCount - first);
+	if (processed + newEnt > NPT_CONCEAL_MAX)
+	{
+		return FALSE;
+	}
+	if (!already)
+	{
+		(void)SvmNptConcealAdd(Pa);
+	}
+	for (ULONG i = first; i < g_nptPageCount; i++)
+	{
+		(void)SvmNptConcealAdd(
+			MmGetPhysicalAddress(g_nptPages[i]).QuadPart);
+	}
+	ULONG64 hideFlags = NPT_PTE_P | NPT_PTE_US | NPT_PTE_A;
+	for (ULONG i = processed; i < s_concealCount; i++)
+	{
+		for (ULONG v = 0; v < GNPT_VIEW_COUNT; v++)
+		{
+			SvmNptSetPte(v, s_concealPa[i], s_hideZeroPa, hideFlags);
+		}
+	}
+	s_concealPagesReg = g_nptPageCount;
+	return TRUE;
 }

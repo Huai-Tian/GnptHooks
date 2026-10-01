@@ -15,6 +15,12 @@ extern "C" {
 #endif
 
 //===== SVM相关MSR (APM §15.30) =====
+#define MSR_HWCR                0xC0010015  //bit0=SMMLOCK(内核MSR_K7_HWCR_SMMLOCK三方
+                                            //一致): 置1=固件锁死SMM且SMI拦截被忽略(APM §15.13.3)
+#ifndef MSR_IA32_TSC_DEADLINE
+#define MSR_IA32_TSC_DEADLINE   0x000006E0  //LAPIC TSC-deadline定时器(物理轴比较,
+                                            //guest轴编程→须轴换算, 处置见svm.c 0x7C特判)
+#endif
 #define MSR_VM_CR               0xC0010114  //DPD(b0) R_INIT(b1) DIS_A20M(b2) LOCK(b3) SVMDIS(b4)
 #define MSR_IGNNE               0xC0010115
 #define MSR_SMM_CTL             0xC0010116
@@ -37,8 +43,9 @@ extern "C" {
 #endif
 
 //===== CPUID =====
-//Fn8000_0001_ECX bit2=SVM支持
+//Fn8000_0001_ECX bit2=SVM支持 bit12=SKINIT支持
 #define CPUID_SVM_ECX_BIT       2
+#define CPUID_SKINIT_ECX_BIT    12
 //Fn8000_000A: EAX= SVM revision(bits7:0); EBX= NASID(可用ASID数)
 //             ECX bit5=EnhancedTlbi bit6=x2AVIC_EXT
 //             EDX=特性位(下表)
@@ -183,7 +190,7 @@ typedef struct _GNPT_VCPU_SVM
 } GNPT_VCPU_SVM, *PGNPT_VCPU_SVM;
 
 extern GNPT_VCPU_SVM g_svmVcpu[64];
-extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; 恒=全部核)
+extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; =实际接管数, 见GNPT_TAKE_CORES)
 extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(HB心跳检停泊)
 
 //root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——仅虚拟化
@@ -193,6 +200,8 @@ extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEX
 //0=引擎未起(调用方按失败处理)
 KAFFINITY SvmPinVirtualizedCpus(VOID);
 extern ULONG64 g_svmFeatBits;       //Fn8000_000A_EDX快照(降级决策)
+extern volatile ULONG g_svmStgiPass; //STGI直通门控: 1=SKINIT特性在场(不拦STGI=裸机等价), 0=拦截+#UD
+extern volatile ULONG g_svmTscDlMode; //0x6E0轴换算门控: 1=LAPIC处TSC-deadline模式(拦截+换算), 0=直通(裸机等价)
 extern KEVENT g_svmShutdownEvent;   //卸载: 唤醒全部发起线程
 
 //段快照helper(svm-asm.asm): x64内核CS/SS/DS/ES基址恒0(64位规范)
@@ -227,11 +236,18 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 #define GNPT_VMCALL_NPTSYNC 4  //NPT改动全核TLB同步(exit handler置TLB_CONTROL=3)
 //==== root写原语(自我隐蔽配套; 隐蔽生效后guest态直写NPT/MSRPM
 //页=落零页静默丢失, 一切动态写必经此族; exit handler(GIF=0)root
-//态直访物理。自发vmmcall=发起线程PASSIVE语义, 原语内池分配(现场
-//拆分)合法) ====
+//态直访物理。自发vmmcall=发起线程PASSIVE语义, 原语内arena槽切取
+//(现场拆分)合法; **新arena块分配除外**——Mm连续分配非IF=0/任意
+//IRQL上下文可安全调用, NPTSET/NPTRES/CONCEAL三case内置root上下文
+//标记, 块边界=拒绝由调用方fail-loud) ====
 #define GNPT_VMCALL_NPTSET 5   //写视图PTE: rdx=gpa r8=pa|(view<<48) r9=flags
 #define GNPT_VMCALL_NPTRES 6   //恢复恒等: rdx=gpa r8=view(0-3单树/0xF四树)
 #define GNPT_VMCALL_MSRBIT 7   //全核MSRPM位操作: rdx=msr r8=(isWrite<<1)|set
+#define GNPT_VMCALL_MEMCPY 9   //root拷贝: rdx=dst r8=src r9=len(0<len≤4KB;
+                               //  rax=1成功/0拒绝)。隐蔽生效后guest态直写
+                               //  已隐蔽页=写fault, 须root代写
+#define GNPT_VMCALL_CONCEAL 12  //运行期工件隐蔽: rdx=pa(4KB对齐)→身份PTE
+                               //  四视图改译零页+挂靠登记表(rax=1/0)
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)

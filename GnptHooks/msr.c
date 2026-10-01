@@ -181,12 +181,13 @@ BOOLEAN GnptMsrDispatchWrite(ULONG32 Msr, ULONG64 Value)
 	return TRUE;
 }
 
-//引擎保留MSR判定: 三MSR属"SVM未激活"自洽故事面, exit 0x7C特判
-//先于公共分发表——用户Install同号=死hook(特判吞掉永不达回调),
-//fail-loud拒绝
+//引擎保留MSR判定: 三MSR属"SVM未激活"自洽故事面+0x6E0属TSC_DEADLINE
+//轴换算, exit 0x7C特判先于公共分发表——用户Install同号=死hook
+//(特判吞掉永不达回调), fail-loud拒绝
 BOOLEAN GnptMsrIsEngineReserved(ULONG32 Msr)
 {
-	return Msr == MSR_EFER || Msr == MSR_VM_CR || Msr == MSR_VM_HSAVE_PA;
+	return Msr == MSR_EFER || Msr == MSR_VM_CR || Msr == MSR_VM_HSAVE_PA ||
+		Msr == MSR_IA32_TSC_DEADLINE;
 }
 
 NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
@@ -198,7 +199,8 @@ NTSTATUS GnptMsrHookInstall(const GNPT_MSR_HOOK* Hook)
 	if (GnptMsrIsEngineReserved(Hook->Msr))
 	{
 		FlLog("[MSR] Install拒绝: MSR=0x%X为引擎保留(S1故事面EFER/VM_CR/"
-			"HSAVE_PA, exit特判先于用户表——用户hook永不达=死hook)", Hook->Msr);
+			"HSAVE_PA或0x6E0轴换算, exit特判先于用户表——用户hook永不达=死hook)",
+			Hook->Msr);
 		return STATUS_NOT_SUPPORTED;
 	}
 	ULONG byteOff;

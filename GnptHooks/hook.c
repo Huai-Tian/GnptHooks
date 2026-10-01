@@ -13,8 +13,12 @@
 //  ret回调用者(rax=回调返回值)
 //
 //GnptCallOriginal经LDE重定位跳板(视图无关)。
-//Remove: 还原CodePage被覆盖字节+双视图PTE恒等还原+全核TLB同步
-//  →hook失效; 在途回调安全完成(槽/条目延迟到卸载释放)
+//工件隐蔽: Install后CodePage身份PTE四视图改译零页(挂靠自我隐蔽
+//  登记表)——guest物理扫描只见零, 补丁签名不可寻; Remove按
+//  [布防PTE恒等还原→全核同步→root memcpy还原补丁字节→解除
+//  隐蔽(恒等+登记表移除)→全核同步]次序, 各步之间无暴露窗口
+//  (补丁存在期间恒被零页翻译掩护)。在途回调安全完成
+//  (槽/条目延迟到卸载释放)
 //====================================================================
 
 #define HOOK_POOL_TAG        'MemN'     //中性池tag
@@ -490,7 +494,7 @@ static VOID HookSwitchView(PVMCB Vmcb, ULONG Cpu, ULONG View);    //前向(定�
 
 //每核单步状态
 static volatile LONG g_stepUse[64];        //用途(STEP_*)
-static volatile LONG g_stepRwMask[64];     //方案B页集(bit i=g_hooks[i]临时RW中)
+static volatile LONG64 g_stepRwMask[64];   //方案B页集(bit i=g_hooks[i]临时RW中)
 static volatile LONG64 g_stepTfShadow[64];  //guest TF影子(arm时初始化, popf仿真同步)
 static volatile LONG g_stepHookIdx[64];    //arm时的hook条目(REHIDE收尾用)
 static volatile LONG g_stepRetView[64];    //READ_TRANS归返视图(HIDE或HOOKS)
@@ -515,13 +519,13 @@ static VOID HookTempRwSet(ULONG HookIdx, ULONG Cpu, BOOLEAN On)
 	{
 		SvmNptSetPte(GNPT_VIEW_SECONDARY, e->TargetPa, e->CodePagePa,
 			NPT_PTE_FLAGS_HOOKS | NPT_PTE_RW);
-		g_stepRwMask[Cpu] |= (LONG)(1UL << HookIdx);
+		g_stepRwMask[Cpu] |= (LONG64)(1ULL << HookIdx);
 	}
 	else
 	{
 		SvmNptSetPte(GNPT_VIEW_SECONDARY, e->TargetPa, e->CodePagePa,
 			NPT_PTE_FLAGS_HOOKS);
-		g_stepRwMask[Cpu] &= ~(LONG)(1UL << HookIdx);
+		g_stepRwMask[Cpu] &= ~(LONG64)(1ULL << HookIdx);
 	}
 }
 
@@ -600,7 +604,7 @@ BOOLEAN GnptHookStepDbExit(PVMCB Vmcb, ULONG Cpu)
 	}
 	else if (use == STEP_TEMP_RW)
 	{
-		ULONG mask = (ULONG)g_stepRwMask[Cpu];
+		ULONG64 mask = (ULONG64)g_stepRwMask[Cpu];
 		g_stepRwMask[Cpu] = 0;
 		for (ULONG i = 0; mask != 0 && i < GNPT_MAX_HOOKS; i++, mask >>= 1)
 		{
@@ -752,7 +756,7 @@ VOID GnptHookStepLeakCheck(PVMCB Vmcb, ULONG Cpu)
 	}
 	else if (use == STEP_TEMP_RW)
 	{
-		ULONG mask = (ULONG)g_stepRwMask[Cpu];
+		ULONG64 mask = (ULONG64)g_stepRwMask[Cpu];
 		g_stepRwMask[Cpu] = 0;
 		for (ULONG i = 0; mask != 0 && i < GNPT_MAX_HOOKS; i++, mask >>= 1)
 		{
@@ -981,7 +985,52 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 }
 
 //==================== 安装/移除 ====================
-//全核TLB同步: 每核vmcall(NPTSYNC)→exit handler置TLB_CONTROL=3
+//安装/移除阶段号(观测用): 'J'环即时留痕+HB行st=字段——冻结吞掉
+//环尾时, 冻结后存活的任一HB行仍能指示最后到达阶段(判读锚点)
+volatile LONG g_gnptHookStage = 0;
+static VOID HookStage(ULONG Stage)
+{
+	g_gnptHookStage = (LONG)Stage;
+	FlRingPush('J', (Stage & 0xFF), Stage, 0, 0, 0);
+}
+//阶段表: 10入口 11CodePage就绪 12钉核 13发布(live++) 14布防
+//15隐蔽 16同步 17自证 18热探针过 30移除入口 31布防还原 32同步
+//33拷贝 34解除 35同步2 36完成 99回滚
+#define HKST_INS_ENTRY    10
+#define HKST_INS_CPALLOC  11
+#define HKST_INS_PIN      12
+#define HKST_INS_LIVE     13
+#define HKST_INS_ARMED    14
+#define HKST_INS_CONCEAL  15
+#define HKST_INS_SYNC1    16
+#define HKST_INS_SELFCHK  17
+#define HKST_INS_PROBE    18
+#define HKST_RM_ENTRY     30
+#define HKST_RM_ARMED     31
+#define HKST_RM_SYNC1     32
+#define HKST_RM_MCPY      33
+#define HKST_RM_REVEAL    34
+#define HKST_RM_SYNC2     35
+#define HKST_RM_DONE      36
+#define HKST_FAIL         99
+
+//安装阶段步进(诊断): 每阶段驻留一拍, 该拍的[HB]st=行落盘——
+//若再冻结, 冻结前的最后心跳行即冻结阶段(证据在盘不在内存)。
+//发布先行(见Install)使步进窗口内fault皆有进展, 步进本身安全
+#define GNPT_HOOK_STEP_MS  300
+static VOID HookStagePaced(ULONG Stage)
+{
+	HookStage(Stage);
+	LARGE_INTEGER w;
+	w.QuadPart = -(LONGLONG)GNPT_HOOK_STEP_MS * 10000LL;
+	KeDelayExecutionThread(KernelMode, FALSE, &w);
+}
+
+//全核TLB同步: 每核自我vmcall(NPTSYNC)→本核exit handler置
+//TLB_CONTROL=3。常态走DPC广播(DISPATCH级)——单核卡死时其余核
+//照常运转, 哨兵v2的挂死判定(12s→0xDEADC1DE蓝屏取证)得以开火;
+//非in-guest核跳过留痕('j'环)。park态降级IPI: park核停泊循环只
+//服务中断不跑DPC, DPC广播对它=永等
 static ULONG_PTR NTAPI HookSyncIpi(ULONG_PTR Ignored)
 {
 	UNREFERENCED_PARAMETER(Ignored);
@@ -993,9 +1042,45 @@ static ULONG_PTR NTAPI HookSyncIpi(ULONG_PTR Ignored)
 	return 0;
 }
 
+//KeGenericCallDpc族=未文档化内核导出(WDK无声明, 签名源=ReactOS
+//NDK), 显式原型消除隐式声明告警
+VOID KeGenericCallDpc(_In_ PKDEFERRED_ROUTINE Routine,
+	_In_opt_ PVOID Context);
+VOID KeSignalCallDpcDone(_In_ PVOID SystemArgument1);
+LOGICAL KeSignalCallDpcSynchronize(_In_ PVOID SystemArgument2);
+
+static VOID HookSyncDpc(struct _KDPC* Dpc, PVOID DeferredContext,
+	PVOID SystemArgument1, PVOID SystemArgument2)
+{
+	UNREFERENCED_PARAMETER(Dpc);
+	UNREFERENCED_PARAMETER(DeferredContext);
+	ULONG cpu = KeGetCurrentProcessorNumber();
+	if (cpu < 64 && g_svmVcpu[cpu].base.bInGuest)
+	{
+		(VOID)CmVmmCall(GNPT_VMCALL_NPTSYNC, 0, 0, 0);
+	}
+	else
+	{
+		FlRingPush('j', cpu, GNPT_VMCALL_NPTSYNC, 0, 0, 0);
+	}
+	if (SystemArgument1)
+	{
+		KeSignalCallDpcDone(SystemArgument1);
+	}
+	if (SystemArgument2)
+	{
+		KeSignalCallDpcSynchronize(SystemArgument2);
+	}
+}
+
 static VOID HookSyncAllCpus(VOID)
 {
-	(VOID)KeIpiGenericCall(HookSyncIpi, 0);
+	if (g_gnptParkedMask != 0)
+	{
+		(VOID)KeIpiGenericCall(HookSyncIpi, 0);    //park态: IPI可被停泊核服务
+		return;
+	}
+	KeGenericCallDpc(HookSyncDpc, NULL);
 }
 
 //安装期热探测拒绝(guest/PASSIVE): 三树恒等还原(root原语)+Removed
@@ -1021,6 +1106,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
+	HookStagePaced(HKST_INS_ENTRY);
 	if (Hook->StackArgs > GNPT_MAX_STACK_ARGS)
 	{
 		FlLog("[Hook] Install拒绝: StackArgs=%u超上限%u(目标%p)",
@@ -1055,6 +1141,28 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	{
 		FlLog("[Hook] Install拒绝: 目标%p偏移%u+14跨页", Hook->Target, off);
 		return STATUS_UNSUCCESSFUL;
+	}
+	//混装互斥纪律: TRANSPARENT与常规两模式的驻留视图体系不同
+	//(TRANSPARENT潜伏P/HIDE/EXEC vs 常规HOOKS)——并存时一方的
+	//驻留视图下另一方恒等直通=按核静默失效(互偷)。互斥=fail-loud
+	//拒绝, 全部Remove后再装另一模式
+	{
+		BOOLEAN newT = (Hook->Flags & HOOK_TRANSPARENT) != 0;
+		for (ULONG i = 0; i < GNPT_MAX_HOOKS; i++)
+		{
+			if (g_hooks[i].Used && !g_hooks[i].Removed)
+			{
+				BOOLEAN liveT =
+					(g_hooks[i].pub.Flags & HOOK_TRANSPARENT) != 0;
+				if (liveT != newT)
+				{
+					FlLog("[Hook] Install拒绝: 目标%p混装(驻留%s模式hook互斥——"
+						"并存=互偷静默失效; 先全部Remove)",
+						Hook->Target, liveT ? "TRANSPARENT" : "普通");
+					return STATUS_NOT_SUPPORTED;
+				}
+			}
+		}
 	}
 	//条目分配+重复安装检查
 	PGNPT_ENTRY e = NULL;
@@ -1102,9 +1210,19 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 		e->Used = 0;
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
-	//CodePage: 目标页整页副本+目标偏移14B绝对跳转→槽
-	e->CodePageVa = (PUCHAR)ExAllocatePoolWithTag(
-		NonPagedPool, PAGE_SIZE, HOOK_POOL_TAG);
+	//CodePage: 目标页整页副本+目标偏移14B绝对跳转→槽。
+	//Mm连续分配钳NPT覆盖界内——身份PTE改译(工件隐蔽)的前提;
+	//常规池在大物理机可落覆盖界外=改译必然失败, 不如分配时即钳
+	PHYSICAL_ADDRESS cpLow, cpCeil, cpBound;
+	cpLow.QuadPart = 0;
+	cpCeil.QuadPart = (LONGLONG)SvmNptCoverageBytes();
+	cpBound.QuadPart = 0;
+	if (cpCeil.QuadPart == 0)
+	{
+		cpCeil.QuadPart = 0x7FFFFFFFFF;    //树未建(安装gate已拦, 防御)
+	}
+	e->CodePageVa = (PUCHAR)MmAllocateContiguousMemorySpecifyCache(
+		PAGE_SIZE, cpLow, cpCeil, cpBound, MmCached);
 	if (e->CodePageVa == NULL)
 	{
 		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
@@ -1121,17 +1239,38 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	e->TargetPa = MmGetPhysicalAddress(
 		(PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1))).QuadPart;
+	//目标物理覆盖预检: 超NPT覆盖(PML4[0]界)=布防PTE无处落, 静默
+	//缺防=永不触发的死hook——fail-loud拒绝
+	if (e->TargetPa >= SvmNptCoverageBytes())
+	{
+		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+		MmFreeContiguousMemory(e->CodePageVa);
+		e->Used = 0;
+		FlLog("[Hook] Install拒绝: 目标%p物理%llX超NPT覆盖%llX",
+			Hook->Target, (unsigned long long)e->TargetPa,
+			(unsigned long long)SvmNptCoverageBytes());
+		return STATUS_NOT_SUPPORTED;
+	}
+	HookStagePaced(HKST_INS_CPALLOC);
 	//root原语前置: 钉到虚拟化核集(SMT隔离下裸机兄弟核
 	//vmmcall=#UD→0x7E); 完事还原亲和
 	KAFFINITY oldAff = SvmPinVirtualizedCpus();
 	if (oldAff == 0)
 	{
-		ExFreePoolWithTag(e->CodePageVa, HOOK_POOL_TAG);
+		MmFreeContiguousMemory(e->CodePageVa);
 		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
 		e->Used = 0;
 		FlLog("[Hook] Install失败: 引擎未起(无虚拟化核)");
 		return STATUS_NOT_SUPPORTED;
 	}
+	HookStagePaced(HKST_INS_PIN);
+	//发布先行: live++置于首个树写之前。引擎不变量"树内NX/P=0⇒
+	//live>0"——live==0时P态取指fault走零进展分支(冲净不切视图
+	//不推RIP), 布防后热页fault即核级陷阱(热Ke*页千次/秒, 窗口
+	//毫秒级必中); 发布后窗口内一切fault走正常舞步(有进展)。
+	//失败回滚/热拒路径以Removed CAS对称递减
+	InterlockedIncrement(&g_hookLive);
+	HookStagePaced(HKST_INS_LIVE);
 	//多视图PTE布防(静态一次写死, 运行时零PTE写; root原语=隐蔽生效):
 	//  P: 原页可读可写不可执行(取指NPF→进detour视图)
 	//  常规hook   → HOOKS树=CodePage只读可执行(写NPF→回P转发)
@@ -1150,9 +1289,63 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	HookNptSetPteRoot(GNPT_VIEW_PRIMARY, e->TargetPa, e->TargetPa,
 		NPT_PTE_FLAGS_HOOKP);
-	//全核TLB同步=布防即刻生效
-	HookSyncAllCpus();
-	InterlockedIncrement(&g_hookLive);    //先发布(live>0=引擎处置脱落)
+	HookStagePaced(HKST_INS_ARMED);
+	//CodePage工件隐蔽(root原语, 挂靠自我隐蔽登记表): 身份PTE四视图
+	//改译零页+登记游标排水(布防拆分新增的页表页一并隐蔽)。自我隐蔽
+	//未启用(鉴别形态/构建失败继续形态)时跳过——无零页即无工件隐蔽,
+	//仅布防同步。失败或自证FAIL=统一回滚: 布防还原+解除登记(幂等)
+	//+释放, 无半隐蔽态
+	if (SvmNptHideZeroPa() != 0)
+	{
+		BOOLEAN ok = (CmVmmCall(GNPT_VMCALL_CONCEAL, e->CodePagePa, 0, 0)
+			!= 0);
+		HookStagePaced(HKST_INS_CONCEAL);
+		if (ok)
+		{
+			//全核TLB同步=布防+隐蔽一次覆盖, 而后guest态读自证
+			HookSyncAllCpus();
+			HookStagePaced(HKST_INS_SYNC1);
+			ok = (*(volatile ULONG64*)(e->CodePageVa + off) == 0);
+			HookStagePaced(HKST_INS_SELFCHK);
+			if (ok)
+			{
+				FlLog("[Hook] CodePage隐蔽自证: 读=0(零页翻译, 工件物理不可见)");
+			}
+		}
+		if (!ok)
+		{
+			HookStage(HKST_FAIL);
+			HookNptRestoreRoot(GNPT_VIEW_PRIMARY, e->TargetPa);
+			if (Hook->Flags & HOOK_TRANSPARENT)
+			{
+				HookNptRestoreRoot(GNPT_VIEW_HIDE, e->TargetPa);
+				HookNptRestoreRoot(GNPT_VIEW_EXEC, e->TargetPa);
+			}
+			else
+			{
+				HookNptRestoreRoot(GNPT_VIEW_SECONDARY, e->TargetPa);
+			}
+			//对称回滚发布(发布先行): CAS防与脱落路径双重递减
+			if (InterlockedCompareExchange(&e->Removed, 1, 0) == 0)
+			{
+				InterlockedDecrement(&g_hookLive);
+			}
+			//解除登记(未登记时NPTRES/表移除均幂等无害)+清翻译
+			HookNptRestoreRoot(0xF, e->CodePagePa);
+			SvmNptConcealRemove(e->CodePagePa);
+			HookSyncAllCpus();
+			MmFreeContiguousMemory(e->CodePageVa);
+			ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+			e->Used = 0;
+			FlLog("[Hook] Install失败: CodePage隐蔽登记/自证FAIL('c'环留痕)");
+			KeSetSystemAffinityThread(oldAff);
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+	}
+	else
+	{
+		HookSyncAllCpus();    //布防即刻生效(无隐蔽面形态)
+	}
 	if (Hook->Flags & HOOK_TRANSPARENT)
 	{
 		//安装期热探测: 页冷是TRANSPARENT唯一可行性前提, 而"冷"是
@@ -1168,6 +1361,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 			KeSetSystemAffinityThread(oldAff);
 			return STATUS_UNSUCCESSFUL;
 		}
+		HookStagePaced(HKST_INS_PROBE);
 		FlLog("[Hook] 热探测通过: %lld次NPF/250ms(页冷实测确认)", heat);
 	}
 	FlLog("[Hook] Install OK: 目标=%p 回调=%p 跳板槽=%p 重定位跳板=%p(%uB) CodePage=%p(PA=%llX) 栈参=%u",
@@ -1192,11 +1386,8 @@ NTSTATUS GnptHookRemove(PVOID Target)
 		{
 			continue;
 		}
-		//①还原CodePage被覆盖字节(源=原页, 原页从未被改)——
-		//  尚持旧TLB翻译的核此刻也只见原始字节=hook死透
-		ULONG off = (ULONG)((ULONG_PTR)Target & (PAGE_SIZE - 1));
-		RtlCopyMemory(e->CodePageVa + off, (PUCHAR)Target, e->ReplayLen);
-		//②布防树PTE恒等还原(root原语, 按条目模式: 不触碰未布防树
+		HookStage(HKST_RM_ENTRY);
+		//①布防树PTE恒等还原(root原语, 按条目模式: 不触碰未布防树
 		//=不烧无关树的拆分区配额)
 		HookNptRestoreRoot(GNPT_VIEW_PRIMARY, e->TargetPa);
 		if (e->pub.Flags & HOOK_TRANSPARENT)
@@ -1208,12 +1399,61 @@ NTSTATUS GnptHookRemove(PVOID Target)
 		{
 			HookNptRestoreRoot(GNPT_VIEW_SECONDARY, e->TargetPa);
 		}
-		//③全核TLB同步(残留CodePage翻译被冲净)
+		HookStage(HKST_RM_ARMED);
+		//②全核TLB同步: 冲净TargetPa→CodePage翻译——此后无核可取指
+		//于CodePage(在途回调已过跳转码, 自槽/重定位跳板运行, 不取指
+		//于此), ③的整块改写无跨核撕裂窗口
 		HookSyncAllCpus();
+		HookStage(HKST_RM_SYNC1);
+		//③还原CodePage被覆盖字节(root拷贝原语: 隐蔽生效后guest态
+		//直写该页=写fault, 必经exit handler代写)。源=原页(从未被改);
+		//长度钳页尾(重定位覆盖长可跨页界, 越界=池损坏)
+		ULONG off = (ULONG)((ULONG_PTR)Target & (PAGE_SIZE - 1));
+		ULONG len = e->ReplayLen;
+		if (len > PAGE_SIZE - off)
+		{
+			len = PAGE_SIZE - off;    //补丁14B必在页内, 钳位不伤补丁区
+		}
+		BOOLEAN cpOk = (CmVmmCall(GNPT_VMCALL_MEMCPY,
+			(ULONG64)(e->CodePageVa + off), (ULONG64)(ULONG_PTR)Target,
+			len) != 0);
+		HookStage(HKST_RM_MCPY);
+		//④解除CodePage隐蔽(释放前必做——PFN此后可归池复用, 残留
+		//零页翻译落新拥有者=读零损坏): 四树恒等+登记表移除。
+		//拷贝被拒(仅理论: len∈(0,4KB]恒成立)时保持隐蔽=补丁字节
+		//不外泄; PFN归池前树已释放(卸载契约), 无复用风险
+		BOOLEAN revealed = FALSE;
+		if (cpOk)
+		{
+			if (SvmNptHideZeroPa() != 0)
+			{
+				HookNptRestoreRoot(0xF, e->CodePagePa);
+				SvmNptConcealRemove(e->CodePagePa);
+			}
+			revealed = TRUE;    //无隐蔽面形态: 本无登记, 直接视为已解除
+		}
+		else
+		{
+			FlLog("[Hook] Remove异常: CodePage字节还原被拒('M'环留痕), 保持隐蔽");
+		}
+		HookStage(HKST_RM_REVEAL);
+		//⑤全核TLB同步: 冲净CodePage零页翻译
+		HookSyncAllCpus();
+		HookStage(HKST_RM_SYNC2);
+		//⑥解除自证: 恒等恢复后guest态读=原页真实字节
+		{
+			ULONG64 s = *(volatile ULONG64*)(e->CodePageVa + off);
+			FlLog("[Hook] CodePage解除自证: 读=%llX(%s)",
+				(unsigned long long)s,
+				(revealed && s != 0) ? "非零=还原已生效" :
+				revealed ? "零=解除未生效/还原异常(复检'c'环与'M'环)" :
+				"零=隐蔽保持(拷贝被拒路径)");
+		}
 		e->Removed = 1;
 		InterlockedDecrement(&g_hookLive);
-		FlLog("[Hook] Remove OK: 目标=%p 还原%uB+双视图PTE恒等+全核TLB同步(在途回调安全完成)",
-			Target, e->ReplayLen);
+		HookStage(HKST_RM_DONE);
+		FlLog("[Hook] Remove OK: 目标=%p 布防恒等+root还原%uB+%s+全核TLB同步(在途回调安全完成)",
+			Target, len, revealed ? "解除工件隐蔽" : "工件隐蔽保持");
 		KeSetSystemAffinityThread(oldAff);
 		return STATUS_SUCCESS;
 	}
@@ -1242,8 +1482,49 @@ VOID GnptHookRemoveAll(VOID)
 	}
 }
 
+//枚举live hook(语义与MSR侧一致): Buffer=NULL→*InOutCount=数量;
+//容量不足→STATUS_BUFFER_TOO_SMALL并回填所需数量。条目只拷公开
+//字段(Removed/内部指针不出)
+NTSTATUS GnptHookEnumerate(GNPT_HOOK* Buffer, ULONG* InOutCount)
+{
+	if (InOutCount == NULL)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	ULONG cnt = 0;
+	for (ULONG i = 0; i < GNPT_MAX_HOOKS; i++)
+	{
+		if (g_hooks[i].Used && !g_hooks[i].Removed)
+		{
+			cnt++;
+		}
+	}
+	if (Buffer == NULL)
+	{
+		*InOutCount = cnt;
+		return STATUS_SUCCESS;
+	}
+	if (cnt > *InOutCount)
+	{
+		*InOutCount = cnt;
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+	ULONG n = 0;
+	for (ULONG i = 0; i < GNPT_MAX_HOOKS; i++)
+	{
+		if (g_hooks[i].Used && !g_hooks[i].Removed)
+		{
+			Buffer[n++] = g_hooks[i].pub;
+		}
+	}
+	*InOutCount = cnt;
+	return STATUS_SUCCESS;
+}
+
 //DriverUnload在关引擎**之后**调用(纯内存释放, 无引擎依赖):
-//清零后释放(CodePage跳转码/条目指针不残留给PFN新拥有者)
+//清零后释放(CodePage跳转码/条目指针不残留给PFN新拥有者)。
+//隐蔽生命周期: live条目在Remove已解除; 脱落/拒绝条目保持隐蔽到
+//此处——关引擎后NPT已释放, PFN归池时零页翻译不存在, 无复用风险
 VOID GnptHookFreeMemory(VOID)
 {
 	ULONG entries = 0, replays = 0, codepages = 0;
@@ -1263,7 +1544,7 @@ VOID GnptHookFreeMemory(VOID)
 		if (e->CodePageVa != NULL)
 		{
 			RtlZeroMemory(e->CodePageVa, PAGE_SIZE);
-			ExFreePoolWithTag(e->CodePageVa, HOOK_POOL_TAG);
+			MmFreeContiguousMemory(e->CodePageVa);
 			codepages++;
 		}
 		RtlZeroMemory(e, sizeof(GNPT_ENTRY));

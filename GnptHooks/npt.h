@@ -100,6 +100,21 @@ BOOLEAN SvmNptConcealFaultFix(ULONG64 Gpa);
 //只读查PTE(不拆分; 'O'兜底判定用): 返回视图内gpa的4KB条目
 //现值(未拆分区返回2MB大页条目值; 非法gpa返回0)
 ULONG64 SvmNptPeekPte(ULONG View, ULONG64 Gpa);
+//==== 运行期工件隐蔽(Install冷路径, 须root上下文=vmcall进) ====
+//登记一页gpa并入既有隐蔽体系: 身份PTE四视图改译零页+登记表
+//挂靠。含级联收尾——改译拆分副产物页表页(运行期树修改新增的
+//arena槽页)一并登记改译(登记游标排水), 迭代到不动点。
+//全有全无: 资源不足(登记表满/页表页数组满/arena块边界/超512GB
+//覆盖/级联超轮)→FALSE且零PTE改译(拆分残留无害, 游标自愈);
+//成功→TRUE。幂等(重复登记=仅排水, 无副作用)
+BOOLEAN SvmNptConcealPageRuntime(ULONG64 Pa);
+//登记表移除一页(交换末尾; 纯.data操作, 任意上下文)。PTE侧
+//还原走既有NPTRES(0xF); 'O'兜底按PTE现值判定, 不依赖此表
+VOID SvmNptConcealRemove(ULONG64 Pa);
+//root上下文标记(exit handler进出成对调用): 置位期间
+//SvmNptAllocPage拒绝触发新arena块分配(Mm连续分配非IF=0/任意
+//IRQL安全), 块边界=返回NULL由调用方fail-loud; 槽切取不受限
+VOID SvmNptRootCtxMark(BOOLEAN InRoot);
 
 #ifdef __cplusplus
 }

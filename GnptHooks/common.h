@@ -80,11 +80,14 @@ extern volatile LONG g_gnptParkedMask;
 #define GNPT_VMMCALL_SIG1 0x3A7C5E1F9B2D8467ULL
 
 //内部vmmcall功能码(后续功能预留, 当前未接线):
-//  8 =MSR权限图原语  10=TSC校准探针(空handler)
-//  11=时钟布防  12=CodePage隐蔽/恢复  13=私有Host CR3 protect
+//  10=TSC校准探针(空handler)  11=时钟布防  13=私有Host CR3 protect
 
 //当前虚拟化目标核(-1=未启动), 启动循环置位, 日志心跳读它
 extern volatile LONG g_gnptVcpuCpu;
+
+//hook安装/移除当前阶段号(hook.c维护; 阶段表见hook.c)——HB心跳行
+//st=字段读它: 冻结吞掉环尾时, 存活的任一心跳行仍能定位冻结阶段
+extern volatile LONG g_gnptHookStage;
 
 //===== 文件日志 =====
 //DriverEntry/DriverUnload路径零文件I/O(加载窗口期过滤驱动可能死锁):
@@ -140,6 +143,12 @@ typedef struct _GNPT_RING_ENTRY
 //    首条+每4096条——预期个位数=探测器/自触发)
 //  G=#GP拦截处置采样(rsn=0x4D, a=RIP, b=1族字节命中转注入#UD/
 //    0忠实回注; 首条+每4096条)
+//  c=运行期工件隐蔽登记(rsn=功能码, a=pa, b=0拒绝/1成功, c=登记
+//    总数; Install冷路径)
+//  M=root拷贝原语(rsn=功能码, a=dst, b=src, c=len; Remove冷路径)
+//  J=安装/移除阶段面包屑(cpu=阶段号, rsn=阶段号; 表见hook.c——
+//    冻结吞环尾时HB行st=字段仍能指示最后阶段)
+//  j=全核同步DPC跳过(rsn=NPTSYNC; 非in-guest核留痕)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -226,14 +235,27 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9af"
+#define GNPT_BUILD_TAG "v0.9ar"
 //变体开关=开发期单变量鉴别脚手架(正式版恒0=全功能; 各变体仅控制
 //对应的演示面门, 引擎本体不变; 历史实验语义见开发文档, 不入代码):
 //0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR 6=隐蔽+hook
 //7=hook+MSR 8=机制轮 9=+CPUID拦截 10=+CPUID拦截且绕TSC壳 11=已移除
-#define GNPT_M92_VARIANT 0
+#define GNPT_M92_VARIANT 1
 //哨兵v2运行时开关(默认开; 0=关——纯引擎最小观测面场景)
 #define GNPT_DPC_SENTINEL 1
+//接管核数旋钮(诊断剂量轮脚手架, 正式版恒64=全核):
+//0=零接管对照(NPT+心跳+哨兵全套在位但零VMRUN) 1..63=只接管前N核
+//部分接管仅限纯引擎变体(svm.c设#error门): 全功能下hook布防/
+//root原语落裸核=蓝屏; 纯引擎下探针/故事面在裸核与接管核逐位一致
+#define GNPT_TAKE_CORES 64
+//故事面读者陷阱(诊断轮): 1=guest写EFER.SVME=1(运行时无人合法做=
+//SVM启动尝试)时武装该核——EFER读改回显值/VM_CR读改回真值, 读者
+//协议可推进(其VMRUN必经0x80拦截=全程可见); 探针写回恒SVME=0不误触
+#define GNPT_STORY_TRAP 1
+//SMI拦截轮(诊断→修复候选): 1=置INTERCEPT_SMI+0x62处置(STGI手册
+//协议: SMI从root进SMM, 绕开guest态SMM/RSM=无痕复位轴)。
+//HWCR.SMMLOCK(bit0)=1时硬件忽略拦截(启动横幅读报go/no-go)
+#define GNPT_SMI_INTERCEPT 1
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 
 #ifdef __cplusplus

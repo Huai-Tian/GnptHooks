@@ -33,6 +33,21 @@ static volatile LONG64 g_demoTCall[DEMO_T_MAX]; //每hook独立计数槽(Context
 static BOOLEAN g_demoTFree[DEMO_T_MAX];         //触发返回值须ExFreePool收尾(逐候选契约)
 static PVOID g_demoN = NULL;                    //阶段B普通模式目标
 static volatile LONG64 g_demoNCall = 0;
+static volatile LONG64 g_demoColdCall = 0;     //冷靶计数槽
+
+//冷靶(驱动本地): 普通模式hook对照目标——与热Ke*目标同构走
+//CodePage全链, 但页冷无自然流量=单变量隔离"热页"因素。
+//纯寄存器ALU链≥14B且无RIP-rel无相对分支=重定位安全门必过
+static ULONG64 DemoColdTargetFn(ULONG64 a1, ULONG64 a2, ULONG64 a3,
+	ULONG64 a4)
+{
+	ULONG64 r = a1;
+	r ^= a2;
+	r += a3;
+	r -= a4;
+	r ^= 0x5A5A5A5A5A5A5A5AULL;
+	return r;
+}
 
 //demo回调(detour语义, 返回值=新函数返回值)。
 //回调运行在任意线程/任意IRQL(含DISPATCH级): 只做IRQL安全操作,
@@ -226,6 +241,23 @@ static BOOLEAN DemoStoryTryInstr(const char* name, VOID(*fn)(VOID))
 	}
 }
 
+//返回TRUE=确认无异常(直通断言); FALSE=异常(直通配置失效, 已留痕)
+static BOOLEAN DemoStoryTryPass(const char* name, VOID(*fn)(VOID))
+{
+	ULONG code = 0;
+	__try
+	{
+		fn();
+		FlLog("[S1] %s: 直通无异常(裸机等价: 特性在场, 硬件静默执行)", name);
+		return TRUE;
+	}
+	__except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		FlLog("[S1] %s: 异常码%X(**直通失效**——在场配置不应异常, 查拦截位)", name, code);
+		return FALSE;
+	}
+}
+
 static VOID DemoStoryProbe(VOID)
 {
 	//①三MSR读: 探测器视角(全走MSRPM→exit→伪造/影子)
@@ -242,7 +274,8 @@ static VOID DemoStoryProbe(VOID)
 	FlLog("[S1] EFER回写: 前%llX 后%llX(应等值; 引擎存活见后续探针)",
 		(unsigned long long)efer, (unsigned long long)efer2);
 	//③SVM指令族8条×两形态(非规范PA走0x4D处置/规范PA走拦截0x80/0x82/
-	//0x83/VMMCALL走签名门/其余走0x7A/0x84-0x86; 全部#UD注入→SEH捕获)
+	//0x83/VMMCALL走签名门/其余走0x7A/0x84-0x86; #UD注入→SEH捕获;
+	//STGI例外=按SKINIT特性门控: 在场直通(断言=无异常)/缺席#UD)
 	g_storyValidPa = MmGetPhysicalAddress(g_storyVmcb).QuadPart;
 	DemoStoryTryInstr("VMRUN(非规范PA)", StoryProbeVmrunI);
 	DemoStoryTryInstr("VMSAVE(非规范PA)", StoryProbeVmsaveI);
@@ -258,11 +291,108 @@ static VOID DemoStoryProbe(VOID)
 		FlLog("[S1] VMLOAD(规范PA): 跳过(VMSAVE未#UD=拦截位疑失效, 规避载零毁态)");
 	}
 	DemoStoryTryInstr("VMMCALL(无签名)", StoryProbeVmmcall);
-	DemoStoryTryInstr("STGI", StoryProbeStgi);
+	if (g_svmStgiPass)
+	{
+		DemoStoryTryPass("STGI", StoryProbeStgi);
+	}
+	else
+	{
+		DemoStoryTryInstr("STGI", StoryProbeStgi);
+	}
 	DemoStoryTryInstr("CLGI", StoryProbeClgi);
 	DemoStoryTryInstr("SKINIT", StoryProbeSkinit);
 	DemoStoryTryInstr("INVLPGA", StoryProbeInvlpga);
 	FlLog("[S1] 故事面探针完成(判据①③; 停机S1计数+#GP手术总结另含本探针量)");
+}
+
+//0x6E0轴换算探针: 读原值→写未来值→读回(应≈写入)→立即恢复原值。
+//窗口<1ms且probe取未来值=不触发定时器; 原值0=无系统deadline在飞
+//(恢复写0=关闭, 等价)。仅在g_svmTscDlMode=1(拦截+换算在位)时执行;
+//缺席模式如实跳过(直通形态无换算可验)
+static VOID DemoTscDeadlineProbe(VOID)
+{
+	ULONG code = 0;
+	if (!g_svmTscDlMode)
+	{
+		FlLog("[S3] 0x6E0轴换算: 非TSC-deadline模式, 探针跳过(直通形态)");
+		return;
+	}
+	ULONG64 orig = 0;
+	__try
+	{
+		orig = __readmsr(MSR_IA32_TSC_DEADLINE);
+	}
+	__except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		FlLog("[S3] 0x6E0: 读异常%X=LAPIC未用TSC-deadline模式, 轴换算探针跳过",
+			code);
+		return;
+	}
+	ULONG64 probe = orig;
+	ULONG64 now = __rdtsc();
+	if (probe < now)
+	{
+		probe = now;    //原值0/已过时: 垫到当前(避免写后立即触发)
+	}
+	probe += 0x100000000ULL;    //未来值(约1-2s): 写读窗口内不触发
+	__try
+	{
+		__writemsr(MSR_IA32_TSC_DEADLINE, probe);
+		ULONG64 back = __readmsr(MSR_IA32_TSC_DEADLINE);
+		__writemsr(MSR_IA32_TSC_DEADLINE, orig);    //立即恢复(在飞deadline归位)
+		FlLog("[S3] 0x6E0轴换算: 原值%llX 写%llX 读回%llX 残差%lld"
+			"(读回≈写入=双向换算账平; 已恢复原值)",
+			(unsigned long long)orig, (unsigned long long)probe,
+			(unsigned long long)back, (LONGLONG)(back - probe));
+	}
+	__except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		FlLog("[S3] 0x6E0: 写读异常%X(模式异常, 已尝试恢复原值)", code);
+	}
+}
+
+//PMU旁信道自证探针: guest组使能PMC0(事件0x76 unhalted clocks)→
+//清零→循环100次EFER读(每次=1个exit+root故事处置路径)→采样→
+//恢复原配置(窗口<1ms)。PMC虚拟化(VMCB 0xB8 bit3)生效=世界切换
+//交换guest/host寄存器组→root驻留指令进host组=guest读数≈循环
+//自身(万级); 泄漏=计数含100次exit的root路径(数十万+)。判读:
+//万级=隔离生效; 十万级以上=root泄漏。PCMVIRT特性缺席的平台
+//0xB8 bit3不可置=PMC面无法硬件关闭(平台边界, guest启用计数
+//可观测root指令量)→如实跳过。AMD PMC: PERFEVNTSEL_0=0xC0010000
+//PERF_CTR_0=0xC0010004(EN=bit22)
+static VOID DemoPmuProbe(VOID)
+{
+	ULONG code = 0;
+	if ((g_svmFeatBits & SVM_FEAT_PMCVIRT) == 0)
+	{
+		FlLog("[S4] PMU自证: PCMVIRT特性缺席(0xB8仅LBR), PMC面=平台边界"
+			"(无硬件隔离), 探针跳过");
+		return;
+	}
+	__try
+	{
+		ULONG64 selOrig = __readmsr(0xC0010000);
+		ULONG64 ctrOrig = __readmsr(0xC0010004);
+		__writemsr(0xC0010000, 0x76ULL | (1ULL << 22));    //事件0x76+EN
+		__writemsr(0xC0010004, 0);                          //计数器清零
+		volatile ULONG64 sink = 0;
+		ULONG64 efer = 0;
+		for (int i = 0; i < 100; i++)      //100次exit+root处置, 泄漏面
+		{
+			efer = __readmsr(MSR_EFER);
+			sink += efer;
+		}
+		ULONG64 cnt = __readmsr(0xC0010004);
+		__writemsr(0xC0010000, selOrig);   //恢复(系统perf配置归位)
+		__writemsr(0xC0010004, ctrOrig);
+		FlLog("[S4] PMU自证: PMC0=%llu(100次EFER读+循环; 万级=guest组"
+			"隔离生效, 十万级+=root泄漏), sink=%llu 已恢复原配置",
+			(unsigned long long)cnt, (unsigned long long)sink);
+	}
+	__except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		FlLog("[S4] PMU自证: PMC访问异常%X(不可用形态), 跳过", code);
+	}
 }
 
 static KEVENT g_demoSeqDone;
@@ -371,7 +501,7 @@ static VOID DemoMultiHookThread(PVOID Context)
 		}
 	}
 #endif
-	//======== 阶段B: 16核互偷普查(普通模式×TRANSPARENT, 双向拓扑) ========
+	//======== 阶段B: 混装拒绝纪律+模式切换链(T驻留→拒绝→T全撤→N接管) ========
 	ULONG aIdx = (tLive >= 2) ? 1 : 0;    //仍活的T(移除后=T2; 单live=T1)
 #if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 3 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 7
 	if (tLive >= 1)
@@ -381,13 +511,12 @@ static VOID DemoMultiHookThread(PVOID Context)
 		g_demoN = MmGetSystemRoutineAddress(&nName);
 		if (g_demoN == NULL)
 		{
-			FlLog("[MultiHook] 阶段B: KeInitializeDpc解析失败, 混装本轮跳过");
+			FlLog("[MultiHook] 阶段B: KeInitializeDpc解析失败, 本轮跳过");
 		}
 		else if ((ULONG_PTR)PAGE_ALIGN(g_demoN) ==
 			(ULONG_PTR)PAGE_ALIGN(g_demoT[aIdx]))
 		{
-			FlLog("[MultiHook] 阶段B: KeInitializeDpc与T%u同页, 混装本轮跳过",
-				aIdx + 1);
+			FlLog("[MultiHook] 阶段B: KeInitializeDpc与活T同页, 本轮跳过");
 		}
 		else
 		{
@@ -396,38 +525,61 @@ static VOID DemoMultiHookThread(PVOID Context)
 			h.Callback = DemoCountCallback;
 			h.Context = &g_demoNCall;
 			h.Flags = 0;    //普通模式: Ke*普通内核函数(hook.h纪律5), 无热探针
+			//①混装拒绝格: T驻留期间N Install应被拒(两模式驻留视图
+			//互斥, 并存=互偷静默失效——fail-loud是唯一安全纪律)
 			NTSTATUS st = GnptHookInstall(&h);
-			FlLog("[MultiHook] 阶段B 混装: 普通模式hook KeInitializeDpc(%p): %s(Flags=0)",
-				g_demoN, NT_SUCCESS(st) ? "Install OK" : "FAIL(见[Reloc]/[Hook]行)");
+			FlLog("[MultiHook] 阶段B 混装拒绝格: T驻留时N Install→0x%X(%s)",
+				(ULONG)st, (st == STATUS_NOT_SUPPORTED) ?
+				"拒绝OK=纪律生效" : "异常(应拒绝, 见[Hook]行)");
+			//②撤除最后的活T(此前T1已在阶段A被选择性移除)
+			NTSTATUS rst = GnptHookRemove(g_demoT[aIdx]);
+			FlLog("[MultiHook] 阶段B 撤T: Remove %s→%s",
+				g_demoTName[aIdx], NT_SUCCESS(rst) ? "OK" : "FAIL");
+			//改钉未舞步核3(P驻留): 阶段A的T舞步把原驻核1/2留在
+			//HIDE/EXEC驻留态, N接管链若在其上执行则叠加"安装核
+			//非P驻留"变量; 钉3后布防→隐蔽→同步→触发全链单变量
+			KeSetSystemAffinityThread((KAFFINITY)1 << 3);
+			//③冷靶先行: 驱动本地冷页走普通模式+工件隐蔽全链(与热
+			//靶同构, 无热页自然流量)——绿则热靶再冻结=热页因素,
+			//冻则'J'面包屑+心跳st=定位阶段
+			GNPT_HOOK hc = { 0 };
+			hc.Target = DemoColdTargetFn;
+			hc.Callback = DemoCountCallback;
+			hc.Context = &g_demoColdCall;
+			st = GnptHookInstall(&hc);
+			FlLog("[MultiHook] 阶段B 冷靶接管(本地%u): %s(Flags=0)",
+				(ULONG)((ULONG_PTR)DemoColdTargetFn & 0xFFF),
+				NT_SUCCESS(st) ? "Install OK" : "FAIL(见[Hook]行)");
 			if (NT_SUCCESS(st))
 			{
-				//16核互偷普查: 每核先T后N各触发一次, 前后快照记Δ——
-				//(TΔ>0, NΔ=0)=该核P/HIDE驻留; (TΔ=0, NΔ>0)=该核HOOKS驻留;
-				//双向拓扑一次取齐, 不依赖预设驻留(自然流量会先占)。
-				//核间1s隔: 单次T触发≈百级exit, 16核连发会打满tstorm桶
-				//(1024/700ms)致普查中途脱落
-				ULONG cpuCount = KeQueryActiveProcessorCount(NULL);
-				if (cpuCount > 64)
-				{
-					cpuCount = 64;
-				}
-				FlLog("[MultiHook] 阶段B: %u核互偷普查开始(每核先T后N, 核间1s隔)",
-					cpuCount);
-				for (ULONG c = 0; c < cpuCount; c++)
-				{
-					KeSetSystemAffinityThread((KAFFINITY)1 << c);
-					LONG64 tBefore = g_demoTCall[aIdx];
-					LONG64 nBefore = g_demoNCall;
-					DemoFireT(aIdx);
-					DemoFireN();
-					FlLog("[MultiHook] 普查核%u: TΔ=%lld, NΔ=%lld (T总=%lld, N总=%lld)",
-						c,
-						g_demoTCall[aIdx] - tBefore, g_demoNCall - nBefore,
-						g_demoTCall[aIdx], g_demoNCall);
-					iv.QuadPart = -10000000LL;    //1s: 隔开防普查自身打满tstorm桶
-					KeDelayExecutionThread(KernelMode, FALSE, &iv);
-				}
-				FlLog("[MultiHook] 阶段B: 普查完成(逐核判读: T增且N不增=P/HIDE; T不增且N增=HOOKS)");
+				ULONG64 r = DemoColdTargetFn(0x1111111111111111ULL,
+					0x2222222222222222ULL, 0x3333333333333333ULL,
+					0x4444444444444444ULL);
+				FlLog("[MultiHook] 阶段B 冷靶触发: 返回=%llX 累计=%lld"
+					"(计数>0=普通模式全链路活)",
+					(unsigned long long)r, g_demoColdCall);
+			}
+			//④热靶接管: KeInitializeDpc(热Ke*页, 自然流量千次/秒级)
+			st = GnptHookInstall(&h);
+			FlLog("[MultiHook] 阶段B 热靶接管: KeInitializeDpc(%p): %s(Flags=0)",
+				g_demoN, NT_SUCCESS(st) ? "Install OK" : "FAIL(见[Hook]行)");
+			if (NT_SUCCESS(st))
+			{
+				DemoFireN();
+				FlLog("[MultiHook] 阶段B 热靶触发: 累计=%lld(>0=detour全链路活)",
+					g_demoNCall);
+			}
+			//⑤枚举契约: NULL探针取数+定容枚举(语义=MSR侧同款)
+			{
+				ULONG n = 0;
+				GnptHookEnumerate(NULL, &n);
+				GNPT_HOOK list[4];
+				ULONG cnt = RTL_NUMBER_OF(list);
+				NTSTATUS est = GnptHookEnumerate(list, &cnt);
+				FlLog("[MultiHook] 阶段B Enumerate: live=%u(容量%u) st=0x%X "
+					"回填%u 首条目Target=%p",
+					n, (ULONG)GNPT_MAX_HOOKS, (ULONG)est, cnt,
+					(cnt > 0) ? list[0].Target : NULL);
 			}
 		}
 	}
@@ -540,8 +692,29 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	//名称定位器——与EPT型框架契约一致)
 	//变体门: hook面=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7);
 	//序列线程沿用内层门语义, 线程恒启动
-	//故事面探针先行(全功能立即自证, 独立于demo hook轮序列)
-	DemoStoryProbe();
+	//故事面探针先行(全功能立即自证, 独立于demo hook轮序列)。
+	//仅虚拟化核安全: 拦截位是探针的防弹衣——裸核上STGI/SKINIT被
+	//硬件真实执行(APM三人组#UD条件带SVML/DEV豁免, SKINIT特性位
+	//在场时SVME=0不#UD), SKINIT=安全重初始化+跳转垃圾SLB=整机
+	//复位(C0轮实锤)。零接管轮跳过; 有接管核时钉核0防线程迁移
+	//落裸核
+	if (g_svmVcpuCount == 0)
+	{
+		FlLog("[S1] 零接管对照: 故事面探针跳过(裸核SKINIT被硬件真实执行=复位)");
+	}
+	else
+	{
+		//KeSetSystemAffinityThread返回void(WDK无旧值可存):
+		//恢复亲和=重建全活跃核掩码
+		ULONG cpuTotal = KeQueryActiveProcessorCount(NULL);
+		KAFFINITY allAff = (cpuTotal >= 64) ? ~(KAFFINITY)0
+			: (((KAFFINITY)1 << cpuTotal) - 1);
+		KeSetSystemAffinityThread((KAFFINITY)1);
+		DemoStoryProbe();
+		DemoTscDeadlineProbe();
+		DemoPmuProbe();
+		KeSetSystemAffinityThread(allAff);
+	}
 	DemoMultiHookStart();
 	//变体门: MSR面独立调用(全功能/裸MSR/隐蔽+MSR/hook+MSR/CPUID决策轮)
 #if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 4 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 7 || GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10
