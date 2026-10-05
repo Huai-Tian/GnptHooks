@@ -235,7 +235,7 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9az"
+#define GNPT_BUILD_TAG "v0.9bb"
 //变体开关=开发期单变量鉴别脚手架(正式版恒0=全功能; 各变体仅控制
 //对应的演示面门, 引擎本体不变; 历史实验语义见开发文档, 不入代码):
 //0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR 6=隐蔽+hook
@@ -247,10 +247,11 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 //0=零接管对照(NPT+心跳+哨兵全套在位但零VMRUN) 1..63=只接管前N核
 //部分接管仅限纯引擎变体(svm.c设#error门): 全功能下hook布防/
 //root原语落裸核=蓝屏; 纯引擎下探针/故事面在裸核与接管核逐位一致
-//剂量旋钮本值=2: 低剂量自愈判据轮——旧机C1/C2(1-2逻辑核)三轮全绿,
-//C4/C16必死; 新机衰减态下低剂量是否存活=本构建唯一问题。
-//全功能下部分接管有#error门(需VARIANT=1, 现值即1)
-#define GNPT_TAKE_CORES 2
+//剂量旋钮本值=64: 全核终验形态——冷启窗口期全核+CPUID伪装
+//完整性唯一验收场(伪装面=接管核集合的函数, 部分接管形态下
+//裸核直通真值=无全核一致性可言); 纯冒烟无负载, 全核与低剂量
+//构建唯一差异=接管集合扩展到全部逻辑核
+#define GNPT_TAKE_CORES 64
 //故事面读者陷阱(诊断轮): 1=guest写EFER.SVME=1(运行时无人合法做=
 //SVM启动尝试)时武装该核——EFER读改回显值/VM_CR读改回真值, 读者
 //协议可推进(其VMRUN必经0x80拦截=全程可见); 探针写回恒SVME=0不误触
@@ -260,7 +261,7 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 //无签名leaf归零; maxleaf真值不收敛)。CPUID exit短路于TSC壳的
 //快路径恒在位(高频风暴不进补偿壳)。转正门槛=accel Full+视频
 //叠加三因子同场双绿(DWM判据), 门槛不过不交付
-#define GNPT_CPUID_STEALTH 0
+#define GNPT_CPUID_STEALTH 1
 //SMI拦截轮(诊断→修复候选): 1=置INTERCEPT_SMI+0x62处置(STGI手册
 //协议: SMI从root进SMM, 绕开guest态SMM/RSM=无痕复位轴)。
 //HWCR.SMMLOCK(bit0)=1时硬件忽略拦截(启动横幅读报go/no-go)

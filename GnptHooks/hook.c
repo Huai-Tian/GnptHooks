@@ -1264,7 +1264,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 		return STATUS_NOT_SUPPORTED;
 	}
 	HookStagePaced(HKST_INS_PIN);
-	//发布先行: live++置于首个树写之前。引擎不变量"树内NX/P=0⇒
+	//发布先行: live++置于首个树写之前。引擎不变量"树内NX/P=0=>
 	//live>0"——live==0时P态取指fault走零进展分支(冲净不切视图
 	//不推RIP), 布防后热页fault即核级陷阱(热Ke*页千次/秒, 窗口
 	//毫秒级必中); 发布后窗口内一切fault走正常舞步(有进展)。

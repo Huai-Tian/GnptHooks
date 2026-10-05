@@ -1,4 +1,4 @@
-# README_AGENT.md — AI 协作者契约文档 (v0.9y 现状)
+# README_AGENT.md — AI 协作者契约文档 (v0.9bb 现状)
 
 > **本文档的读者是大语言模型 / 编码 Agent，不是人类。** 人类请阅读 [README.md](README.md) / [README_ZH.md](README_ZH.md)。
 >
@@ -54,7 +54,7 @@
 | bug = 蓝屏/冻结 | 没有用户态容错边界，一切以裸机正确性为准 |
 | 嵌套环境是开发形态 | VMware 嵌套 SVM 特性位失真；异常先物理机复现再定性（勿追鬼） |
 
-**当前版本 v0.9y = M9 毕业（物理机全里程碑收官）**：M0-M5 同前（嵌套毕业→物理机复验）；M6 TSC 时间轴补偿（水位+跨核钳制）+时钟域调查毕业（v0.8g）；M7 MSR hook 面（MSRPM 位图 API）毕业（v0.9b）；M8 NPT 自我隐蔽（改译零页，物理机 2,284 页）+ 稳定性长征毕业（页热防线/全核回退/SMT 证伪，v0.9w 封版）；**M9 三体竞态定罪并修复**（NPT 自我隐蔽×MSRPM 读拦截×直通 WRMSR = 0x101 系列死因；修复 = 写位拦截 root 忠实代写；加速套件 Full 双绿+C 轮历史首过，v0.9y 封版 ccaffb3）。**TSC per-VCPU 化、CPUID 观测回归决策未做**（M10 特性线），你也不要"顺手实现"。**MSR API 竞态纪律见 msr.h 使用纪律第 5 条——隐蔽在场时置读拦截的 MSR 禁止写直通，违例 = 已定罪的 0x101 三体竞态**。
+**当前版本 v0.9bb = M13 毕业（双物理平台收官）**：M0-M9 同前（引擎/双 NPT/单步/TRANSPARENT/TSC 补偿/MSR 面/自我隐蔽/三体竞态修复，v0.9y）；M10 CPUID 拦截裁决 + SSDT 终裁（425a2e8-5e1d2ae）；M11 自洽故事面 + 工件隐蔽 + API 收口 + 平台风险定案（v0.9ar, f50a881）+ 新平台双根因修复（v0.9au, ffd92b2）；**M12 第二平台杀手刻画**（剂量模型：全核 SVM 驻留消耗可恢复"额度"，静默复位/0x101 双外显，复位不清零、分钟-小时级恢复；C-state 与负载水平实验排除；vmload/vmsave 循环剥除 = CVE-2024-53114 预防性合规，v0.9az, eeadb66）；**M13 CPUID 伪装转正**（拦截位服务于隐蔽：Fn8000_0001 SVM 位清零/无签名 leaf 归零/maxleaf 真值；三步验证：低剂量冒烟+加速 Full 30min×2（两轮合计 1,015 次 exit 零异常）+全核 3003s 含任务管理器全核"虚拟化： 已禁用"一致性验收；GNPT_CPUID_STEALTH=1 为正式默认，v0.9ba）。**MSR API 竞态纪律见 msr.h 使用纪律第 5 条——隐蔽在场时置读拦截的 MSR 禁止写直通，违例 = 已定罪的 0x101 三体竞态**。
 
 ---
 
@@ -130,7 +130,7 @@
 | "每次视图切换 TlbControl=3 太粗暴, 应优化" | bring-up 形态正确性优先 | 嵌套实测 80 秒仅 2 次切换, flush 开销可忽略；ASID 免 flush 是物理机定案项（RL-16） |
 | "NPT 拆页后的 Splits 记录应该跟踪释放" | 交付语义：泄漏 PT 页换管理简单性（GeptHooks 同款裁决） | 有意为之，勿"修" |
 | "Secondary 视图该在回调返回后切回 Primary" | 视图是核级状态（RL-11）；数据访问在 Secondary 完全正常 | 常态**永驻** Secondary；仅写 fault 才切回（写随即落在真实页, 再切回） |
-| "CPUID 应该过滤隐藏" | 未实现特性（M5）；当前 = 全真值直透传 | 勿"顺手实现"半吊子隐身——失真即特征 |
+| "CPUID 应该过滤隐藏" | **已实现并转正（M13）**：拦截位服务于隐蔽（Fn8000_0001 SVM 位清零/无签名 leaf 归零/maxleaf 真值），GNPT_CPUID_STEALTH=1 为正式默认 | 伪装面=接管核集合的函数——部分接管下裸核回答真值，勿宣称部分形态的完整伪装；修改伪装三则须重过三步验证判据 |
 | "'i' 环事件是中断交付" | 'i' 已被 NPTSYNC 确认占用 | tag 表以 common.h 注释为权威（本文档 §8.2 同步） |
 | "SvmShutdownAllCpus 返回 void 够了" | park 拒绝时引擎仍在位, 卸载方不能释放 hook 内存 | BOOLEAN：TRUE=全核裸机可 FreeMemory |
 | "重定位跳板失败可以警告后继续安装" | 带病上机 = 不可调试时机的蓝屏 | FAIL → 拒绝安装（安全门语义） |
@@ -381,6 +381,8 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | 0x101 (CLOCK_WATCHDOG_TIMEOUT)，钉C0/深闲置数分钟内，DWM 崩溃循环、黑屏-恢复、无声冻结；历史上 30s~2h "随机"概率死 | **三体竞态（M9.6 定罪）**：NPT 自我隐蔽（改译页表页）× MSRPM 读拦截（LSTAR 读 exit）× 直通 WRMSR 的硬件级竞态——三者齐备时挂核，无任何一行代码"错" | 写位拦截（OnWrite=root 忠实代写，msr.h 使用纪律第 5 条）：x5_v2 直通死 107s vs x8 双拦绿 15min+，单变量翻转；修复后加速 Full 双绿、C 轮历史首过（v0.9y）。**鉴别方法论**：IDLEDISABLE(钉C0)=确定性死亡复现器；单因子/双因子/组合变体矩阵定位共因子；勿再用"改代码等死"的玄学排查 |
 | 安装期/运行初期 tstorm：NPF 计数 4 位数暴涨（1,024–2,600 NPF/250ms），伴随 [F] 脱落行 | hook 目标页"热"（同步原语页或高频页）——页级单步成本不可承受 | 安装期热探测门拒绝（换候选）+ 运行期 tstorm 脱落（留 [F] 审计行）；候选禁类：wait 家族同页目标（M8 判例，3/3 DWM 事故相关） |
 | vmmcall 在 guest 内执行 = #UD；#DB 在非拦截核逃逸 | SMT 部分虚拟化的固有缺陷：兄弟核未虚拟化 → 指令语义不一致 | **全核接管是硬约束**（M8 两轮实测证伪 SMT 隔离方案）；root 原语钉核 API 保留但 guest 侧永远全核 |
+| **0x139 (KERNEL_SECURITY_CHECK_FAILURE) Arg1=4=FAST_FAIL_INCORRECT_STACK**，帧链=nt!KiGeneralProtectionFault←驱动 exit 处置内（含 asm 世界开关帧），故障线程=System | **root 处置内物理 #GP（M11.30 定罪）**：处置代码访问了模式依赖 MSR（0x6E0）而本机 LAPIC 未处 TSC-deadline 模式 → 硬件 #GP 在 GIF=0 上下文 raise，无 SEH 防护且 SEH 链跨世界错位 → 异常分发栈检查 fail-fast | **root 处置 MSR 安全门**：任何模式依赖 MSR 必须先在裸机 PASSIVE 上下文（启动期，SEH 可用）探测；探测失败=不置拦截位（guest 直通 #GP 走原生路径=裸机等价）。0x6E0 已按此门控（g_svmTscDlMode，启动横幅如实报告） |
+| 静默复位（无蓝屏/dump、Kernel-Power 41 BugcheckCode=0、无 WHEA、日志戛然而止，死亡时 exit 账目冻结） | **sub-SMM 平台杀手（M11.27/28 定案）**：全核 guest 停泊时 SMM 之下的外部事件（SMU/EC 类）直接复位整机；驱动缺席也死（复位循环）；SMMLOCK=1 封死 SMI 拦截观测 | **已知边界勿当 bug 修**：操作规程=凉机+晚载+默认电源+短突发+死后即停；秒卸载（`[Entry] 完成` 立即 sc stop）实测可行；README"平台边界"章节已文档化；该机已于 2026-10-01 退货（M11.33），Zen5 新平台第二数据点待测 |
 
 ---
 
@@ -391,9 +393,9 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | NPF=0 判据 | **物理机已定案** | 嵌套 26081 次零增长；物理机 4.6M+ 触发 NPF 钉每核一例（M8） |
 | ASID 免 flush 切换 | 物理机定案项 | bring-up 恒 TlbControl=3；嵌套下切换频率 2 次/80s 无评估价值 |
 | 方案 B 临时 RW 跨核窗口 | 已知臂（M4） | SvmNptSetPte 操作全局共享 Secondary 树——单步窗口内其它核对同页读不 fault（读 CodePage 字节，非崩溃）；窗口=1 指令，概率≈0 |
-| 无 Enumerate API | 未实现 | GeptHooks 有, 本项目按需后补 |
-| CPUID 观测面 | **移除中（caveat 在案）** | v0.9n 移除；原"5/5 定罪"数据采于 IDLEDISABLE 污染区（M8.28 附注），移除理由现按隐蔽性论据（更少 exit=更小时序足迹）；M10 可清洁重测决策 |
-| TSC per-VCPU offset | M10 待做 | 现为全局水位+跨核钳制；kov.dev 静态 per-VCPU 形态为参考 |
+| 无 Enumerate API | ~~未实现~~ **已实现** | hook/msr 双 Enumerate + 容量池化（M11 S2 收口） |
+| CPUID 拦截位 | **伪装面在位（M13 转正）** | INTERCEPT_CPUID 服务于伪装三则（SVM 位清零/无签名 leaf 归零/maxleaf 真值）；exit 短路于 TSC 补偿壳的快路径为正式遗产；修改伪装行为须重过三步验证（低剂量冒烟+加速 Full+全核一致性） |
+| TSC per-VCPU offset | M10 已审计关闭 | 全局水位+跨核钳制为定案形态（M10.1 防回归锚） |
 | PG 长浸泡 | **已过** | v0.7d 265s + 物理机多轮全功能（30min×4+）无 0x109；隐蔽面经 PG 检验（M8） |
 | 三体竞态真因（微架构层） | 残留学术项 | 工程已闭环（写拦截修复）；直通 WRMSR×读 exit×改译页的精确硬件交互需 dump/AMD 确认 |
 | 嵌套环境 #DB 投递失真 | 已知项 | TF 陷阱以 DR6.BS=0 投递；int 2E 窗口的 #DB 以"TF 已失"形态到达（走 'L' 收口而非 'I' 路径）——物理机应走 'I'；防线 2 已兜底验证 |
@@ -402,6 +404,12 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | 回调线程迁移 | 理论臂 | 每核 g_curHook 上下文, 嵌套实测未出现 'w' 留痕 |
 | 哨兵 v2 阈值 | 可调（默认 6s/12s） | 预警/实锤两级；全机瞬时冻结（T1 也死）场景哨兵无法开火=已知边界，需 KDNET |
 | accel 门禁二跑假警报 | v4 已知缺陷 | 同 boot 二跑 WRONGVER 误报；数据有效；v5 修复 |
+| **sub-SMM 静默复位杀手（平台一：移动）** | **平台物理边界（M11.27/28 定案）** | 全核 guest 停泊时 SMM 之下外部事件复位整机（5800H+EOL 固件实测）；无蓝屏/无 WHEA/驱动缺席也死/复位循环间隔递减；SMMLOCK=1 封死观测；软件层不可修不可见，操作规程缓解（凉机+晚载+默认电源+短突发+秒卸载+死后即停）；README"平台边界"章节已文档化；实测机已退货（2026-10-01） |
+| **剂量敏感型平台杀手（平台二：AM5 桌面）** | **平台物理边界（M12 定案）** | 全核 SVM 驻留消耗可恢复"额度"：全核会话死亡（静默复位或 0x101 挂核=idle 核不响应 IPI，同一事件双外显）；复位不清零额度、恢复需分钟-小时级非驻留；低剂量（TAKE_CORES=2）健康实证；**实验排除**：C-state（钉 C0 无效）/负载水平（idle 死、14555 次 exit 存活）/特定应用/全部软件观测面（WHEA 零、'L'/'Y' 环零触发）；主导假说=固件自治看门狗（SMU/MP1 类，未证实，APM 无记载）；有效缓解=剂量控制+会话时长控制（干净卸载后重启=新会话）；日常开发用低剂量构建，全核留冷启窗口短促验证 |
+| **PMC/IBS virt 特性缺席** | 平台特性边界（M11.31） | Cezanne 无 PCMVIRT(bit8)/IBSVIRT(bit26) → 0xB8 仅 LBR virt=0x1；PMC 面（guest 计数器可观测 root 指令量）无硬件隔离可用；探针按特性门控如实跳过；换 PCMVIRT 在场平台自然闭合。跨代实证（M11.33）：Zen4(7840U)=IBS✅/PMC❌，Zen5(9955HX)=全✅；9600X 已到货验收（启动横幅 `0xB8 virt=` 直读；位缺席先查 BIOS 更新再定性，固件屏蔽先例：7840U AVIC 被 BIOS 屏蔽） |
+| **0x6E0 轴换算的 deadline 路径** | 代码在位待实测（M11.30） | 本机 LAPIC=legacy 模式 → 门控直通形态已验证（横幅+探针如实跳过）；TSC-deadline 模式平台的换算残差实测=换机后顺带 |
+| **STGI 直通门控** | 已实现已验证（M11.29/31） | SKINIT 特性在场=不拦截（裸机静默执行忠实，r84=0）；缺席=拦截+#UD；CLGI/SKINIT 维持拦截 |
+| 睡眠唤醒检测 | 代码在位（M11.29） | T1 biased/unbiased 差值>10s → [S3] 诚实日志；不自动二次接管；待日常睡眠场景自然验证 |
 
 ---
 
