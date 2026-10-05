@@ -30,6 +30,8 @@ extern "C" {
 #define NPT_PTE_NX              (1ULL << 63)   //不可执行(需host EFER.NXE=1)
 #define NPT_PTE_FLAGS_LEAF2MB   (NPT_PTE_P | NPT_PTE_RW | NPT_PTE_US | \
                                  NPT_PTE_A | NPT_PTE_D | NPT_PTE_PS)
+#define NPT_PTE_FLAGS_LEAF1GB   (NPT_PTE_P | NPT_PTE_RW | NPT_PTE_US | \
+                                 NPT_PTE_A | NPT_PTE_D | NPT_PTE_PS)  //PDPT级1GB大页
 #define NPT_PTE_FLAGS_INTER     (NPT_PTE_P | NPT_PTE_RW | NPT_PTE_US)  //中间级
 //4KB恒等leaf(全开放): 可读可写可执行
 #define NPT_PTE_FLAGS_LEAF4K_RWX (NPT_PTE_P | NPT_PTE_RW | NPT_PTE_US | \

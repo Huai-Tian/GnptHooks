@@ -235,7 +235,7 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9ar"
+#define GNPT_BUILD_TAG "v0.9au"
 //变体开关=开发期单变量鉴别脚手架(正式版恒0=全功能; 各变体仅控制
 //对应的演示面门, 引擎本体不变; 历史实验语义见开发文档, 不入代码):
 //0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR 6=隐蔽+hook

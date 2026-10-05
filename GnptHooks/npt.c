@@ -6,14 +6,14 @@
 #define NPT_COVER_LIMIT     0x8000000000ULL //512GB覆盖上限(对齐资源分配界)
 //页表页数组容量: 4树×514 + 拆分PT页(自我隐蔽: 框架页聚簇后
 //~170个2MB区/树, 256拆分区上限覆盖+余量; 含arena块数上限)
-#define NPT_MAX_PAGES       (514 * GNPT_VIEW_COUNT + 1024 + 8)
+#define NPT_MAX_PAGES       (1025 * GNPT_VIEW_COUNT + 1024 + 8)
 #define NPT_MAX_SPLITS      256             //每树最大拆分区数(2MB区)
 
 //页表页arena(自我隐蔽级联对策: 散池分配每页几乎独占一个2MB帧,
 //隐蔽登记拆该帧=登记数级联放大): 页表页从2MB连续块切槽, 同帧
 //第二页起零新拆分, 级联坍缩——2056树页+~700拆分PT页聚在~10个
 //2MB帧内(vs散池~2000帧)。块数: (2056+1024+8)/512≈7块, 给8块
-#define NPT_ARENA_BLOCKS    8
+#define NPT_ARENA_BLOCKS    20
 #define NPT_ARENA_SLOTS     512             //2MB/PAGE_SIZE
 
 typedef struct _NPT_SPLIT
@@ -131,7 +131,13 @@ static PVOID SvmNptAllocPage(PULONG64 paOut)
 }
 
 //构建单棵恒等树(PML4[0]->PDPT单页->512个PD页, PD级2MB大页leaf)
-static BOOLEAN SvmNptBuildTree(PNPT_TREE Tree, ULONG64 Cover)
+//+全空间层: PML4[1..511]各链一页PDPT, PDPT级1GB大页恒等leaf——
+//平台高MMIO窗(核显aperture/PCIe高窗, 物理布局常驻512GB之上,
+//guest图形栈合法映射该区)在PML4[0]覆盖之外, 缺该层=访问即
+//不可恢复NPF风暴(fault不推RIP死循环=单核冻结)。1GB粒度恒等
+//即满足: 该区无hook目标(仅RAM区拆4KB); 超MAXPHYADDR的PML4项
+//不链(物理不存在的GPA留P=0, 翻译语义正确)
+static BOOLEAN SvmNptBuildTree(PNPT_TREE Tree, ULONG64 Cover, ULONG64 MaxPhy)
 {
 	ULONG64 pa = 0;
 	Tree->Pml4Va = (PULONG64)SvmNptAllocPage(&pa);
@@ -160,6 +166,29 @@ static BOOLEAN SvmNptBuildTree(PNPT_TREE Tree, ULONG64 Cover)
 			Tree->PdVa[i][k] = (base + (k << 21)) | NPT_PTE_FLAGS_LEAF2MB;
 		}
 	}
+	//全空间层: PML4[1..511], 每项独立PDPT页, 512个1GB大页leaf
+	for (ULONG64 m = 1; m < 512; m++)
+	{
+		ULONG64 segBase = m << 39;    //段基址(512GB对齐)
+		if (segBase >= MaxPhy)
+		{
+			break;    //超MAXPHYADDR段不链(P=0=物理不存在语义)
+		}
+		PULONG64 pdptHi = (PULONG64)SvmNptAllocPage(&pa);
+		if (pdptHi == NULL)
+		{
+			return FALSE;
+		}
+		Tree->Pml4Va[m] = pa | NPT_PTE_FLAGS_INTER;
+		for (ULONG64 j = 0; j < 512; j++)
+		{
+			ULONG64 gpa = segBase + (j << 30);
+			if (gpa < MaxPhy)
+			{
+				pdptHi[j] = gpa | NPT_PTE_FLAGS_LEAF1GB;
+			}
+		}
+	}
 	Tree->Ncr3 = MmGetPhysicalAddress(Tree->Pml4Va).QuadPart;
 	return TRUE;
 }
@@ -172,6 +201,12 @@ BOOLEAN SvmBuildNptViews(PULONG64 Ncr3Out,
 	{
 		RtlZeroMemory(Ncr3Out, sizeof(ULONG64) * GNPT_VIEW_COUNT);
 	}
+	ULONG64 maxPhy = 0;
+	{
+		int info[4] = { 0 };
+		__cpuidex(info, 0x80000008, 0);
+		maxPhy = 1ULL << (info[0] & 0xFF);    //MAXPHYADDR(全空间层上限)
+	}
 	if (g_nptTree[0].Ncr3 != 0)
 	{
 		return TRUE;    //已构建(幂等)
@@ -183,7 +218,7 @@ BOOLEAN SvmBuildNptViews(PULONG64 Ncr3Out,
 	}
 	for (ULONG t = 0; t < GNPT_VIEW_COUNT; t++)
 	{
-		if (!SvmNptBuildTree(&g_nptTree[t], cover))
+		if (!SvmNptBuildTree(&g_nptTree[t], cover, maxPhy))
 		{
 			SvmFreeNpt();
 			return FALSE;

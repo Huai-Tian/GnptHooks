@@ -13,6 +13,10 @@ volatile ULONG g_svmStgiPass = 0;      //STGI直通门控(启动时按CPUID定, 
 volatile ULONG g_svmTscDlMode = 0;     //0x6E0轴换算门控(启动时裸机探测LAPIC模式定, 见SvmStartAllCpus)
 KEVENT g_svmShutdownEvent;             //卸载广播(通知事件: 一次唤醒全部发起线程)
 static ULONG64 g_svmNcr3 = 0;          //P视图NCR3(SvmBuildNptViews返回; 其余视图经SvmNptViewNcr3)
+//NPF风暴探针: 引擎不可恢复NPF的取证面(单发全档转储后静音)
+static volatile ULONG64 g_nStormGpa[64];  //各核最后不可恢复NPF的gpa
+static volatile LONG g_nStormCnt[64];    //同gpa连续计数(阈值=单发触发)
+static volatile LONG g_nStormDone[64];   //已转储(此后'N'静音防环溢出)
 //故事面状态(语义/处置见exit分派前的"SVM未激活自洽故事面"节):
 //三MSR读写exit计数(0=EFER 1=VM_CR 2=HSAVE; 停机总结对账)+
 //HSAVE影子寄存器(per-core, 仅exit handler写)
@@ -200,16 +204,16 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	{
 		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
 	}
-	//VMCB 0xB8指令虚拟化使能族(§15.33/§15.23/§15.38/§15.39), 严格按
-	//Fn8000_000A_EDX特性门控(违特性置位=VMEXIT_INVALID): bit0=LBR
-	//virt(b1)/bit2=IBS virt(b26)/bit3=PMC virt(b8)。使能=世界切换时
-	//硬件交换guest/host寄存器组→root驻留指令/分支不泄漏进guest
-	//LBR/PMC/IBS计数器=PMU旁信道闭合(VMCB位零exit成本)。
+	//VMCB 0xB8指令虚拟化使能族(§15.33/§15.23/§15.38/§15.39): 仅LBR
+	//virt(b0)按Fn8000_000A_EDX特性门控置位(世界切换硬件交换guest/host
+	//LBR寄存器组=root驻留指令/分支不泄漏进guest, VMCB位零exit成本)。
+	//IBS virt(b2)/PMC virt(b3)特性在场也不置位: 两者使能依赖AVIC或
+	//NMI虚拟化的中断投递基础设施(§15.38/§15.39, 本框架未实现AVIC/
+	//NMI virt), 无配套平台按VMRUN一致性检查拒绝(实测全核VMEXIT_INVALID)。
+	//S1横幅的0xB8值=特性叙事面(第二实例故事), 与实际使能解耦。
 	//bit1=VMSAVEvirt不使能(该路径要#UD注入非guest执行)
 	vmcb->Control.LbrVirtEnable =
-		((g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL) |
-		((g_svmFeatBits & SVM_FEAT_IBSVIRT) ? 4ULL : 0ULL) |
-		((g_svmFeatBits & SVM_FEAT_PMCVIRT) ? 8ULL : 0ULL);
+		((g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL);
 	//MSRPM故事三MSR读写双拦位(EFER/VM_CR/VM_HSAVE_PA)——此刻=裸机
 	//root直写位图(无NPT/无MSRPM语义)。读写位须成对置: 读伪造后若写
 	//直通, guest会把伪造值RMW回写真实MSR(EFER SVME=0→一致性检查死;
@@ -275,10 +279,54 @@ static VOID SvmVcpuThread(PVOID Context)
 	__writemsr(MSR_VM_HSAVE_PA, Vcpu->HsavePa);
 	Vcpu->base.bSvmOn = 1;
 	SvmFillVmcb(Vcpu);
+	#if DBG
+	if (idx == 0)
+	{
+		//发射前一致性域直读(仅核0; 裸intrinsics, 不经故事面)
+		PVMCB vmcbP = (PVMCB)Vcpu->VmcbVa;
+		ULONG64 eferP = __readmsr(MSR_EFER);
+		FlLog("PROBE[A] efer=%llX svme=%u vmcr=%llX hsave=%llX vmcb_pa=%llX",
+			eferP, (ULONG)((eferP >> 12) & 1), __readmsr(MSR_VM_CR),
+			__readmsr(MSR_VM_HSAVE_PA), Vcpu->VmcbPa);
+		FlLog("PROBE[B] 0xB8=%llX asid=%u np=%u ncr3=%llX efer_v=%llX",
+			vmcbP->Control.LbrVirtEnable, vmcbP->Control.GuestAsid,
+			(ULONG)(vmcbP->Control.NpEnable & 1ULL), vmcbP->Control.NCr3,
+			vmcbP->State.Efer);
+		FlLog("PROBE[C] m1=%lX m2=%lX exc=%lX iopm=%llX msrpm=%llX",
+			vmcbP->Control.InterceptMisc1, vmcbP->Control.InterceptMisc2,
+			vmcbP->Control.InterceptException, vmcbP->Control.IopmBasePa,
+			vmcbP->Control.MsrpmBasePa);
+		FlLog("PROBE[D] cr0=%llX cr4=%llX rflags=%llX",
+			vmcbP->State.Cr0, vmcbP->State.Cr4, vmcbP->State.Rflags);
+	}
+	#endif
 	FlLog("SVM: 核%u接管(vmrun循环就绪)", idx);
 	FlArmLaunchWatch();      //vmrun观测预热(仅Debug构建有实体; Release空宏)
 	CmSvmEnter(Vcpu);         //世界开关; "返回"=本核已guest化(launch失败除外)
 	g_flLaunchHot = 0;
+	#if DBG
+	//0xB8位组回退重试探针: 首试vmrun一致性被拒且位组含LBR外使能位时,
+	//回退LBR独留重试一次, 判别拒绝源在位组内/外。位组合置语义:
+	//IBS/PMC虚拟化的中断投递依赖AVIC或NMI虚拟化(APM §15.38/§15.39)
+	if (!Vcpu->base.bInGuest && Vcpu->base.bLaunchFailed)
+	{
+		PVMCB vmcbP = (PVMCB)Vcpu->VmcbVa;
+		if ((vmcbP->Control.LbrVirtEnable & ~1ULL) != 0)
+		{
+			vmcbP->Control.LbrVirtEnable &= 1ULL;
+			Vcpu->base.bLaunchFailed = 0;
+			FlLog("PROBE[R] cpu=%u 0xB8回退重试(重试值=%llX)",
+				idx, vmcbP->Control.LbrVirtEnable);
+			FlArmLaunchWatch();
+			CmSvmEnter(Vcpu);
+			g_flLaunchHot = 0;
+			FlLog("PROBE[R] cpu=%u 重试结果: %s", idx,
+				Vcpu->base.bInGuest ? "接管成功(拒绝源=0xB8位组)" :
+				Vcpu->base.bLaunchFailed ? "仍拒(拒绝源在0xB8外)" :
+				"探针未确认");
+		}
+	}
+	#endif
 	if (Vcpu->base.bInGuest)
 	{
 		FlLog("SVM: 核%u已guest化(KEEP确认), 停泊等待", idx);
@@ -529,7 +577,7 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
 		g_svmNcr3 = ncr3[GNPT_VIEW_PRIMARY];
-		FlLog("NPT: 四视图就绪(%u页, 覆盖%lluGB, P=%llX HOOKS=%llX HIDE=%llX EXEC=%llX)",
+		FlLog("NPT: 四视图就绪(%u页, 覆盖%lluGB+全空间1GB大页层, P=%llX HOOKS=%llX HIDE=%llX EXEC=%llX)",
 			nptPages, nptCover >> 30,
 			ncr3[GNPT_VIEW_PRIMARY], ncr3[GNPT_VIEW_SECONDARY],
 			ncr3[GNPT_VIEW_HIDE], ncr3[GNPT_VIEW_EXEC]);
@@ -1137,11 +1185,44 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			{
 				return 0;
 			}
-			//'N'环: a=faulting gpa(EXITINFO2) b=错误码(EXITINFO1);
+			//'N'环: a=faulting gpa(EXITINFO2) b=错误码(EXITINFO1) c=guest RIP;
 			//错误码位域: bit0 P/bit1 RW/bit2 US/bit3 RSV/bit4 ID(取指)/
 			//bit6 SS/bit32 终译fault/bit33 guest页表fault(§15.25.6)
-			FlRingPush('N', cpu, SVM_EXIT_NPF,
-				vmcb->Control.ExitInfo2, vmcb->Control.ExitInfo1, 0);
+			//风暴探针: 同gpa连续32次=单发'F'全档转储(五事件: RIP/错误码/
+			//gpa + 易失GPR三组 + 指令字节(DecodeAssists) + VMCB的CR组),
+			//此后该核'N'静音(防行环溢出吞转储+保T1落盘窗口); vmrun
+			//重执行循环不動=行为不变劣(冻结形态与泄漏语义原样保留)
+			{
+				ULONG64 stormGpa = vmcb->Control.ExitInfo2;
+				ULONG sc = cpu & 63;
+				if (g_nStormGpa[sc] != stormGpa)
+				{
+					g_nStormGpa[sc] = stormGpa;
+					g_nStormCnt[sc] = 0;
+				}
+				if (InterlockedIncrement(&g_nStormCnt[sc]) == 32)
+				{
+					g_nStormDone[sc] = 1;
+					//五档单发, reason=档位序号, a/b/c=载荷(各64位):
+					//1=RIP/错误码/gpa 2-3=易失GPR六值
+					//4=指令字节16B+字节数(DecodeAssists) 5=guest CR组
+					FlRingPush('F', cpu, 1, vmcb->State.Rip,
+						vmcb->Control.ExitInfo1, stormGpa);
+					FlRingPush('F', cpu, 2, Regs->rax, Regs->rcx, Regs->rdx);
+					FlRingPush('F', cpu, 3, Regs->rbx, Regs->rsi, Regs->rdi);
+					FlRingPush('F', cpu, 4,
+						*(ULONG64*)(ULONG_PTR)vmcb->Control.GuestInstructionBytes,
+						*(ULONG64*)(ULONG_PTR)(vmcb->Control.GuestInstructionBytes + 8),
+						(ULONG64)vmcb->Control.NumOfBytesFetched);
+					FlRingPush('F', cpu, 5, vmcb->State.Cr0,
+						vmcb->State.Cr3, vmcb->State.Cr4);
+				}
+				if (!g_nStormDone[sc])
+				{
+					FlRingPush('N', cpu, SVM_EXIT_NPF, stormGpa,
+						vmcb->Control.ExitInfo1, vmcb->State.Rip);
+				}
+			}
 			return 0;    //fault语义: 不推RIP(FlRingExit计数+限流兜底)
 		}
 		case SVM_EXIT_EXCP_DB:    //0x41: 单步窗口#DB认领(IDLE残余=吞)
