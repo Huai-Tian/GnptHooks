@@ -145,12 +145,16 @@ CmSvmEnter PROC
     clgi
 CmSvmLoop:
     mov rax, [rsp+8]                ;rax = VmcbPa ([Top-8])
-    vmload rax                      ;guest段/MSR集同步(FS/GS/TR/LDTR/
-                                    ;KernelGsBase/SYSCALL/SYSENTER)
+    ;vmload/vmsave剥除: 本对指令在type-2(host=guest同OS)下为纯自反
+    ;往返——VMRUN加载集(§15.5)不含FS/GS/TR/LDTR/KernelGsBase/
+    ;SYSCALL/SYSENTER, #VMEXIT也不保存/重载它们(exit后硬件保持
+    ;guest运行值=host=guest同值, 无需切换); 指令对的VMCB往返
+    ;恒等。保留=每exit两次额外执行, 且Zen4+客户SoC上该指令对
+    ;为随机host复位诱因(AMD勘误, Linux对Zen4清特性位绕过),
+    ;高频exit下剂量累积=平台衰减态主嫌。初始化时的一次性
+    ;__svm_vmsave保留(VMCB段快照=S1故事面HSAVE影子契约)
     vmrun rax                       ;进guest; #VMEXIT回到下一条
     ;===== #VMEXIT: GIF=0, RIP/RSP/RAX=host值, 其余GPR=guest值 =====
-    vmsave rax                      ;guest段/MSR集存回VMCB(不碰RIP/RSP/
-                                    ;RAX——§15.5.2指令集)
     ;--- guest GPR入帧(GUEST_REGS序; rax槽=垃圾, handler从VMCB覆盖) ---
     push r15
     push r14
@@ -181,6 +185,16 @@ CmSvmLoop:
     mov rdx, rsp
     add rdx, 80h                    ;rdx = GUEST_REGS
     mov rcx, [rsp+100h]             ;rcx = VCPU
+    push rcx                        ;VCPU暂存栈上(rdtsc要毁rax/rdx;
+    rdtsc                           ;  rcx虽幸存但栈序无关, 干净)
+    shl rdx, 20h                    ;edx:eax -> 64位T0
+    or rdx, rax                     ;rdx = T0全宽
+    mov rax, rdx                    ;rax = T0
+    pop rcx                         ;rcx = VCPU(还原)
+    mov [rcx+80h], rax              ;VCPU->WdTsc = T0
+    mov rdx, rsp
+    add rdx, 80h                    ;rdx = GUEST_REGS(重装载——
+                                    ;push/pop已抵消, rsp回原位)
     call SvmExitHandler
     ;--- 恢复xmm ---
     movaps xmm5, xmmword ptr [rsp+70h]

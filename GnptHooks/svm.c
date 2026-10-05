@@ -157,12 +157,13 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//CPUID全直通=零exit。若未来需要拦截CPUID(如leaf伪装), 须同时
 	//启用SvmExitHandler顶部的TSC壳短路路径(见该处注释)并以满负载
 	//视频场景做回归验收。变体9/10=CPUID位实验开关(变体10附带绕壳)
-#if GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10
-	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
-		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
-#else
 	vmcb->Control.InterceptMisc1 = INTERCEPT_MSR_PROT |
 		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_CPUID_STEALTH
+	//CPUID伪装轮(开关在common.h): 拦截位置位=CPUID经exit进
+	//handler(短路于TSC壳的快路径在SvmExitHandler顶部, 风暴
+	//不进补偿壳)。转正验收门槛=accel Full+视频叠加三因子双绿
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_CPUID;
 #endif
 #if GNPT_SMI_INTERCEPT
 	//SMI拦截(APM Table 15-14+§15.35.11): GIF=1下外部SMI→
@@ -501,9 +502,10 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	g_svmStgiPass = ((feat[2] >> CPUID_SKINIT_ECX_BIT) & 1) != 0;
 	FlLog("%s AMD SVM引擎 %s | %u核 | SVM=%s rev=%u ASID=%u",
 		"GNPT", GNPT_BUILD_TAG, cpuCount, stateText, svmRev, nasid);
-	FlLog("特性: NP=%d NRIPS=%d VmcbClean=%d FlushByAsid=%d DecodeAssists=%d VGIF=%d",
+	FlLog("特性: NP=%d NRIPS=%d VmcbClean=%d FlushByAsid=%d DecodeAssists=%d VGIF=%d VMSAVEvirt=%d",
 		(featBits >> 0) & 1, (featBits >> 3) & 1, (featBits >> 5) & 1,
-		(featBits >> 6) & 1, (featBits >> 7) & 1, (featBits >> 16) & 1);
+		(featBits >> 6) & 1, (featBits >> 7) & 1, (featBits >> 16) & 1,
+		(featBits >> 15) & 1);
 	FlLog("STGI门控: SKINIT特性=%u → %s", g_svmStgiPass,
 		g_svmStgiPass ? "直通(裸机等价: 硬件静默执行)"
 		              : "拦截+#UD(无SKINIT特性, 保守忠实)");
@@ -525,6 +527,21 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 			g_svmTscDlMode ? "TSC-deadline模式→拦截+换算" : "非deadline模式→直通(裸机等价)",
 			code);
 	}
+	//INIT重定向观测(诊断轮): VM_CR.R_INIT(bit1)置1=外部INIT经
+	//#SX异常可见化(§15.21.8)——衰减态死亡若以INIT形态到达,
+	//guest态核可捕获(#SX拦截→'K'环级留痕)而非被静默打死。
+	//写入裸机PASSIVE一次性完成+回读验证; LOCK置位后写被忽略
+	//(回读不符=如实报告, 不阻断启动——纯观测面)
+	{
+		ULONG64 vmCr = __readmsr(MSR_VM_CR);
+		__writemsr(MSR_VM_CR, vmCr | VM_CR_R_INIT);
+		ULONG64 vmCrBack = __readmsr(MSR_VM_CR);
+		FlLog("INIT重定向: VM_CR=%llX R_INIT=%u%s",
+			(unsigned long long)vmCrBack,
+			(ULONG)((vmCrBack >> 1) & 1),
+			((vmCrBack >> 1) & 1) ? "=已重定向(#SX可见化)" :
+			"=写被忽略(观察仅, 不阻断)");
+	}
 #if GNPT_SMI_INTERCEPT
 	{
 		//go/no-go: HWCR bit0=SMMLOCK——1=固件锁死SMM, SMI拦截
@@ -534,6 +551,11 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 			(unsigned long long)hwcr, (ULONG)(hwcr & 1ULL),
 			(hwcr & 1ULL) ? "=固件锁死, 拦截将被硬件忽略!" : "=拦截可生效");
 	}
+#endif
+#if GNPT_CPUID_STEALTH
+	FlLog("CPUID伪装: 拦截位在位(Fn8000_0001 SVM位清零/无签名leaf归零)");
+#else
+	FlLog("CPUID伪装: 关闭(全真值直透传)");
 #endif
 #if GNPT_TAKE_CORES < 64
 	FlLog("诊断旋钮: GNPT_TAKE_CORES=%d(0=零接管对照, 1..63=前N核)", GNPT_TAKE_CORES);
@@ -1094,10 +1116,34 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			}
 			return 0;    //fault语义不推RIP(#GP/#UD皆指向引发指令)
 		}
-		case SVM_EXIT_CPUID:    //0x72直透传(全真值; 伪装待后续版本)
+		case SVM_EXIT_CPUID:    //0x72: 真值打底+伪装位修整(裸机等价校准)
 		{
 			int info[4] = { 0 };
 			__cpuidex(info, (int)Regs->rax, (int)Regs->rcx);
+#if GNPT_CPUID_STEALTH
+			//伪装三则(固件级禁用形态, 与S1故事面VM_CR伪LOCK|SVMDIS
+			//自洽——真实世界固件禁SVM正是CPUID位清+SVMDIS置组合):
+			//①Fn8000_0001 ECX bit2(SVM位)清零; 绝不全零返回(特性
+			//  位全丢=系统行为未定义)
+			//②hypervisor专用leaf(0x40000000-0x4000000F)全零
+			//  (无签名泄漏; 嵌套场景下层签名不穿透)
+			//③maxleaf不收敛(比真值小=检测特征; 防嵌套抬高层新平台
+			//  无场景, 保持真值)
+			{
+				ULONG leaf = (ULONG)Regs->rax;
+				if (leaf == 0x80000001)
+				{
+					info[2] &= ~(1 << 2);
+				}
+				else if (leaf >= 0x40000000 && leaf <= 0x4000000F)
+				{
+					info[0] = 0;
+					info[1] = 0;
+					info[2] = 0;
+					info[3] = 0;
+				}
+			}
+#endif
 			//RAX走VMCB(asm契约: 帧rax槽恢复时跳过, vmrun从VMCB
 			//加载——写Regs->rax无效)
 			vmcb->State.Rax = (ULONG64)(ULONG)info[0];
@@ -1332,6 +1378,24 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 static volatile LONG64 g_svmTscWm = 0;   //全局虚拟TSC水位(单调只升)
 ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 {
+	//exit窗口看门狗: 处置耗时超50ms(2000MHz档, rdtsc差>1e8)=
+	//'L'环留痕(exit窗口GIF=0, IPI/时钟中断悬挂窗口的量化证据)。
+	//入口统一判定=覆盖全部exit类型(含CPUID短路路径)。仅观测
+	//不干预——护栏数据先于任何处置变更, 下轮按数据定后续
+	{
+		ULONG64 wdNow = __rdtsc();
+		if (wdNow - Vcpu->WdTsc > 100000000ULL)
+		{
+			ULONG wdc = (ULONG)(UCHAR)Vcpu->CpuIndex & 63;
+			static volatile LONG s_wdCnt[64] = { 0 };
+			LONG wn = InterlockedIncrement(&s_wdCnt[wdc]);
+			if (wn == 1 || (wn & 0xFF) == 0)
+			{
+				FlRingPush('L', wdc, 0,
+					wdNow - Vcpu->WdTsc, (ULONG64)(ULONG)wn, 0);
+			}
+		}
+	}
 	//CPUID exit短路于TSC壳(变体9/10的CPUID位启用时才可达)——
 	//不进T0/T1/扣除/水位/钳制(哨兵照常刷新, dispatch/观测/计数
 	//照常走)。原因: TSC补偿壳的水位/钳制与高频exit存在交互风险,

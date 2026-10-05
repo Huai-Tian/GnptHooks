@@ -187,6 +187,8 @@ typedef struct _GNPT_VCPU_SVM
 	CHAR Pad[7];
 	ULONG64 ExitTsc;               //+0x78 C专用(asm不引用): #VMEXIT入口
 	                               //TSC样本(时间轴补偿T0, SvmExitHandler壳)
+	ULONG64 WdTsc;                 //+0x80 看门狗T0(asm写, C判定:
+	                               //exit窗口rdtsc入, handler尾比差)
 } GNPT_VCPU_SVM, *PGNPT_VCPU_SVM;
 
 extern GNPT_VCPU_SVM g_svmVcpu[64];
