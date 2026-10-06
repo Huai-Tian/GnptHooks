@@ -710,9 +710,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 		KAFFINITY allAff = (cpuTotal >= 64) ? ~(KAFFINITY)0
 			: (((KAFFINITY)1 << cpuTotal) - 1);
 		KeSetSystemAffinityThread((KAFFINITY)1);
+#if GNPT_SVM_ALIGN && GNPT_ALIGN_PROBES
+		//对齐形态(探针停用轮): 故事/PMU探针全停(无#UD注入链与
+		//额外exit源, 入口行为对齐参考实现=纯接管+驻留);
+		//ALIGN_PROBES=0(探针回加轮, 第五刀)=探针复活=bb同款启动
+		FlLog("[Entry] 对齐形态: 故事/PMU探针全停");
+#else
 		DemoStoryProbe();
 		DemoTscDeadlineProbe();
 		DemoPmuProbe();
+#endif
 		KeSetSystemAffinityThread(allAff);
 	}
 	DemoMultiHookStart();

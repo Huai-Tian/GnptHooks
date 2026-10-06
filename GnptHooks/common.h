@@ -235,12 +235,24 @@ extern volatile LONG g_flWriteGuard;
 extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9bb"
+#define GNPT_BUILD_TAG "v0.9bt"
 //变体开关=开发期单变量鉴别脚手架(正式版恒0=全功能; 各变体仅控制
 //对应的演示面门, 引擎本体不变; 历史实验语义见开发文档, 不入代码):
 //0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR 6=隐蔽+hook
 //7=hook+MSR 8=机制轮 9=+CPUID拦截 10=+CPUID拦截且绕TSC壳 11=已移除
-#define GNPT_M92_VARIANT 1
+//bn轮注: M14终局后恢复=0(全功能: hook/隐蔽/MSR面复活),
+//进入M13验收协议Step2(accel Full+视频30min, DWM判据)
+//bq轮注(A刀, M14.20): hook面冷窗单变量——VARIANT=0激活hook+自我
+//隐蔽, 其余面全留bp位(见下方各子开关); 冷刀矩阵第一刀
+//br轮注(B刀, M14.21): hook面已出罪——本刀=bo精确复刻减hook面
+//(VARIANT=1), 其余子开关全bo位(见下方); 非hook面七项联合单变量
+//bs轮注(C刀, M14.22): bo精确复刻(VARIANT=0+全bo位)确认杀手今日仍在
+//(两段协议), 兼作M3a配对/M3b剂量判别
+//bt轮注(M14.24法证修复): bs配置+Install布防/隐蔽改译后即刻全核
+//TLB同步(hook.c两处HookSyncAllCpus前移)——消灭conceal路径600ms
+//混合翻译窗口(0x3B蓝屏判例yhnflt的崩溃时点); Remove路径本就
+//restore→sync紧邻无窗口, 不动
+#define GNPT_M92_VARIANT 0
 //哨兵v2运行时开关(默认开; 0=关——纯引擎最小观测面场景)
 #define GNPT_DPC_SENTINEL 1
 //接管核数旋钮(诊断剂量轮脚手架, 正式版恒64=全核):
@@ -256,15 +268,82 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 //SVM启动尝试)时武装该核——EFER读改回显值/VM_CR读改回真值, 读者
 //协议可推进(其VMRUN必经0x80拦截=全程可见); 探针写回恒SVME=0不误触
 #define GNPT_STORY_TRAP 1
+//故事MSR拦位轮(诊断二分): 1=MSRPM布防EFER/VM_CR/HSAVE读写
+//双拦位(S1故事面=读伪造/写代写, 正式形态); 0=三MSR全直通
+//(位图空=硬件零exit, EFER读回真值SVME=1=故事破但引擎语义不变;
+//探针②RMW写真值无害——读到的就是真值)
+//br轮注(B刀): 1=bo位
+#define GNPT_STORY_MSR 1
+//LBR虚拟化轮(诊断二分): 1=LbrVirtEnable按特性置位(世界切换硬件
+//交换guest/host LBR寄存器组=root驻留分支不泄漏进guest, 正式形态);
+//0=恒不置位(LBR MSR对guest直通, 世界切换少一组硬件保存/恢复;
+//参考实现SimpleSvm/NoirVisor均不置0xB8任何位)。特性纯隐蔽性,
+//关闭零引擎语义变化
+//br轮注(B刀): 1=bo位
+#define GNPT_LBRVIRT 1
+//NPT对齐形态轮(诊断二分): 1=四棵树改参考实现形状——仅PML4[0..1]
+//两入口、全2MB叶、覆盖1TB(高MMIO窗在第二入口内); 0=正式形态
+//(PML4[0]512GB全2MB+PML4[1..511]全空间1GB大页层)。纯驻留期
+//(零exit)硬件持续访问的唯一引擎配置=活跃NPT形状, 本轮单变量
+//切换形状以观测平台敏感度
+//br轮注(B刀): 0=bo位(正式形状)
+#define GNPT_NPT_ALIGN 0
+//SVM对齐形态轮(诊断二分→转正底盘): 1=对齐底盘——与参考实现
+//同构的驻留基座(拦截面/VMCR/TSC/探针/树数全部由下方子开关
+//矩阵表达: 全1=bg最小对齐形态, 全0=正式形态全功能, 两极间
+//任意组合可表达)。0=正式形态旧代码路径(历史bl复活轮形态,
+//语义上与"底盘+全0子开关"等价)。VMCALL位为STOP桥生命线不可
+//砍(APM §15.9: 未拦截的VMMCALL在guest内#UD)。M14终局判定:
+//两形态安全性等价(九差异全出罪), 底盘=配置表达力超集,
+//转正默认=1(平台兼容面最大+回归粒度最细)
+#define GNPT_SVM_ALIGN 1
+//TSC补偿壳轮(诊断回加): 1=补偿壳在位(每exit负向累计TscOffset+
+//全局水位跨核钳制, 正式形态; RDTSC直通但硬件应用偏移=纯驻留期
+//持续在场的唯一VMCB字段); 0=旁路(直通dispatch, TscOffset恒0=
+//参考实现同款零跨核发散)。仅SVM_ALIGN形态下区分生效
+//br轮注(B刀): 1=bo位(补偿壳在位)
+#define GNPT_TSC_CC 1
+//INIT重定向轮(诊断回加): 1=启动时写VM_CR.R_INIT=1(外部INIT经
+//#SX可见化=观测面; 真MSR硬件状态, 纯驻留期持续在场); 0=不写
+//(外部INIT走原生路径=参考实现同款)。仅SVM_ALIGN形态下区分
+//br轮注(B刀): 1=bo位
+#define GNPT_RINIT 1
+//树数轮(诊断回加, 第四刀甲): 1=对齐形态仅建P树(其余视图NCR3
+//复制P, 页表足迹≈参考实现单树~4MB); 0=四树全建(P/HOOKS/HIDE/
+//EXEC各自NCR3, 足迹4×1027页≈16MB=bb同款; 无hook时树1-3纯驻留
+//足迹, 视图永不切换)。NPT形状已出罪(M14.2), 四树仍用对齐形状
+//=纯足迹单变量。仅SVM_ALIGN形态下区分
+//bq轮注(A刀): 0=四树——hook视图切换的硬依赖(单树形态下
+//SECONDARY/HIDE/EXEC改译无树可落); 已随A刀冷窗出罪
+//br轮注(B刀): 0=bo位(四树足迹保留=bo减hook面后的最接近形态)
+#define GNPT_ALIGN_TREES 0
+//拦截位全集轮(诊断回加, 第四刀乙): 1=对齐形态最小拦截面(CPUID+
+//MSR_PROT+VMRUN/VMMCALL, 异常拦截/指令族/SHUTDOWN/INIT/INVLPGA
+//全关); 0=控制区拦截位全集回加(Misc1+SHUTDOWN/INIT/INVLPGA,
+//异常+DB/MC/GP, Misc2+VMLOAD/VMSAVE/CLGI/SKINIT——bg/bb控制区
+//差异位; dispatch处置路径本就编译在内, 位回加即复活)。CPUID位
+//保留底盘(bg/bh/bi已出罪的流量画像)。仅SVM_ALIGN形态下区分
+//br轮注(B刀): 0=bo位
+#define GNPT_ALIGN_BITS 0
+//启动探针回加轮(诊断回加, 第五刀=终局刀): 1=对齐形态启动故事/
+//PMU探针全停(bg底盘); 0=探针回加(bb同款启动行为——DemoStory
+//Probe 11条SVM指令族#UD注入链+DemoTscDeadlineProbe 0x6E0探针
+//+DemoPmuProbe万级PMU自证, 启动期一次性; bg/bb差异清单最后一项)。
+//仅SVM_ALIGN形态下区分
+//br轮注(B刀): 0=bo位
+#define GNPT_ALIGN_PROBES 0
 //CPUID伪装轮: 1=置INTERCEPT_CPUID+handler伪装(Fn8000_0001
 //SVM位清零——固件级禁用形态, 与S1故事面VM_CR伪LOCK|SVMDIS自洽;
 //无签名leaf归零; maxleaf真值不收敛)。CPUID exit短路于TSC壳的
 //快路径恒在位(高频风暴不进补偿壳)。转正门槛=accel Full+视频
 //叠加三因子同场双绿(DWM判据), 门槛不过不交付
+//br轮注(B刀): 1=bo位
 #define GNPT_CPUID_STEALTH 1
 //SMI拦截轮(诊断→修复候选): 1=置INTERCEPT_SMI+0x62处置(STGI手册
 //协议: SMI从root进SMM, 绕开guest态SMM/RSM=无痕复位轴)。
 //HWCR.SMMLOCK(bit0)=1时硬件忽略拦截(启动横幅读报go/no-go)
+//bl复活轮注: bb值=1(9600X上SMMLOCK=1硬件忽略=死位, 考古已
+//清白——回加以忠实复刻bb编译产物)
 #define GNPT_SMI_INTERCEPT 1
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 

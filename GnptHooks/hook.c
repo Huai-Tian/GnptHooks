@@ -1289,6 +1289,16 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	HookNptSetPteRoot(GNPT_VIEW_PRIMARY, e->TargetPa, e->TargetPa,
 		NPT_PTE_FLAGS_HOOKP);
+	//布防即刻全核同步(M14.24法证修复, 判例yhnflt): PTE组写完→IPI
+	//全核TLB冲净。原conceal路径把同步推迟到stage16(步进300ms×2),
+	//窗口内系统处于混合翻译态(陈旧TLB核跑原代码/新鲜walk核跑舞步/
+	//P-HOOKS不对称/拆分PDE刚换)——崩溃核cpu6恰为SECONDARY常驻核
+	//(常规hook舞步不回切P视图), 在窗口内对新arm页的首次取指-数据
+	//读序列收到P=0 not-present fault(软件侧任何可达状态均不可推导,
+	//与M11以来"不可能签名"家族一致)。无隐蔽路径(else分支)本就arm
+	//后即刻sync=无此窗口。窗口压缩到IPI广播延迟(~百µs)后, 无论根因
+	//是硅级walk边角还是未定位竞态, 混合态不再可观察
+	HookSyncAllCpus();
 	HookStagePaced(HKST_INS_ARMED);
 	//CodePage工件隐蔽(root原语, 挂靠自我隐蔽登记表): 身份PTE四视图
 	//改译零页+登记游标排水(布防拆分新增的页表页一并隐蔽)。自我隐蔽
@@ -1299,6 +1309,9 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	{
 		BOOLEAN ok = (CmVmmCall(GNPT_VMCALL_CONCEAL, e->CodePagePa, 0, 0)
 			!= 0);
+		//隐蔽改译即刻全核生效(M14.24同判例): 零页改译也是PTE组写,
+		//写完即同步, 不留步进级窗口(原延迟到stage16同步, 300ms暴露)
+		HookSyncAllCpus();
 		HookStagePaced(HKST_INS_CONCEAL);
 		if (ok)
 		{
