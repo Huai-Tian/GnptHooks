@@ -13,22 +13,22 @@ volatile ULONG g_svmStgiPass = 0;      //STGI直通门控(启动时按CPUID定, 
 volatile ULONG g_svmTscDlMode = 0;     //0x6E0轴换算门控(启动时裸机探测LAPIC模式定, 见SvmStartAllCpus)
 KEVENT g_svmShutdownEvent;             //卸载广播(通知事件: 一次唤醒全部发起线程)
 static ULONG64 g_svmNcr3 = 0;          //P视图NCR3(SvmBuildNptViews返回; 其余视图经SvmNptViewNcr3)
-//NPF风暴探针: 引擎不可恢复NPF的取证面(单发全档转储后静音)
+//NPF风暴探针(仅Debug构建读写): 引擎不可恢复NPF的取证面
+//(单发全档转储后静音)
 static volatile ULONG64 g_nStormGpa[64];  //各核最后不可恢复NPF的gpa
 static volatile LONG g_nStormCnt[64];    //同gpa连续计数(阈值=单发触发)
 static volatile LONG g_nStormDone[64];   //已转储(此后'N'静音防环溢出)
 //故事面状态(语义/处置见exit分派前的"SVM未激活自洽故事面"节):
-//三MSR读写exit计数(0=EFER 1=VM_CR 2=HSAVE; 停机总结对账)+
-//HSAVE影子寄存器(per-core, 仅exit handler写)
+//三MSR读写exit计数(0=EFER 1=VM_CR 2=HSAVE; Debug构建累加,
+//停机总结对账)+HSAVE影子寄存器(per-core, 仅exit handler写=
+//功能件)
 static volatile LONG64 g_svmStoryRd[3] = { 0, 0, 0 };
 static volatile LONG64 g_svmStoryWr[3] = { 0, 0, 0 };
 static ULONG64 g_svmHsaveShadow[64] = { 0 };
-//#GP处置计数: 族转换#UD / 忠实回注(自然#GP应≈0, 停机对账)
+//#GP处置计数: 族转换#UD / 忠实回注(自然#GP应≈0; Debug构建
+//累加, 停机对账)
 static volatile LONG64 g_svmGpUdConv = 0;
 static volatile LONG64 g_svmGpReinj = 0;
-//读者陷阱掩码(bit cpu, 锁存): guest写EFER.SVME=1(运行时无人合法
-//做=SVM启动尝试)时武装该核——故事面临时收敛, 见SvmStoryMsrHandle
-static volatile LONG g_svmTrapMask = 0;
 
 //SVM可用性三态判定(APM §15.4):
 //  0=可用 1=CPU无SVM 2=BIOS禁且不可解锁 3=BIOS禁但有SVM_KEY可能
@@ -120,8 +120,21 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	vmcb->State.Cr0 = __readcr0();
 	vmcb->State.Cr3 = __readcr3();
 	vmcb->State.Cr4 = __readcr4();
+	//DR-TRANSPARENT卫生: 历史硬件DR残留清零(引擎重启/
+	//park边角的陈旧断点=幽灵hook: DR0-3不在VMCB跨世界持续,
+	//陈旧地址+新会话误武装=改道到已释放槽)。裸机Windows运行期
+	//DR0-3恒0/DR7恒0x400(保留位)——清零=裸机等价; DR6状态位
+	//无副作用保留裸读。DR6/DR7=VMCB guest state(§15.5), 接管后
+	//MOV DR全拦=guest视角由影子承载, 硬件/VMCB位全归引擎
+	__writedr(0, 0);
+	__writedr(1, 0);
+	__writedr(2, 0);
+	__writedr(3, 0);
+	__writedr(7, 0x400);
+	//影子侧对偶初始化(DR7=0x400): guest首个读DR7零差异
+	GnptHookDrShadowInit((ULONG)(UCHAR)Vcpu->CpuIndex);
 	vmcb->State.Dr6 = __readdr(6);
-	vmcb->State.Dr7 = __readdr(7);
+	vmcb->State.Dr7 = 0x400;
 	vmcb->State.Rflags = CmGetRflags();    //pushfq全宽读取(asm helper; MSVC无x64 RFLAGS intrinsics)
 	vmcb->State.Rax = 0;                         //探针不依赖(恢复序列从探针栈弹出真值)
 	vmcb->State.Cpl = 0;                         //x64发起线程恒CPL0
@@ -150,99 +163,44 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	vmcb->State.Idtr.Base = CmGetIdtBase();
 	//---- FS/GS/TR/LDTR+系统MSR集: 硬件真值预同步 ----
 	__svm_vmsave((void*)(ULONG_PTR)Vcpu->VmcbPa);    //参数=VMCB物理地址(按指针值传递, MSVC契约)
-	//---- 拦截配置(最小集; INTR不拦=中断直通) ----
-	//CPUID拦截位保持移除: 高频CPUID exit在GPU渲染×C-state高频切换
-	//同场的负载下有DWM崩溃循环级时序风险(内核存活的自愈型崩溃,
-	//非确定性, 与exit频率和TSC补偿壳的交互相关); RDTSC/RDTSCP/
-	//CPUID全直通=零exit。若未来需要拦截CPUID(如leaf伪装), 须同时
-	//启用SvmExitHandler顶部的TSC壳短路路径(见该处注释)并以满负载
-	//视频场景做回归验收。变体9/10=CPUID位实验开关(变体10附带绕壳)
-#if GNPT_SVM_ALIGN
-	//对齐形态: Misc1=参考实现同款(CPUID+MSR_PROT); CPUID位=对齐
-	//exit流量画像(handler真值直通, 见case 0x72)
-	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT;
-#if !GNPT_ALIGN_BITS
-	//拦截位全集回加轮(第四刀乙)/转正形态: bg/bb控制区差异位回加
-	//——SHUTDOWN/INIT/INVLPGA(bb在位, bg裁掉)+SMI(SMI_INTERCEPT=1
-	//时并入=与正式形态同位; SMMLOCK=1平台硬件忽略=观察位)。
-	//CPUID位保留底盘(bg/bh/bi已出罪的流量画像)
-	vmcb->Control.InterceptMisc1 |= INTERCEPT_SHUTDOWN | INTERCEPT_INIT |
-		INTERCEPT_INVLPGA;
-#if GNPT_SMI_INTERCEPT
-	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
-#endif
-#endif
-#else
-	vmcb->Control.InterceptMisc1 = INTERCEPT_MSR_PROT |
+	//---- 拦截配置 ----
+	//Misc1: CPUID(伪装面载体; 快路径短路于TSC壳——高频风暴不进
+	//补偿壳)+MSR_PROT(MSR hook面载体)+SHUTDOWN/INIT/INVLPGA(观测/
+	//自愈位)+SMI(观测位, SMMLOCK=1平台硬件忽略)
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
 		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
-#if GNPT_CPUID_STEALTH
-	//CPUID伪装轮(开关在common.h): 拦截位置位=CPUID经exit进
-	//handler(短路于TSC壳的快路径在SvmExitHandler顶部, 风暴
-	//不进补偿壳)。转正验收门槛=accel Full+视频叠加三因子双绿
-	vmcb->Control.InterceptMisc1 |= INTERCEPT_CPUID;
-#endif
 #if GNPT_SMI_INTERCEPT
-	//SMI拦截(APM Table 15-14+§15.35.11): GIF=1下外部SMI→
-	//#VMEXIT(SMI)(0x62, 保持pending), 处置=STGI从root立即可控
-	//服务——SMM的save/restore对象=裸机形态root上下文, 绕开
-	//guest态SMM/RSM窗口(M11.24无痕复位轴)。HWCR.SMMLOCK=1时
-	//本位被硬件忽略(启动横幅读报go/no-go)
 	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
 #endif
-#endif
-	//#DB拦截常驻: 单步窗口外的任何#DB=残余TF泄漏→
-	//guest可见=0x3B/0x1E致命; 常驻+IDLE吞+清TF=最后一道网
-	//#MC观测(EXCP_INTERCEPT_MC, 同上: 静默复位转化器)
-	//#GP拦截(0x4D处置见dispatch): SVM指令族#GP先于拦截位(Table 15-7),
-	//非规范PA形态硬件直接raise #GP不经拦截位→须拦截#GP+RIP字节
-	//族判定改注入#UD(裸机SVME=0全族#UD的自洽语义)
-#if GNPT_SVM_ALIGN
-	//对齐形态: 异常拦截全关——guest异常走原生IDT(参考实现同款;
-	//本形态无单步原语/#GP手术/静默复位转化器)
-	vmcb->Control.InterceptException = 0;
-#if !GNPT_ALIGN_BITS
-	//拦截位全集回加轮: 异常拦截DB/MC/GP回加(bb在位, bg裁掉;
-	//处置路径dispatch内本就编译, 位回加即复活——#DB窗口外吞/
-	//#GP族手术/#MC静默复位转化器)
+	//DR0-7读写全拦(DR-TRANSPARENT机件): guest的MOV DR经exit对
+	//影子仿真——硬件DR0-3(跨VMRUN持续)与VMCB.Dr6/7(guest state)
+	//永不受guest触碰; 空闲态零额外exit(Windows运行期几乎无MOV DR
+	//流量, 仅启动/调试器路径)
+	vmcb->Control.InterceptDrRead = 0xFF;
+	vmcb->Control.InterceptDrWrite = 0xFF;
+	//异常拦截: #DB(单步窗口认领+DR断点入口陷阱+窗口外残余TF泄漏
+	//的最后防线——guest可见#DB=致命, 一律拦截)+#MC(静默复位转化
+	//器: 命中即留痕+bugcheck带dump)+#GP(SVM指令族#GP先于拦截位,
+	//Table 15-7——须拦截+RIP字节族判定改注入#UD, 维持裸机
+	//SVME=0全族#UD的自洽语义)
 	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB |
 		EXCP_INTERCEPT_MC | EXCP_INTERCEPT_GP;
-#endif
-#else
-	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB | EXCP_INTERCEPT_MC |
-		EXCP_INTERCEPT_GP;
-#endif
-	//V_INTR_MASKING必须为0: 该位仅当"拦截INTR+host ISR"形态才有意义;
-	//本框架type-2 in-place=INTR直通(物理中断由guest原生IF门控),
-	//置位+host IF=1=物理中断无视guest cli直接投递=中断插入临界期
-	//=数据腐败=瞬间bugcheck。V_INTR_MASKING=0+INTR直通=中断流与
-	//裸机一致
-	//SVM指令族显式拦截——裸机Windows(EFER.SVME=0)上全族#UD(APM
-	//§15.4: #UD条件=SVME=0, 与是否在guest无关); 不拦则guest内
-	//SVME=1下硬件照常执行(VMLOAD/VMSAVE可直访VMCB段/MSR态,
-	//CLGI可翻转GIF)=自洽故事差+安全洞双开。工程处置=显式拦截
-	//+#UD注入(不依赖硬件默认), dispatch的'v' case族。
-	//STGI例外=按SKINIT特性门控(见下): 在场裸机STGI本就静默
-	//执行, 注入#UD反成可判别违反
-#if GNPT_SVM_ALIGN
-	//对齐形态: Misc2=VMRUN必须位+VMMCALL(STOP桥生命线; APM §15.9
-	//未拦截的VMMCALL在guest内#UD); 指令族位全关——guest内SVME=1
-	//下硬件照常执行(参考实现同款裸语义)
-	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;
-#if !GNPT_ALIGN_BITS
-	//拦截位全集回加轮: 指令族位VMLOAD/VMSAVE/CLGI/SKINIT回加
-	//(bb在位, bg裁掉; 'v' case族处置路径本就编译)。STGI仍按
-	//SKINIT特性门控(9600X在场=直通)
-	vmcb->Control.InterceptMisc2 |= INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
-		INTERCEPT_CLGI | INTERCEPT_SKINIT;
-	if (!g_svmStgiPass)
-	{
-		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
-	}
-#endif
-#else
+	//V_INTR_MASKING必须为0: 该位仅当"拦截INTR+host ISR"形态才有
+	//意义; 本框架type-2 in-place=INTR直通(物理中断由guest原生IF
+	//门控), 置位+host IF=1=物理中断无视guest cli直接投递=中断
+	//插入临界期=数据腐败=瞬间bugcheck。V_INTR_MASKING=0+INTR
+	//直通=中断流与裸机一致
+	//Misc2: VMRUN位(一致性检查强制)+VMMCALL(STOP桥生命线; APM
+	//§15.9未拦截的VMMCALL在guest内#UD)+SVM指令族显式拦截——
+	//裸机Windows(EFER.SVME=0)上全族#UD(APM §15.4: #UD条件=
+	//SVME=0, 与是否在guest无关); 不拦则guest内SVME=1下硬件照常
+	//执行(VMLOAD/VMSAVE可直访VMCB段/MSR态, CLGI可翻转GIF)=自洽
+	//故事差+安全洞双开。工程处置=显式拦截+#UD注入(不依赖硬件
+	//默认), dispatch的'v' case族。STGI例外=按SKINIT特性门控:
+	//在场裸机STGI本就静默执行, 注入#UD反成可判别违反
 	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
 		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
-		INTERCEPT_CLGI | INTERCEPT_SKINIT;    //VMRUN位强制+VMMCALL签名门+指令族
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
 	//STGI门控(Fn8000_0001_ECX bit12=SKINIT): 在场→拦截位不设=
 	//直通忠实(裸机同款CPU的STGI静默执行不#UD); 缺席→拦截+#UD
 	//注入(保守维持)。GIF方向安全: guest态GIF本为1, STGI直通
@@ -252,59 +210,52 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	{
 		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
 	}
-#endif
+	
 	//VMCB 0xB8指令虚拟化使能族(§15.33/§15.23/§15.38/§15.39): 仅LBR
-	//virt(b0)按Fn8000_000A_EDX特性门控置位(世界切换硬件交换guest/host
-	//LBR寄存器组=root驻留指令/分支不泄漏进guest, VMCB位零exit成本)。
+	//virt(b0)按Fn8000_000A_EDX bit1特性门控置位——世界开关硬件交换
+	//guest/host LBR寄存器组(含DebugCtl)=root驻留分支不泄漏进guest
+	//LBR栈(LBR探测面: 读LBR栈找非模块分支地址=root/hypervisor指纹),
+	//VMCB位零exit成本, 代价=世界开关多一组寄存器保存/恢复。
 	//IBS virt(b2)/PMC virt(b3)特性在场也不置位: 两者使能依赖AVIC或
-	//NMI虚拟化的中断投递基础设施(§15.38/§15.39, 本框架未实现AVIC/
-	//NMI virt), 无配套平台按VMRUN一致性检查拒绝(实测全核VMEXIT_INVALID)。
+	//NMI虚拟化的中断投递基础设施(§15.38/§15.39, 本框架未实现),
+	//违合置要求=全核VMEXIT_INVALID(Zen5实测)——PMC计数root泄漏=
+	//平台边界(PROBE[R]回退=安全网; PMC探针按"在场未使能"如实报告)。
 	//S1横幅的0xB8值=特性叙事面(第二实例故事), 与实际使能解耦。
 	//bit1=VMSAVEvirt不使能(该路径要#UD注入非guest执行)
-	//GNPT_LBRVIRT=0(诊断轮): 恒不置位=世界切换少一组硬件保存/恢复
-#if GNPT_LBRVIRT
 	vmcb->Control.LbrVirtEnable =
-		((g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL);
-#else
-	vmcb->Control.LbrVirtEnable = 0;
-#endif
-	//MSRPM故事三MSR读写双拦位(EFER/VM_CR/VM_HSAVE_PA)——此刻=裸机
-	//root直写位图(无NPT/无MSRPM语义)。读写位须成对置: 读伪造后若写
-	//直通, guest会把伪造值RMW回写真实MSR(EFER SVME=0→一致性检查死;
-	//VM_CR/HSAVE真值被改=host态/仲裁面毁; 详见msr.h使用纪律5)。
-	//0x6E0(TSC_DEADLINE)读写双拦=时间轴换算(LAPIC物理轴比较×guest
-	//虚拟轴编程, 处置见0x7C特判SvmTscDeadlineHandle)——仅LAPIC实处
-	//TSC-deadline模式时置位(g_svmTscDlMode启动探测); 缺席时0x6E0
-	//访问硬件即#GP, 拦截处置的root真访问=物理#GP无SEH防护=蓝屏级,
-	//故缺席=不置位(guest直通#GP走原生路径=裸机等价)
-	//GNPT_STORY_MSR=0(诊断轮): 三MSR拦位全不置=位图空(硬件按位图
-	//判定, 零exit); 读者陷阱随之dormant(其武装点在EFER写exit处置)
-#if GNPT_STORY_MSR
+		(g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL;
+	//MSRPM布防(自我隐蔽生效前=本核发起线程裸机root态, 直写位图
+	//合法, 无需vmmcall root原语):
+	//  三故事MSR(EFER/VM_CR/HSAVE_PA)读写双拦位="SVM未激活"自洽
+	//  故事面的载体(0x7C特判先于公共MSR API表; 读写成对置位
+	//  =拦读伪造的MSR禁止写直通, msr.h使用纪律5——伪造值RMW回写
+	//  真实MSR=状态毁);
+	//  0x6E0(TSC_DEADLINE)仅LAPIC实处TSC-deadline模式时置双拦位
+	//  (g_svmTscDlMode启动探测; 缺席时0x6E0硬件访问即#GP, root真
+	//  访问=物理#GP无SEH防护=蓝屏级, 故缺席=不置位, guest直通#GP
+	//  走原生路径=裸机等价)
 	{
-		static const ULONG32 s_storyMsr[3] = { MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA };
+		ULONG byteOff;
+		UCHAR bit;
+		const ULONG32 storyMsrs[3] = {
+			MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA
+		};
 		PUCHAR map = (PUCHAR)Vcpu->MsrpmVa;
 		for (ULONG i = 0; i < 3; i++)
 		{
-			ULONG byteOff;
-			UCHAR bit;
-			if (GnptMsrLocate(s_storyMsr[i], &byteOff, &bit))
+			if (GnptMsrLocate(storyMsrs[i], &byteOff, &bit))
 			{
-				map[byteOff] |= (UCHAR)((1 << bit) | (1 << (bit + 1)));  //读位+写位成对
+				map[byteOff] |= (UCHAR)(3 << bit);    //读+写双拦位
 			}
 		}
-		if (g_svmTscDlMode)
+		if (g_svmTscDlMode != 0 &&
+			GnptMsrLocate(MSR_IA32_TSC_DEADLINE, &byteOff, &bit))
 		{
-			ULONG byteOff;
-			UCHAR bit;
-			if (GnptMsrLocate(MSR_IA32_TSC_DEADLINE, &byteOff, &bit))
-			{
-				map[byteOff] |= (UCHAR)((1 << bit) | (1 << (bit + 1)));
-			}
+			map[byteOff] |= (UCHAR)(3 << bit);
 		}
 	}
-#endif
 	vmcb->Control.IopmBasePa = Vcpu->IopmPa;     //位图全0=不拦任何端口
-	vmcb->Control.MsrpmBasePa = Vcpu->MsrpmPa;   //位图: 故事三MSR外全0(用户hook经root原语增位)
+	vmcb->Control.MsrpmBasePa = Vcpu->MsrpmPa;   //位图: 故事面+0x6E0置位外全0
 	vmcb->Control.GuestAsid = 1;                 //0非法(一致性检查要求)
 	//---- 嵌套分页布线: NP启用+NCR3(§15.25.3) ----
 	vmcb->Control.NpEnable |= NP_ENABLE_NP;
@@ -480,14 +431,11 @@ static VOID SvmStopAndFree(ULONG n, const char* why)
 	//#GP处置账: 族转换数应=探针量; 忠实回注=自然#GP(静置应≈0)
 	FlLog("%s: S1#GP手术: 族转换#UD=%lld 忠实回注=%lld(0x4D exit总账见r4D)",
 		why, g_svmGpUdConv, g_svmGpReinj);
-#if GNPT_STORY_TRAP
-	FlLog("%s: 读者陷阱掩码=%X(0=全程无SVM启动尝试)", why, g_svmTrapMask);
-#endif
 	FlLog("%s: 完成(泄漏核掩码=%X)", why, leaked);
 }
 
 //==================== 生命周期 ====================
-//虚拟化核数(0=引擎未起; =实际接管数, 诊断旋钮见GNPT_TAKE_CORES)
+//虚拟化核数(0=引擎未起; =实际接管数)
 volatile ULONG g_svmVcpuCount = 0;
 //停泊哨兵: 各核最后#VMEXIT的TSC——HB心跳检查"核在VMRUN里停泊
 //过久"(idle停泊正常=guest真实hlt; >2s且系统活动=IPI丢失嫌疑现场)
@@ -510,9 +458,10 @@ KAFFINITY SvmPinVirtualizedCpus(VOID)
 	return oldAff;
 }
 
-//部分接管安全门: 裸核上hook布防/root原语=蓝屏, 仅纯引擎变体放行
-#if GNPT_TAKE_CORES < 64 && GNPT_M92_VARIANT != 1
-#error "GNPT_TAKE_CORES<64 仅限纯引擎变体(VARIANT=1)"
+//部分接管安全门: 裸核上hook布防/root原语=蓝屏, 低剂量(TAKE_CORES<64)
+//仅限纯引擎诊断形态(零hook零MSR面)放行
+#if GNPT_TAKE_CORES < 64
+#error "GNPT_TAKE_CORES<64 仅限纯引擎诊断形态(零hook零MSR面)"
 #endif
 
 NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
@@ -520,12 +469,7 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	UNREFERENCED_PARAMETER(DriverObject);
 	ULONG totalCpu = KeQueryActiveProcessorCount(NULL);
 	ULONG cpuCount = totalCpu;
-	//全核接管=正式形态: 部分虚拟化是不一致性根源(裸机核上vmmcall=
-	//#UD、单步窗口逃逸——API原语/hook布防落裸核=蓝屏), 故部分
-	//接管仅作诊断剂量轮(上方#error门限纯引擎变体)。纯引擎下
-	//裸核与接管核的探针/故事面表现逐位一致(真#UD与注入#UD同形),
-	//SvmPinVirtualizedCpus按g_svmVcpuCount钉核=部分轮自动只钉
-	//接管核, 语义正确
+	//全核接管=正式形态(部分接管=纯引擎诊断剂量轮, 见上方#error门)
 #if GNPT_TAKE_CORES == 0
 	cpuCount = 0;
 #elif GNPT_TAKE_CORES < 64
@@ -584,16 +528,10 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 			g_svmTscDlMode ? "TSC-deadline模式→拦截+换算" : "非deadline模式→直通(裸机等价)",
 			code);
 	}
-	//INIT重定向(RINIT轮): VM_CR.R_INIT(bit1)置1=外部INIT经#SX
-	//异常可见化(§15.21.8)——若杀手以INIT形态到达, 死亡表达从
-	//静默复位变为可观察异常。本写在发起核一次性完成(=az/bb
-	//正式形态同款足迹, VM_CR为每核MSR其余核不写——单变量复刻
-	//bg/bb差异项)。对齐形态下异常拦截全关: #SX直送guest无'K'
-	//环留痕, 死亡表达=guest崩溃面(蓝屏可分析)。LOCK置位后写被
-	//忽略(回读不符=如实报告, 不阻断启动——纯观测面)。
-	//形态门: SVM_ALIGN且RINIT=0=对齐不写(参考实现不触碰VM_CR,
-	//外部INIT走原生路径); 其余(正式形态恒写/RINIT回加轮)写
-#if !GNPT_SVM_ALIGN || GNPT_RINIT
+	//INIT重定向: VM_CR.R_INIT(bit1)置1=外部INIT经#SX异常可见化
+	//(§15.21.8)——外部INIT的死法从静默复位变为可观察事件。
+	//发起核一次性写(VM_CR为每核MSR, 其余核不写)。LOCK置位后
+	//写被忽略(回读不符=如实报告, 不阻断启动——纯观测面)
 	{
 		ULONG64 vmCr = __readmsr(MSR_VM_CR);
 		__writemsr(MSR_VM_CR, vmCr | VM_CR_R_INIT);
@@ -604,7 +542,6 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 			((vmCrBack >> 1) & 1) ? "=已重定向(#SX可见化)" :
 			"=写被忽略(观察仅, 不阻断)");
 	}
-#endif
 #if GNPT_SMI_INTERCEPT
 	{
 		//go/no-go: HWCR bit0=SMMLOCK——1=固件锁死SMM, SMI拦截
@@ -620,33 +557,8 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 #else
 	FlLog("CPUID伪装: 关闭(全真值直透传)");
 #endif
-#if GNPT_SVM_ALIGN
-	FlLog("SVM对齐形态: 拦截面=%s; R_INIT%s; "
-		"TSC补偿%s; 启动探针%s; NPT%s",
-		GNPT_ALIGN_BITS ?
-			"CPUID+MSR_PROT+VMRUN/VMMCALL最小集(异常拦截/指令族/"
-			"SHUTDOWN/INIT/INVLPGA/SMI全关)" :
-			"全集回加(+SHUTDOWN/INIT/INVLPGA+异常DB/MC/GP+指令族"
-			"VMLOAD/VMSAVE/CLGI/SKINIT, bb同款; CPUID位保留底盘)",
-		GNPT_RINIT ? "回加(发起核VM_CR.R_INIT=1写, #SX可见化)" :
-			"不写(参考实现同款)",
-		GNPT_TSC_CC ? "在位(TscOffset负向累计+跨核钳制)" :
-			"旁路(TscOffset恒0)",
-		(GNPT_SVM_ALIGN && GNPT_ALIGN_PROBES) ? "全停(bg底盘)" :
-			"回加(bb同款: 11条指令族#UD链+0x6E0+PMU万级自证)",
-		GNPT_ALIGN_TREES ? "单树(参考实现同款足迹)" : "四树");
-#endif
-#if GNPT_LBRVIRT
-	FlLog("LBR虚拟化: 按特性置位(世界切换硬件交换LBR寄存器组)");
-#else
-	FlLog("LBR虚拟化: 恒不置位(诊断形态, 世界切换无LBR硬件交换)");
-#endif
-#if GNPT_TAKE_CORES < 64
-	FlLog("诊断旋钮: GNPT_TAKE_CORES=%d(0=零接管对照, 1..63=前N核)", GNPT_TAKE_CORES);
-#endif
-	//故事面布防声明(位在各核SvmFillVmcb置; 0xB8值由特性门控现算=
-	//与特性行互证; 含#GP处置——SVM指令族#GP先于拦截位, Table 15-7)
-#if GNPT_STORY_MSR
+	//故事面布防声明(位在各核SvmFillVmcb置; 含#GP处置——SVM指令族
+	//#GP先于拦截位, Table 15-7)
 	FlLog("S1故事: SVM未激活——EFER读伪SVME=0/VM_CR伪0x18(BIOS锁死=第二"
 		"实例自拒)/HSAVE影子0; 指令族8条#UD+#GP手术; 0xB8 virt=0x%llX(%s%s%s)",
 		((g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL) |
@@ -655,16 +567,6 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		(g_svmFeatBits & SVM_FEAT_LBRVIRT) ? "LBR " : "",
 		(g_svmFeatBits & SVM_FEAT_IBSVIRT) ? "IBS " : "",
 		(g_svmFeatBits & SVM_FEAT_PMCVIRT) ? "PMC" : "");
-#else
-	FlLog("S1故事: 诊断形态——三MSR拦位全关(EFER/VM_CR/HSAVE直通零exit, "
-		"读回真值); 指令族8条#UD+#GP手术不变; 0xB8 virt=0x%llX(%s%s%s)",
-		((g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL) |
-		((g_svmFeatBits & SVM_FEAT_IBSVIRT) ? 4ULL : 0ULL) |
-		((g_svmFeatBits & SVM_FEAT_PMCVIRT) ? 8ULL : 0ULL),
-		(g_svmFeatBits & SVM_FEAT_LBRVIRT) ? "LBR " : "",
-		(g_svmFeatBits & SVM_FEAT_IBSVIRT) ? "IBS " : "",
-		(g_svmFeatBits & SVM_FEAT_PMCVIRT) ? "PMC" : "");
-#endif
 	if (svmState != 0)
 	{
 		FlLog("[Entry] SVM不可用(状态%u), 拒绝接管", svmState);
@@ -682,32 +584,22 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		FlLog("[Entry] NP=0(处理器无嵌套分页), 拒绝接管");
 		return STATUS_NOT_SUPPORTED;
 	}
-	//NPT四视图构建(静态共享树, 先于每核资源分配):
-	//P=常态 / HOOKS=常规驻留 / HIDE=TRANSPARENT潜伏 / EXEC=执行窗口
+	//NPT两视图构建(静态共享树, 先于每核资源分配):
+	//P=常态 / HOOKS=常规hook驻留
 	{
-		ULONG64 ncr3[GNPT_VIEW_COUNT] = { 0, 0, 0, 0 };
+		ULONG64 ncr3[GNPT_VIEW_COUNT] = { 0, 0 };
 		ULONG nptPages = 0;
 		ULONG64 nptCover = 0;
 		if (!SvmBuildNptViews(ncr3, &nptCover, &nptPages))
 		{
-			FlLog("[Entry] NPT四视图构建失败(内存不足?), 拒绝接管");
+			FlLog("[Entry] NPT两视图构建失败(内存不足?), 拒绝接管");
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
 		g_svmNcr3 = ncr3[GNPT_VIEW_PRIMARY];
-#if GNPT_NPT_ALIGN
-		(void)nptCover;    //对齐形态覆盖恒1TB(日志直书), 变量仅正式形态使用
-		FlLog("NPT: 对齐形态——PML4[0..1]两入口全2MB叶, 覆盖1TB, 无全空间"
-			"1GB大页层; %s共%u页; 四视图就绪 P=%llX HOOKS=%llX HIDE=%llX EXEC=%llX",
-			GNPT_ALIGN_TREES ? "单树(参考实现同款足迹)" : "四树回加(bb同款足迹)",
-			nptPages,
-			ncr3[GNPT_VIEW_PRIMARY], ncr3[GNPT_VIEW_SECONDARY],
-			ncr3[GNPT_VIEW_HIDE], ncr3[GNPT_VIEW_EXEC]);
-#else
-		FlLog("NPT: 四视图就绪(%u页, 覆盖%lluGB+全空间1GB大页层, P=%llX HOOKS=%llX HIDE=%llX EXEC=%llX)",
-			nptPages, nptCover >> 30,
-			ncr3[GNPT_VIEW_PRIMARY], ncr3[GNPT_VIEW_SECONDARY],
-			ncr3[GNPT_VIEW_HIDE], ncr3[GNPT_VIEW_EXEC]);
-#endif
+		FlLog("NPT: PML4[0]全2MB叶覆盖%lluGB+高区1GB叶全空间; 共%u页; "
+			"两视图就绪 P=%llX HOOKS=%llX",
+			nptCover >> 30, nptPages,
+			ncr3[GNPT_VIEW_PRIMARY], ncr3[GNPT_VIEW_SECONDARY]);
 	}
 	//每核资源预分配(VMCB/HSAVE 4KB, IOPM 12KB, MSRPM 8KB, VMM栈16KB)
 	for (ULONG i = 0; i < cpuCount; i++)
@@ -743,16 +635,10 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	//NPT自我隐蔽: 全部核资源已分配+零核launch(此刻本线程纯裸机
 	//root态=写NPT页直访物理自免疫); 首核launch后guest态动态写须走
 	//vmmcall root原语(见svm.h功能码注释)。失败=无隐蔽(非致命, 记日志)
-	//变体门: 隐蔽面=全功能(0)/裸隐蔽(2)/隐蔽+MSR(5)/隐蔽+hook(6)/
-	//机制轮(8)/CPUID决策轮(9/10)
-#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 2 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 8 || GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10 || GNPT_M92_VARIANT == 11
 	if (!SvmNptConcealAll())
 	{
 		FlLog("[Entry] 自我隐蔽失败(内存不足?), 无隐蔽继续(功能不受影响)");
 	}
-#else
-	FlLog("[Entry] M9.2鉴别: 自我隐蔽停用(本轮无零页改译)");
-#endif
 	//每核发起线程
 	ULONG created = 0;
 	for (ULONG i = 0; i < cpuCount; i++)
@@ -888,22 +774,12 @@ static VOID SvmStoryMsrHandle(PVMCB vmcb, ULONG cpu, ULONG32 msr, BOOLEAN isWrit
 	if (isWrite)
 	{
 		ULONG64 val = (ULONG64)(ULONG)Regs->rax | ((ULONG64)(ULONG)Regs->rdx << 32);
+#if DBG
 		InterlockedIncrement64(&g_svmStoryWr[idx]);
+#endif
 		if (msr == MSR_EFER)
 		{
 			vmcb->State.Efer = val | EFER_SVME;    //强制SVME=1; 只写VMCB(guest权威态)
-#if GNPT_STORY_TRAP
-			//读者陷阱: SVME=1的运行时写=SVM启动尝试(探针写回恒
-			//SVME=0不误触)。C4#1死亡前奏=EFER写×2→16秒轮询→静默
-			//复位。武装本核故事面临时收敛——后续EFER读回显值/
-			//VM_CR读回真值, 读者协议可推进(其VMRUN必经0x80拦截
-			//=全程可见), 试图免死+完整观察
-			if (val & EFER_SVME)
-			{
-				InterlockedOr(&g_svmTrapMask, 1UL << (cpu & 31));
-				FlRingPush('T', cpu, 1, val, 0, 0);
-			}
-#endif
 		}
 		else if (msr == MSR_VM_CR)
 		{
@@ -916,27 +792,17 @@ static VOID SvmStoryMsrHandle(PVMCB vmcb, ULONG cpu, ULONG32 msr, BOOLEAN isWrit
 	}
 	else
 	{
+#if DBG
 		InterlockedIncrement64(&g_svmStoryRd[idx]);
+#endif
 		ULONG64 val;
 		if (msr == MSR_EFER)
 		{
 			val = vmcb->State.Efer & ~EFER_SVME;      //伪造SVME=0(裸机Windows形态)
-#if GNPT_STORY_TRAP
-			if (g_svmTrapMask & (1UL << (cpu & 31)))
-			{
-				val = vmcb->State.Efer;    //陷阱核: 回显guest权威值(SVME=1)
-			}
-#endif
 		}
 		else if (msr == MSR_VM_CR)
 		{
 			val = VM_CR_LOCK | VM_CR_SVMDIS;          //0x18: "BIOS锁死"故事
-#if GNPT_STORY_TRAP
-			if (g_svmTrapMask & (1UL << (cpu & 31)))
-			{
-				val = __readmsr(MSR_VM_CR);    //陷阱核: 回真值(SVM允许), 与SVME=1自洽
-			}
-#endif
 		}
 		else
 		{
@@ -1019,8 +885,16 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 	FlRingExit(cpu, (ULONG)exitCode, vmcb->State.Rip, vmcb->Control.ExitInfo1);
 	//单步窗口泄漏防御: armed而guest TF已失=窗口死亡
 	//(步进指令为syscall/sysret/iret类清TF指令, #DB永不到达)→
-	//拦截位+EXEC视图永久泄漏=全系统pushf/popf风暴+guest破坏
+	//拦截位永久泄漏=全系统pushf/popf风暴+guest破坏
 	GnptHookStepLeakCheck(vmcb, cpu);
+	//MOV DR拦截(0x20-0x3F, Table C-1: [4]=方向0读/1写, [3:0]=DR号)
+	//→hook.c影子仿真(guest读写只到影子, 硬件DR/VMCB.Dr6/7不受
+	//guest触碰)。拦截位=VMCB静态置位, 到达即本case
+	if (exitCode >= 0x20 && exitCode < 0x40)
+	{
+		GnptHookDrMovExit(vmcb, cpu, Regs, (ULONG)exitCode);
+		return 0;
+	}
 	switch ((ULONG)exitCode)
 	{
 		case SVM_EXIT_VMMCALL:    //0x81: 探针/KEEP/STOP桥+签名门+root写原语族
@@ -1038,23 +912,18 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					func != GNPT_VMCALL_STOP && func != GNPT_VMCALL_NPTSYNC &&
 					func != GNPT_VMCALL_NPTSET && func != GNPT_VMCALL_NPTRES &&
 					func != GNPT_VMCALL_MSRBIT && func != GNPT_VMCALL_MEMCPY &&
-					func != GNPT_VMCALL_CONCEAL))
+					func != GNPT_VMCALL_CONCEAL && func != GNPT_VMCALL_DRSET))
 			{
-				static volatile LONG s_sigCnt[64] = { 0 };    //每核计数
-				LONG sn = InterlockedIncrement(&s_sigCnt[cpu & 63]);
-				if (sn == 1 || (sn & 0xFFF) == 0)    //首条+每4096条采样(防刷爆环)
-				{
+				//签名门拒绝采样(防刷爆环; Release构建零开销)
+				static volatile LONG s_sigCnt[64] = { 0 };
+				GNPT_CRUMB(s_sigCnt, 0xFFF, cpu,
 					FlRingPush('u', cpu, SVM_EXIT_VMMCALL, func,
-						vmcb->State.Cs.Selector, 0);
-				}
+						vmcb->State.Cs.Selector, 0));
 				//EVENTINJ注入#UD: TYPE=3(异常) vector=6 无错误码
 				vmcb->Control.EventInj = EVENTINJ_MAKE(6, EVENTINJ_TYPE_EXCP, 0, 0);
 				static volatile LONG s_udCnt[64] = { 0 };
-				LONG un = InterlockedIncrement(&s_udCnt[cpu & 63]);
-				if (un == 1 || (un & 0xFFF) == 0)
-				{
-					FlRingPush('B', cpu, SVM_EXIT_VMMCALL, vmcb->State.Rip, 0, 0);
-				}
+				GNPT_CRUMB(s_udCnt, 0xFFF, cpu,
+					FlRingPush('B', cpu, SVM_EXIT_VMMCALL, vmcb->State.Rip, 0, 0));
 				return 0;    //不推RIP(fault语义)
 			}
 			switch (func)
@@ -1079,11 +948,29 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					Regs->r11 = vmcb->State.Rip;
 					Regs->rax = vmcb->State.Rax;
 					return 1;
-				case GNPT_VMCALL_NPTSYNC:    //NPT改动TLB同步: 下轮vmrun冲净本guest全部翻译
-					vmcb->Control.TlbControl = 3;
+				case GNPT_VMCALL_NPTSYNC:    //NPT改动TLB同步: 下轮vmrun冲净全部翻译
+				{
+					//同页"+0取原始字节(push rbx执行)+2取CodePage补丁
+					//字节(add[rax],al写只读页→0x50)"的取指中途翻转已
+					//收口: 根因=Zen op-cache(线性标记译码缓存)陈旧项跨arm
+					//存活: ①CPUID序列化被证伪(序列化只保证指令流有序,
+					//不无效化译码缓存条目; 全核'i'环确认执行仍复发);
+					//②陈旧项来源=轮间卸载窗口的无hook期自然流量持续刷新
+					//原始译码项, arm时的同步必须把它当作"必然存在"处置。
+					//修复: ①TlbControl 3→1: 全TLB冲净(含他ASID/host条目);
+					//②root态WBINVD: APM明文"invalidates internal caches"
+					//=L1I/L1D/L2/op-cache全无效化(写回脏行零数据损失,
+					//且自身序列化)——译码缓存唯一的文档化软件无效化
+					//手段(NPT改译无内存写, SMC检测永不触发, 别无他途)。
+					//op-cache命中绕过TLB行走=NX翻译拦不住, 故必须真冲。
+					//成本=每核一次全缓存写回+无效化(~百µs级), install/
+					//remove频度可接受; INVD(丢脏行)绝对禁止
+					vmcb->Control.TlbControl = 1;
+					__wbinvd();    //全缓存无效化: op-cache含
 					FlRingPush('i', cpu, GNPT_VMCALL_NPTSYNC, 0, 0, 0);    //每核同步确认(触发链面包屑)
 					SvmAdvanceRip(vmcb);
 					return 0;
+				}
 				case GNPT_VMCALL_NPTSET:    //root写原语: 视图PTE(隐蔽后动态写唯一正道)
 				{
 					SvmNptRootCtxMark(TRUE);    //现场拆分只许arena槽切取
@@ -1094,7 +981,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					SvmAdvanceRip(vmcb);
 					return 0;
 				}
-				case GNPT_VMCALL_NPTRES:    //root恢复原语: 单树(0-3)/四树(0xF)恒等
+				case GNPT_VMCALL_NPTRES:    //root恢复原语: 单树(0/1)/全树(0xF)恒等
 				{
 					ULONG vw = (ULONG)arg2 & 0xF;
 					SvmNptRootCtxMark(TRUE);    //未拆分区恢复=现场拆分, 同上限
@@ -1127,7 +1014,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					SvmAdvanceRip(vmcb);
 					return 0;
 				}
-				case GNPT_VMCALL_CONCEAL:    //运行期工件隐蔽: 身份PTE四视图零页
+				case GNPT_VMCALL_CONCEAL:    //运行期工件隐蔽: 身份PTE两视图零页
 				{
 					SvmNptRootCtxMark(TRUE);
 					BOOLEAN ok = SvmNptConcealPageRuntime(arg1);
@@ -1136,6 +1023,21 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 						ok ? 1 : 0, (ULONG64)SvmNptConcealCount());
 					vmcb->State.Rax = ok ? 1 : 0;
 					Regs->rax = vmcb->State.Rax;
+					SvmAdvanceRip(vmcb);
+					return 0;
+				}
+				case GNPT_VMCALL_DRSET:    //DR-TRANSPARENT武装/解除(每核root态)
+				{
+					//机件契约: arg1=slot(bit0-1)|on(bit8), arg2=入口
+					//线性地址(on=1)。DR0-3不在VMCB=本核root态
+					//__writedr直写(跨VMRUN持续); Dr7=VMCB guest state。
+					//guest优先租用制: 被guest占用(影子DR7启用)的槽
+					//让位(该核fail-open), guest释放时经MOV DR7合并
+					//路径自动重武装(hook.c)
+					GnptHookDrArmCore(vmcb, cpu, (ULONG)(arg1 & 3),
+						(arg1 & 0x100) != 0, arg2);
+					FlRingPush('g', cpu, (ULONG)arg1, arg2,
+						vmcb->State.Dr7, 0);
 					SvmAdvanceRip(vmcb);
 					return 0;
 				}
@@ -1165,17 +1067,14 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			//guest内SVME=1硬件照常执行=行为差; 显式拦截+注入=完整
 			//裸机故事(与EFER读伪造SVME=0互证)。EVENTINJ注入不经
 			//拦截检查(§15.20), #UD直达guest IDT=与裸机#UD同路; fault
-			//语义不推RIP。'v'环: 首条+每4096条采样(预期个位数)
+			//语义不推RIP。'v'环采样(预期个位数; Release构建零开销)
 		{
 			static volatile LONG s_svmUdCnt[64] = { 0 };
-			LONG vn = InterlockedIncrement(&s_svmUdCnt[cpu & 63]);
-			if (vn == 1 || (vn & 0xFFF) == 0)
-			{
-				FlRingPush('v', cpu, (ULONG)exitCode, vmcb->State.Rip, 0, 0);
-			}
+			GNPT_CRUMB(s_svmUdCnt, 0xFFF, cpu,
+				FlRingPush('v', cpu, (ULONG)exitCode, vmcb->State.Rip, 0, 0));
+		}
 			vmcb->Control.EventInj = EVENTINJ_MAKE(6, EVENTINJ_TYPE_EXCP, 0, 0);
 			return 0;
-		}
 		case SVM_EXIT_EXCP_GP:    //0x4D: #GP拦截处置(手术转换)
 		{
 			//Table 15-7(§15.9): SVM指令族"Checks exceptions(#GP) before
@@ -1202,24 +1101,25 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				}
 			}
 			static volatile LONG s_gpCnt[64] = { 0 };
-			LONG gn = InterlockedIncrement(&s_gpCnt[cpu & 63]);
-			if (gn == 1 || (gn & 0xFFF) == 0)
-			{
+			GNPT_CRUMB(s_gpCnt, 0xFFF, cpu,
 				FlRingPush('G', cpu, SVM_EXIT_EXCP_GP, rip,
-					(ULONG64)(ULONG)family, 0);
-			}
-			if (family)
-			{
-				InterlockedIncrement64(&g_svmGpUdConv);
-				vmcb->Control.EventInj = EVENTINJ_MAKE(6, EVENTINJ_TYPE_EXCP, 0, 0);
-			}
-			else
-			{
-				InterlockedIncrement64(&g_svmGpReinj);
-				vmcb->Control.EventInj = EVENTINJ_MAKE(13, EVENTINJ_TYPE_EXCP,
-					1, vmcb->Control.ExitInfo1);    //忠实回注(错误码=EXITINFO1)
-			}
-			return 0;    //fault语义不推RIP(#GP/#UD皆指向引发指令)
+					(ULONG64)(ULONG)family, 0));
+		if (family)
+		{
+#if DBG
+			InterlockedIncrement64(&g_svmGpUdConv);
+#endif
+			vmcb->Control.EventInj = EVENTINJ_MAKE(6, EVENTINJ_TYPE_EXCP, 0, 0);
+		}
+		else
+		{
+#if DBG
+			InterlockedIncrement64(&g_svmGpReinj);
+#endif
+			vmcb->Control.EventInj = EVENTINJ_MAKE(13, EVENTINJ_TYPE_EXCP,
+				1, vmcb->Control.ExitInfo1);    //忠实回注(错误码=EXITINFO1)
+		}
+		return 0;    //fault语义不推RIP(#GP/#UD皆指向引发指令)
 		}
 		case SVM_EXIT_CPUID:    //0x72: 真值打底+伪装位修整(裸机等价校准)
 		{
@@ -1266,15 +1166,11 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			//(位图竞态/范围外MSR自动exit)→真值回放=裸机等价
 			ULONG32 msr = (ULONG32)Regs->rcx;
 			BOOLEAN isWrite = ((vmcb->Control.ExitInfo1 & 1) != 0);
-			{
-				static volatile LONG s_msrCnt[64] = { 0 };
-				LONG mn = InterlockedIncrement(&s_msrCnt[cpu & 63]);
-				if (mn == 1 || (mn & 0xFFF) == 0)
-				{
-					FlRingPush('m', cpu, SVM_EXIT_MSR,
-						msr, (ULONG64)(ULONG)isWrite, (ULONG64)mn);
-				}
-			}
+			//'m'环采样(首条+每4096条; Release构建零开销)
+			static volatile LONG s_msrCnt[64] = { 0 };
+			GNPT_CRUMB(s_msrCnt, 0xFFF, cpu,
+				FlRingPush('m', cpu, SVM_EXIT_MSR, msr,
+					(ULONG64)(ULONG)isWrite, (ULONG64)gnCrumb));
 			//故事三MSR特判(引擎保留, 先于公共MSR API表——公共表对这些
 			//MSR的Install已被GnptMsrIsEngineReserved拒绝)
 			if (msr == MSR_EFER || msr == MSR_VM_CR || msr == MSR_VM_HSAVE_PA)
@@ -1339,10 +1235,12 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			//'N'环: a=faulting gpa(EXITINFO2) b=错误码(EXITINFO1) c=guest RIP;
 			//错误码位域: bit0 P/bit1 RW/bit2 US/bit3 RSV/bit4 ID(取指)/
 			//bit6 SS/bit32 终译fault/bit33 guest页表fault(§15.25.6)
-			//风暴探针: 同gpa连续32次=单发'F'全档转储(五事件: RIP/错误码/
-			//gpa + 易失GPR三组 + 指令字节(DecodeAssists) + VMCB的CR组),
-			//此后该核'N'静音(防行环溢出吞转储+保T1落盘窗口); vmrun
-			//重执行循环不動=行为不变劣(冻结形态与泄漏语义原样保留)
+			//风暴探针(仅Debug构建): 同gpa连续32次=单发'F'全档转储
+			//(五事件: RIP/错误码/gpa + 易失GPR三组 + 指令字节
+			//(DecodeAssists) + VMCB的CR组), 此后该核'N'静音(防行环
+			//溢出吞转储+保T1落盘窗口); vmrun重执行循环不动=行为
+			//不变劣(冻结形态与泄漏语义原样保留)
+#if DBG
 			{
 				ULONG64 stormGpa = vmcb->Control.ExitInfo2;
 				ULONG sc = cpu & 63;
@@ -1374,25 +1272,59 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 						vmcb->Control.ExitInfo1, vmcb->State.Rip);
 				}
 			}
+#endif
 			return 0;    //fault语义: 不推RIP(FlRingExit计数+限流兜底)
 		}
-		case SVM_EXIT_EXCP_DB:    //0x41: 单步窗口#DB认领(IDLE残余=吞)
+		case SVM_EXIT_EXCP_DB:    //0x41: #DB路由(窗口认领→DR位路由→残余甄别)
 		{
+			//路由顺序: ①单步机件窗口认领(我方注入TF的簿记收尾,
+			//  含同场B位的DrBpDbExit二级路由) ②DR位路由(hook.c:
+			//  guest断点/TF陷阱忠实投递=调试子系统裸机等价;
+			//  我方断点改道; 探测期让位) ③残余甄别(int1/ICEBP
+			//  软件陷阱忠实投递; 其余=我方簿记畸形的最后防线吞)
 			if (GnptHookStepDbExit(vmcb, cpu))
+			{
+				GnptHookDrBpDbExit(vmcb, cpu);
+				return 0;
+			}
+			if (GnptHookDrBpDbExit(vmcb, cpu))
 			{
 				return 0;
 			}
-			//IDLE残余#DB: 一律吞掉不注入。注入回guest无调试接手
-			//=0x1E; guest可见#DB=0x3B——
-			//#DB拦截常驻: 此处=最后一道网, 吞+清TF自愈。
-			//残留窗口位一并解除(LeakCheck已收口, 此为双保险)
-			static volatile LONG s_dbIdleCnt[64] = { 0 };
-			LONG dbn = InterlockedIncrement(&s_dbIdleCnt[cpu & 63]);
-			if (dbn == 1 || (dbn & 0xFF) == 0)
+			//残余#DB(无B无BS): 指令字节甄别后分流。
+			//int1(CD 01)/ICEBP(F1)源: 软件中断陷阱, DR6零位设置
+			//=唯一合法残余源(我方TF泄漏恒带BS→'a'路径, DR断点恒
+			//带B→位路由)。裸机语义=投递(R3: VEH收STATUS_SINGLE_STEP;
+			//R0: 原生KiDebugTrapOrFault)。旧"一律吞"形态=guest
+			//int1永不达=经典hypervisor指纹(ICEBP探针)。trap语义
+			//RIP已过指令, 不推; DR6不动(int1本就不置位);
+			//DecodeAssists缺席(特性=0)=字节数0, 回落吞路径
+			//(保守: 不确定的残余不投递——0x1E防护优先)
 			{
-				FlRingPush('D', cpu, SVM_EXIT_EXCP_DB,
-					vmcb->State.Rip, vmcb->State.Dr6, 0);
+				UCHAR nBytes = vmcb->Control.NumOfBytesFetched;
+				PUCHAR ib = vmcb->Control.GuestInstructionBytes;
+				if ((nBytes == 2 && ib[0] == 0xCD && ib[1] == 0x01) ||
+					(nBytes == 1 && ib[0] == 0xF1))
+				{
+					static volatile LONG s_i1Cnt[64] = { 0 };
+					GNPT_CRUMB(s_i1Cnt, 0xFF, cpu,
+						FlRingPush('a', cpu, (ULONG)SVM_EXIT_EXCP_DB,
+							vmcb->State.Rip, (ULONG64)nBytes, 0));
+					vmcb->Control.EventInj =
+						EVENTINJ_MAKE(1, EVENTINJ_TYPE_EXCP, 0, 0);
+					return 0;    //trap语义: 不推RIP
+				}
 			}
+			//真残余(无int1特征): 一律吞掉不注入。注入回guest无调试
+			//接手=0x1E; guest可见#DB=0x3B——
+			//#DB拦截常驻: 此处=最后防线, 吞+清TF自愈。
+			//残留窗口位一并解除(LeakCheck已收口, 此为双保险)
+			//'D'环在此形态=真异常信号(旧形态的常规IDLE流量已由
+			//'a'环的忠实投递承接)
+			static volatile LONG s_dbIdleCnt[64] = { 0 };
+			GNPT_CRUMB(s_dbIdleCnt, 0xFF, cpu,
+				FlRingPush('D', cpu, SVM_EXIT_EXCP_DB,
+					vmcb->State.Rip, vmcb->State.Dr6, 0));
 			vmcb->Control.InterceptMisc1 &= ~(INTERCEPT_PUSHF | INTERCEPT_POPF);
 			vmcb->State.Rflags &= ~(1ULL << 8);    //清残余TF(自愈终结churn)
 			return 0;    //不推RIP(trap语义RIP已下一条)
@@ -1483,47 +1415,44 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 static volatile LONG64 g_svmTscWm = 0;   //全局虚拟TSC水位(单调只升)
 ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 {
-	//exit窗口看门狗: 处置耗时超50ms(2000MHz档, rdtsc差>1e8)=
-	//'L'环留痕(exit窗口GIF=0, IPI/时钟中断悬挂窗口的量化证据)。
-	//入口统一判定=覆盖全部exit类型(含CPUID短路路径)。仅观测
-	//不干预——护栏数据先于任何处置变更, 下轮按数据定后续
+	//exit窗口看门狗探针(仅Debug构建): 处置耗时超50ms(2000MHz档,
+	//rdtsc差>1e8)='L'环留痕(exit窗口GIF=0, IPI/时钟中断悬挂窗口
+	//的量化证据)。入口统一判定=覆盖全部exit类型(含CPUID短路路径)。
+	//仅观测不干预——护栏数据先于任何处置变更
+#if DBG
 	{
 		ULONG64 wdNow = __rdtsc();
 		if (wdNow - Vcpu->WdTsc > 100000000ULL)
 		{
 			ULONG wdc = (ULONG)(UCHAR)Vcpu->CpuIndex & 63;
 			static volatile LONG s_wdCnt[64] = { 0 };
-			LONG wn = InterlockedIncrement(&s_wdCnt[wdc]);
-			if (wn == 1 || (wn & 0xFF) == 0)
-			{
+			GNPT_CRUMB(s_wdCnt, 0xFF, wdc,
 				FlRingPush('L', wdc, 0,
-					wdNow - Vcpu->WdTsc, (ULONG64)(ULONG)wn, 0);
-			}
+					wdNow - Vcpu->WdTsc, (ULONG64)gnCrumb, 0));
 		}
 	}
-	//CPUID exit短路于TSC壳(变体9/10的CPUID位启用时才可达)——
-	//不进T0/T1/扣除/水位/钳制(哨兵照常刷新, dispatch/观测/计数
-	//照常走)。原因: TSC补偿壳的水位/钳制与高频exit存在交互风险,
-	//绕过壳消除交互; exit成本(~1500周期)guest可见=CPUID自然
-	//延迟范围(100-3000)内; CPUID核滞后累计无界但下一非CPUID
-	//exit钳制前跳=单调安全方向, 高频期滞后率有界瞬态。
-#if GNPT_SVM_ALIGN && !GNPT_TSC_CC
-	//对齐形态(TSC旁路): 全部exit直通dispatch——无TSC补偿记账
-	//(TscOffset恒0=参考实现同款), 仅刷新停泊哨兵
-	g_svmLastExitTsc[(ULONG)(UCHAR)Vcpu->CpuIndex & 63] = __rdtsc();
-	return SvmExitDispatch(Vcpu, Regs);
 #endif
+	//CPUID exit短路于TSC壳——不进T0/T1/扣除/水位/钳制(哨兵照常
+	//刷新, dispatch/观测/计数照常走)。原因: TSC补偿壳的水位/钳制
+	//与高频exit存在交互风险, 绕过壳消除交互; exit成本(~1500周期)
+	//guest可见=CPUID自然延迟范围(100-3000)内; CPUID核滞后累计
+	//无界但下一非CPUID exit钳制前跳=单调安全方向, 高频期滞后率
+	//有界瞬态。
 	{
 		PVMCB vmcbFast = (PVMCB)Vcpu->VmcbVa;
 		if (vmcbFast->Control.ExitCode == SVM_EXIT_CPUID)
 		{
+#if DBG
 			g_svmLastExitTsc[(ULONG)(UCHAR)Vcpu->CpuIndex & 63] = __rdtsc();
+#endif
 			return SvmExitDispatch(Vcpu, Regs);
 		}
 	}
 	Vcpu->ExitTsc = __rdtsc();              //T0: root驻留起点
+#if DBG
 	g_svmLastExitTsc[(ULONG)(UCHAR)Vcpu->CpuIndex & 63] =
 		Vcpu->ExitTsc;                      //停泊哨兵刷新(核号取VCPU)
+#endif
 	ULONG stop = SvmExitDispatch(Vcpu, Regs);
 	if (stop == 0)
 	{

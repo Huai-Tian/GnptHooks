@@ -77,6 +77,23 @@ CmGetRflags PROC
     ret
 CmGetRflags ENDP
 
+;----- RFLAGS.TF置位(调试忠实性探针用; x64无MSVC intrinsic) -----
+;陷阱自动清TF=单步恰一条指令(架构语义), 无递归风险
+CmSetTF PROC
+    pushfq
+    or byte ptr [rsp+1], 1           ;RFLAGS bit8(TF)=第2字节bit0
+    popfq
+    ret
+CmSetTF ENDP
+
+;----- INT1软件陷阱(调试忠实性探针用; x64无MSVC intrinsic) -----
+;vector 1软件中断: DR6零位设置(trap类, RIP=指令后)——#DB路由
+;残余路径的int1甄别/忠实投递的验证载体(SEH捕获STATUS_SINGLE_STEP)
+CmInt1 PROC
+    int 1
+    ret
+CmInt1 ENDP
+
 ;----- GDTR/IDTR读取(10字节伪描述符: u16 limit + u64 base) -----
 CmGetGdtBase PROC
     sub rsp, 10h

@@ -192,8 +192,8 @@ typedef struct _GNPT_VCPU_SVM
 } GNPT_VCPU_SVM, *PGNPT_VCPU_SVM;
 
 extern GNPT_VCPU_SVM g_svmVcpu[64];
-extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; =实际接管数, 见GNPT_TAKE_CORES)
-extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(HB心跳检停泊)
+extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; =实际接管数, 诊断旋钮见GNPT_TAKE_CORES)
+extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(Debug构建HB心跳检停泊)
 
 //root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——仅虚拟化
 //核合法: 裸机核EFER.SVME=0→vmmcall=#UD→蓝屏(调用线程调度核不可控,
@@ -220,6 +220,8 @@ ULONG CmGetGdtLimit(VOID);
 ULONG64 CmGetIdtBase(VOID);     //sidt
 ULONG CmGetIdtLimit(VOID);
 ULONG64 CmGetRflags(VOID);     //pushfq全宽读取(VMCB.Rflags源; MSVC无x64对应intrinsics)
+VOID CmSetTF(VOID);            //置RFLAGS.TF(调试忠实性探针用; 单步陷阱自动清TF)
+VOID CmInt1(VOID);             //INT1软件陷阱(调试忠实性探针用; DR6零位=#DB残余路径甄别载体)
 //段attrib(12位=描述符55:52|47:40拼接, APM §15.5.1)由C侧直读GDT描述符
 //(svm.c: SvmGetSegAttrib)
 
@@ -243,13 +245,19 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 //IRQL上下文可安全调用, NPTSET/NPTRES/CONCEAL三case内置root上下文
 //标记, 块边界=拒绝由调用方fail-loud) ====
 #define GNPT_VMCALL_NPTSET 5   //写视图PTE: rdx=gpa r8=pa|(view<<48) r9=flags
-#define GNPT_VMCALL_NPTRES 6   //恢复恒等: rdx=gpa r8=view(0-3单树/0xF四树)
+#define GNPT_VMCALL_NPTRES 6   //恢复恒等: rdx=gpa r8=view(0/1单树/0xF全树)
 #define GNPT_VMCALL_MSRBIT 7   //全核MSRPM位操作: rdx=msr r8=(isWrite<<1)|set
 #define GNPT_VMCALL_MEMCPY 9   //root拷贝: rdx=dst r8=src r9=len(0<len≤4KB;
                                //  rax=1成功/0拒绝)。隐蔽生效后guest态直写
                                //  已隐蔽页=写fault, 须root代写
 #define GNPT_VMCALL_CONCEAL 12  //运行期工件隐蔽: rdx=pa(4KB对齐)→身份PTE
-                               //  四视图改译零页+挂靠登记表(rax=1/0)
+                               //  两视图改译零页+挂靠登记表(rax=1/0)
+#define GNPT_VMCALL_DRSET 13   //DR-TRANSPARENT武装/解除(每核root态,
+                               //  处置在hook.c的GnptHookDrArmCore——
+                               //  guest优先租用制): rdx=slot(bit0-1)|
+                               //  on(bit8) r8=入口线性地址(on=1)→
+                               //  __writedr(slot)+VMCB.Dr7合并置位;
+                               //  on=0→Dr7撤位('g'环逐核留痕)
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)

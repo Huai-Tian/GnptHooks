@@ -9,22 +9,24 @@
 //  DriverUnload -> 移除hook -> SvmShutdownAllCpus关停并释放资源
 //框架细节(资源分配/串行启动/互斥仲裁/内置隐藏/日志)全在svm.c,
 //使用者只需关心hook回调本身。API契约见hook.h头注释
+//
+//构建形态:
+//  Debug(DBG=1)  = 完整验证轮: 故事面自证探针+多hook验证序列+
+//                  MSR hook演示(结果落盘可判读)
+//  Release(DBG=0)= 纯引擎生命周期示例(接管->驻留->干净卸载;
+//                  demo层整体不编译——验证探针属调试功能,
+//                  仅Debug构建工作; 源码本身即用法参考)
 
-//demo目标(框架使用示例的两项扩展验证):
+#if DBG
+
+//demo目标(框架使用示例的验证轮):
 //  ①"SVM未激活"自洽故事面探针(DriverEntry内联): 三MSR读+EFER回写+
 //    SVM指令族11条逐条执行, 全走guest硬件路径=与真实探测器同型
-//  ②混装/多hook验证轮: TRANSPARENT与普通模式并存+逐核视图驻留普查
-//本文件仍=面向二次开发者的使用示例(demo层扩展, 引擎零改动):
-//  阶段A: 候选链装TRANSPARENT目标(候选三条件=冷+按名导出+可重定位;
-//    MmGetSystemRoutineAddress=真冷目标必存活; MmGetPhysicalMemory
-//    Ranges因prologue含相对call被[Reloc]拒, 留池作重定位安全门演示)
-//  阶段B 16核驻留普查: 普通模式N(KeInitializeDpc, Flags=0)与活T并存,
-//    逐核先T后N各触发一次并记Δ——(T增,N不增)=P/HIDE驻留,
-//    (T不增,N增)=HOOKS驻留, 双向拓扑一次取齐(不依赖预设驻留:
-//    钉单核的期望序会被自然流量先行占用); 核间1s隔=防普查自身
-//    打满tstorm桶(单次T触发≈百级exit×16连发会破1024/700ms桶)
-//候选纪律: 热探针筛选+自触发安全+非wait家族+同页防御跳过
-//(NPF引擎按TargetPa首匹配)。普通模式目标选Ke*普通内核函数
+//  ②多hook验证轮: TRANSPARENT(DR机件)与普通模式并存+触发+选择性移除
+//demo候选(阶段A): T目标=DR0-3线性断点(每核≤4), 原页恒等
+//    不动=读/写透明结构性成立; 触发=入口#DB改道跳板槽(每调用1 exit)
+//候选纪律: 按名导出+可重定位+同页防御跳过(NPF引擎按TargetPa首匹配;
+//DR断点按线性地址不受页约束)。普通模式目标选Ke*普通内核函数
 //(hook.h使用纪律5: PG不覆盖类)
 #define DEMO_T_MAX 2
 static PVOID g_demoT[DEMO_T_MAX];               //live TRANSPARENT目标(触发/移除键)
@@ -33,7 +35,7 @@ static volatile LONG64 g_demoTCall[DEMO_T_MAX]; //每hook独立计数槽(Context
 static BOOLEAN g_demoTFree[DEMO_T_MAX];         //触发返回值须ExFreePool收尾(逐候选契约)
 static PVOID g_demoN = NULL;                    //阶段B普通模式目标
 static volatile LONG64 g_demoNCall = 0;
-static volatile LONG64 g_demoColdCall = 0;     //冷靶计数槽
+static volatile LONG64 g_demoColdCall = 0;      //冷靶计数槽
 
 //冷靶(驱动本地): 普通模式hook对照目标——与热Ke*目标同构走
 //CodePage全链, 但页冷无自然流量=单变量隔离"热页"因素。
@@ -134,15 +136,17 @@ static VOID DemoFireT(ULONG idx)
 		idx + 1, g_demoTName[idx], retVal, g_demoTCall[idx]);
 }
 
-//自触发阶段B普通模式hook一次: KeInitializeDpc(栈上哑DPC对象=零
-//副作用; void返回值的CallOriginal余RAX被弃)
+//自触发阶段B普通模式hook一次: NtClose(NULL哑句柄=零副作用,
+//STATUS_INVALID_HANDLE返回值被弃)。目标选择: KeInitializeDpc已被
+//实证为PatchGuard监视集成员(0x109, P3逐位匹配——普通模式读透明
+//漏洞, NPT无X-only编码)→换NtClose(是否在PG集内未知——本demo即
+//实测oracle)
 static VOID DemoFireN(VOID)
 {
-	KDPC dummyDpc;
-	typedef VOID(*GNPT_DEMO_N_FN)(PVOID, PVOID, PVOID);
-	RtlZeroMemory(&dummyDpc, sizeof(dummyDpc));
-	((GNPT_DEMO_N_FN)g_demoN)(&dummyDpc, NULL, NULL);
-	FlLog("[MultiHook] N(KeInitializeDpc)触发: 累计=%lld", g_demoNCall);
+	typedef NTSTATUS(*GNPT_DEMO_N_FN)(HANDLE);
+	NTSTATUS r = ((GNPT_DEMO_N_FN)g_demoN)((HANDLE)0);
+	FlLog("[MultiHook] N(NtClose)触发: st=0x%X 累计=%lld",
+		(ULONG)r, g_demoNCall);
 }
 
 //注: 未按名导出的Nt系目标无SSDT兜底——x64内核不导出
@@ -351,48 +355,100 @@ static VOID DemoTscDeadlineProbe(VOID)
 	}
 }
 
-//PMU旁信道自证探针: guest组使能PMC0(事件0x76 unhalted clocks)→
-//清零→循环100次EFER读(每次=1个exit+root故事处置路径)→采样→
-//恢复原配置(窗口<1ms)。PMC虚拟化(VMCB 0xB8 bit3)生效=世界切换
-//交换guest/host寄存器组→root驻留指令进host组=guest读数≈循环
-//自身(万级); 泄漏=计数含100次exit的root路径(数十万+)。判读:
-//万级=隔离生效; 十万级以上=root泄漏。PCMVIRT特性缺席的平台
-//0xB8 bit3不可置=PMC面无法硬件关闭(平台边界, guest启用计数
-//可观测root指令量)→如实跳过。AMD PMC: PERFEVNTSEL_0=0xC0010000
-//PERF_CTR_0=0xC0010004(EN=bit22)
+//PMU旁信道状态报告探针(Demo构建): 本框架恒LBR-only(0xB8 bit0),
+//PMC virt永不使能(合置检查: 需AVIC/NMI virt配套)→PMC面=平台
+//边界(root驻留指令计数可经PMC观测=已知残余信道)。探针按特性
+//在场性如实报告并跳过——无隔离可自证, 不做测量(计数器未计数
+//≠隔离生效, 测量读数无论何值都无判读意义)。
+//未来若实现AVIC/VNMI配套并使能PMC virt, 恢复测量体:
+//guest组使能PMC0(事件0x76, PERFEVNTSEL_0=0xC0010000 EN=bit22,
+//PERF_CTR_0=0xC0010004)→清零→100次EFER读(每次=1 exit+root
+//处置)→采样→恢复。隔离生效=读数≈循环自身(万级); 泄漏=含
+//root路径(数十万级)
 static VOID DemoPmuProbe(VOID)
 {
-	ULONG code = 0;
+	//本框架恒LBR-only: IBS/PMC virt特性在场也不使能(合置检查:
+	//需AVIC/NMI virt配套, 置位=全核VMEXIT_INVALID)→PMC隔离
+	//永不生效, 探针无可自证面, 如实报平台边界跳过
 	if ((g_svmFeatBits & SVM_FEAT_PMCVIRT) == 0)
 	{
 		FlLog("[S4] PMU自证: PCMVIRT特性缺席(0xB8仅LBR), PMC面=平台边界"
 			"(无硬件隔离), 探针跳过");
 		return;
 	}
+	FlLog("[S4] PMU自证: PCMVIRT特性在场但本框架未使能(合置检查:"
+		"需AVIC/NMI virt配套), PMC面=平台边界(root驻留指令计数可经"
+		"PMC观测=已知残余信道), 探针跳过");
+}
+
+//======== 调试子系统忠实性自证探针(M15.4判据②验收) ========
+//以检测方视角(设TF/设DR断点/回读DR/发int1)验证"调试面=裸机
+//等价"——检测方的标准手法: 设TF观察#DB是否到达/设DR断点观察
+//是否触发/DR写读一致性/int1陷阱投递。任一失败=裸机不可能的
+//hypervisor指纹。
+//  ①TF单步: 置TF→下一指令trap→#DB必须投递(SEH捕获
+//    STATUS_SINGLE_STEP; 硬件陷阱时自动清TF=单步恰一条)
+//  ②自断点: DR0=本地函数+DR7使能→调用→#DB必须投递(fault形态)
+//  ③回读一致: DR0写后读=等值; DR7写1读回=0x401(bit10 RA1=
+//    裸机回读形态)
+//  ④INT1软件陷阱: int1指令→#DB必须投递(DR6零位设置=残余
+//    路径甄别形态; 旧"一律吞"形态=int1永不达=经典hypervisor
+//    指纹——ICEBP探针, R3侧VEH检测的标准手法, 内核侧以SEH
+//    等价验证)。
+//运行契约: 须在MultiHook开始前调用(②的靶函数此时未被hook=
+//零干扰; 本探针对DR0/DR7的占用经影子机件, 结束时DR7清零归还)
+static VOID DemoDebugFaithProbe(VOID)
+{
+	//①TF单步投递
+	BOOLEAN tfGot = FALSE;
+	ULONG64 tfExc = 0;
 	__try
 	{
-		ULONG64 selOrig = __readmsr(0xC0010000);
-		ULONG64 ctrOrig = __readmsr(0xC0010004);
-		__writemsr(0xC0010000, 0x76ULL | (1ULL << 22));    //事件0x76+EN
-		__writemsr(0xC0010004, 0);                          //计数器清零
-		volatile ULONG64 sink = 0;
-		ULONG64 efer = 0;
-		for (int i = 0; i < 100; i++)      //100次exit+root处置, 泄漏面
-		{
-			efer = __readmsr(MSR_EFER);
-			sink += efer;
-		}
-		ULONG64 cnt = __readmsr(0xC0010004);
-		__writemsr(0xC0010000, selOrig);   //恢复(系统perf配置归位)
-		__writemsr(0xC0010004, ctrOrig);
-		FlLog("[S4] PMU自证: PMC0=%llu(100次EFER读+循环; 万级=guest组"
-			"隔离生效, 十万级+=root泄漏), sink=%llu 已恢复原配置",
-			(unsigned long long)cnt, (unsigned long long)sink);
+		CmSetTF();    //置位后的ret指令即trap
 	}
-	__except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	__except (tfExc = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
 	{
-		FlLog("[S4] PMU自证: PMC访问异常%X(不可用形态), 跳过", code);
+		tfGot = TRUE;
 	}
+	FlLog("[DbgFaith] TF单步: 投递=%s(码%llX)——应OK且80000004"
+		"(STATUS_SINGLE_STEP=单步陷阱忠实投递)",
+		tfGot ? "OK" : "**FAIL**", (unsigned long long)tfExc);
+	//②自断点投递+③回读一致(DemoColdTargetFn此时未被hook=零干扰)
+	__writedr(0, (ULONG64)(ULONG_PTR)DemoColdTargetFn);
+	__writedr(7, 1);    //L0使能(R/W=LEN=00=仅执行1B)
+	ULONG64 rb0 = __readdr(0);
+	ULONG64 rb7 = __readdr(7);
+	BOOLEAN bpGot = FALSE;
+	ULONG64 bpExc = 0;
+	__try
+	{
+		(VOID)DemoColdTargetFn(1, 2, 3, 4);
+	}
+	__except (bpExc = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		bpGot = TRUE;
+	}
+	__writedr(7, 0);    //撤防
+	FlLog("[DbgFaith] 自断点: 投递=%s(码%llX 应80000004); "
+		"回读DR0=%llX(应%llX) DR7=%llX(应401=含bit10 RA1)",
+		bpGot ? "OK" : "**FAIL**", (unsigned long long)bpExc,
+		(unsigned long long)rb0,
+		(unsigned long long)(ULONG_PTR)DemoColdTargetFn,
+		(unsigned long long)rb7);
+	//④INT1软件陷阱投递(残余路径甄别: DR6无B无BS+指令字节=CD 01)
+	BOOLEAN i1Got = FALSE;
+	ULONG64 i1Exc = 0;
+	__try
+	{
+		CmInt1();
+	}
+	__except (i1Exc = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		i1Got = TRUE;
+	}
+	FlLog("[DbgFaith] INT1陷阱: 投递=%s(码%llX)——应OK且80000004"
+		"(int1软件陷阱经残余甄别忠实投递; 吞=int1指纹)",
+		i1Got ? "OK" : "**FAIL**", (unsigned long long)i1Exc);
 }
 
 static KEVENT g_demoSeqDone;
@@ -407,10 +463,11 @@ static VOID DemoMultiHookThread(PVOID Context)
 	iv.QuadPart = -5LL * 10000000LL;    //5s: 安装落定+sc-start窗口RPC突发消退
 	KeDelayExecutionThread(KernelMode, FALSE, &iv);
 
-	//======== 阶段A: TRANSPARENT目标(真冷单T存活至普查) ========
-	//wait族候选已剔除(运行期自然流量会打满tstorm脱落); MmGetPhys
-	//MemRanges prologue含相对call被[Reloc]拒(留池=重定位安全门演示);
-	//MmGetSystemRoutineAddress=真冷(热探针零NPF)+可重定位→必为T1
+	//======== 阶段A: TRANSPARENT目标(DR机件; 双T存活至普查) ========
+	//wait族候选已剔除(运行期自然流量高频, DR机件无热约束但日志面
+	//会被刷爆); MmGetPhysMemRanges prologue含相对call被[Reloc]拒
+	//(留池=重定位安全门演示); MmGetSystemRoutineAddress=可重定位
+	//真冷目标→必为T1
 	static const struct
 	{
 		PCWSTR      Name;
@@ -421,7 +478,6 @@ static VOID DemoMultiHookThread(PVOID Context)
 		{ L"MmGetPhysicalMemoryRanges",  "MmGetPhysicalMemoryRanges",  TRUE  },
 	};
 	ULONG tLive = 0;
-#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 3 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 7
 	for (ULONG c = 0; c < RTL_NUMBER_OF(cand) && tLive < DEMO_T_MAX; c++)
 	{
 		UNICODE_STRING name;
@@ -453,7 +509,7 @@ static VOID DemoMultiHookThread(PVOID Context)
 		h.Target = target;
 		h.Callback = DemoCountCallback;
 		h.Context = &g_demoTCall[tLive];    //独立计数槽
-		h.Flags = HOOK_TRANSPARENT;        //含250ms安装期热探针
+		h.Flags = HOOK_TRANSPARENT;         //DR机件(每核≤4)
 		NTSTATUS st = GnptHookInstall(&h);
 		FlLog("[MultiHook] 阶段A T%u候选%s(%p): %s",
 			tLive + 1, cand[c].Log, target,
@@ -473,7 +529,7 @@ static VOID DemoMultiHookThread(PVOID Context)
 	else
 	{
 		//双T并存格: 统一钉核1顺序触发(两槽各自独立增长=并存判据;
-		//每核单步窗口在两个hook条目间交替=多hook窗口机制验证);
+		//DR断点按线性地址各自独立=页粒度限制不存在)
 		//Install/Remove内置SvmPinVirtualizedCpus会还原亲和——触发段前重钉
 		KeSetSystemAffinityThread((KAFFINITY)1 << 1);
 		if (tLive >= 2)
@@ -483,13 +539,13 @@ static VOID DemoMultiHookThread(PVOID Context)
 			DemoFireT(0);
 			DemoFireT(1);
 			FlLog("[MultiHook] 阶段A: 双T并存触发完成(上四行两槽各自独立增长=并存判据)");
-			//选择性移除: 摘T1后双触发——T1槽冻结(恒等直通)+T2槽续增(仍活)
+			//选择性移除: 摘T1后双触发——T1槽冻结(原页恒等直通)+T2槽续增(仍活)
 			NTSTATUS rst = GnptHookRemove(g_demoT[0]);
 			FlLog("[MultiHook] 选择性Remove T1(%s): %s",
 				g_demoTName[0], NT_SUCCESS(rst) ? "OK" : "FAIL");
 			KeSetSystemAffinityThread((KAFFINITY)1 << 1);  //Remove内置钉核还原后再钉
 			DemoFireT(0);
-			FlLog("[MultiHook] T1已移除: 上行累计应冻结(调用=恒等直通)");
+			FlLog("[MultiHook] T1已移除: 上行累计应冻结(调用=原页恒等直通)");
 			DemoFireT(1);
 			FlLog("[MultiHook] T2对照: 上行累计应续增(选择性移除后仍活)");
 		}
@@ -500,23 +556,24 @@ static VOID DemoMultiHookThread(PVOID Context)
 			FlLog("[MultiHook] 阶段A: 单T(tLive=1), 双T格本轮无样本");
 		}
 	}
-#endif
-	//======== 阶段B: 混装拒绝纪律+模式切换链(T驻留→拒绝→T全撤→N接管) ========
+	//======== 阶段B: 并存格+冷热靶(T驻留→N接管→冷热靶) ========
+	//DR-TRANSPARENT契约: T(线性断点)与N(NPT视图)机制正交,
+	//T驻留期间N Install成功=并存验证; N=NtClose此时布防,
+	//④热靶改为触发验证
 	ULONG aIdx = (tLive >= 2) ? 1 : 0;    //仍活的T(移除后=T2; 单live=T1)
-#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 3 || GNPT_M92_VARIANT == 6 || GNPT_M92_VARIANT == 7
 	if (tLive >= 1)
 	{
 		UNICODE_STRING nName;
-		RtlInitUnicodeString(&nName, L"KeInitializeDpc");
+		RtlInitUnicodeString(&nName, L"NtClose");
 		g_demoN = MmGetSystemRoutineAddress(&nName);
 		if (g_demoN == NULL)
 		{
-			FlLog("[MultiHook] 阶段B: KeInitializeDpc解析失败, 本轮跳过");
+			FlLog("[MultiHook] 阶段B: NtClose解析失败, 本轮跳过");
 		}
 		else if ((ULONG_PTR)PAGE_ALIGN(g_demoN) ==
 			(ULONG_PTR)PAGE_ALIGN(g_demoT[aIdx]))
 		{
-			FlLog("[MultiHook] 阶段B: KeInitializeDpc与活T同页, 本轮跳过");
+			FlLog("[MultiHook] 阶段B: NtClose与活T同页, 本轮跳过");
 		}
 		else
 		{
@@ -524,45 +581,43 @@ static VOID DemoMultiHookThread(PVOID Context)
 			h.Target = g_demoN;
 			h.Callback = DemoCountCallback;
 			h.Context = &g_demoNCall;
-			h.Flags = 0;    //普通模式: Ke*普通内核函数(hook.h纪律5), 无热探针
-			//①混装拒绝格: T驻留期间N Install应被拒(两模式驻留视图
-			//互斥, 并存=互偷静默失效——fail-loud是唯一安全纪律)
+			h.Flags = 0;    //普通模式: Nt系syscall函数(hook.h纪律5)
+			//①并存格: T驻留时N Install——两机制无交集(线性断点×
+			//NPT视图), 应成功
 			NTSTATUS st = GnptHookInstall(&h);
-			FlLog("[MultiHook] 阶段B 混装拒绝格: T驻留时N Install→0x%X(%s)",
-				(ULONG)st, (st == STATUS_NOT_SUPPORTED) ?
-				"拒绝OK=纪律生效" : "异常(应拒绝, 见[Hook]行)");
+			FlLog("[MultiHook] 阶段B 并存格: T驻留时N Install→0x%X(%s)",
+				(ULONG)st, NT_SUCCESS(st) ?
+				"成功=正交并存(DR机件: 断点与视图无交集)" :
+				"失败(应成功, 见[Hook]行)");
 			//②撤除最后的活T(此前T1已在阶段A被选择性移除)
 			NTSTATUS rst = GnptHookRemove(g_demoT[aIdx]);
 			FlLog("[MultiHook] 阶段B 撤T: Remove %s→%s",
 				g_demoTName[aIdx], NT_SUCCESS(rst) ? "OK" : "FAIL");
-			//改钉未舞步核3(P驻留): 阶段A的T舞步把原驻核1/2留在
-			//HIDE/EXEC驻留态, N接管链若在其上执行则叠加"安装核
-			//非P驻留"变量; 钉3后布防→隐蔽→同步→触发全链单变量
-			KeSetSystemAffinityThread((KAFFINITY)1 << 3);
 			//③冷靶先行: 驱动本地冷页走普通模式+工件隐蔽全链(与热
 			//靶同构, 无热页自然流量)——绿则热靶再冻结=热页因素,
 			//冻则'J'面包屑+心跳st=定位阶段
-			GNPT_HOOK hc = { 0 };
-			hc.Target = DemoColdTargetFn;
-			hc.Callback = DemoCountCallback;
-			hc.Context = &g_demoColdCall;
-			st = GnptHookInstall(&hc);
-			FlLog("[MultiHook] 阶段B 冷靶接管(本地%u): %s(Flags=0)",
-				(ULONG)((ULONG_PTR)DemoColdTargetFn & 0xFFF),
-				NT_SUCCESS(st) ? "Install OK" : "FAIL(见[Hook]行)");
-			if (NT_SUCCESS(st))
+			KeSetSystemAffinityThread((KAFFINITY)1 << 3);
 			{
-				ULONG64 r = DemoColdTargetFn(0x1111111111111111ULL,
-					0x2222222222222222ULL, 0x3333333333333333ULL,
-					0x4444444444444444ULL);
-				FlLog("[MultiHook] 阶段B 冷靶触发: 返回=%llX 累计=%lld"
-					"(计数>0=普通模式全链路活)",
-					(unsigned long long)r, g_demoColdCall);
+				GNPT_HOOK hc = { 0 };
+				hc.Target = DemoColdTargetFn;
+				hc.Callback = DemoCountCallback;
+				hc.Context = &g_demoColdCall;
+				NTSTATUS cst = GnptHookInstall(&hc);
+				FlLog("[MultiHook] 阶段B 冷靶接管(本地%u): %s(Flags=0)",
+					(ULONG)((ULONG_PTR)DemoColdTargetFn & 0xFFF),
+					NT_SUCCESS(cst) ? "Install OK" : "FAIL(见[Hook]行)");
+				if (NT_SUCCESS(cst))
+				{
+					ULONG64 r = DemoColdTargetFn(0x1111111111111111ULL,
+						0x2222222222222222ULL, 0x3333333333333333ULL,
+						0x4444444444444444ULL);
+					FlLog("[MultiHook] 阶段B 冷靶触发: 返回=%llX 累计=%lld"
+						"(计数>0=普通模式全链路活)",
+						(unsigned long long)r, g_demoColdCall);
+				}
 			}
-			//④热靶接管: KeInitializeDpc(热Ke*页, 自然流量千次/秒级)
-			st = GnptHookInstall(&h);
-			FlLog("[MultiHook] 阶段B 热靶接管: KeInitializeDpc(%p): %s(Flags=0)",
-				g_demoN, NT_SUCCESS(st) ? "Install OK" : "FAIL(见[Hook]行)");
+			//④热靶触发: NtClose已在①布防(T驻留期间)——自然流量
+			//累计+自触发双验证(detour全链路活)
 			if (NT_SUCCESS(st))
 			{
 				DemoFireN();
@@ -583,15 +638,13 @@ static VOID DemoMultiHookThread(PVOID Context)
 			}
 		}
 	}
-#endif
 	KeSetSystemAffinityThread(allCpus);
 	FlLog("[MultiHook] 序列完成(tLive=%u): 残余hook交由卸载RemoveAll统一清理", tLive);
 	KeSetEvent(&g_demoSeqDone, IO_NO_INCREMENT, FALSE);
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-//启动多hook验证序列(旧单候选DemoHookInstall的升级替代; 变体门在
-//DemoMultiHookThread的阶段内, 门列表与旧函数一致)
+//启动多hook验证序列
 static VOID DemoMultiHookStart(VOID)
 {
 	KeInitializeEvent(&g_demoSeqDone, NotificationEvent, FALSE);
@@ -610,9 +663,9 @@ static VOID DemoMultiHookStart(VOID)
 	}
 }
 
-VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
+//demo层收尾(DriverUnload调用, 仅Debug构建有实体)
+static VOID DemoShutdown(VOID)
 {
-	UNREFERENCED_PARAMETER(pDriverObject);
 	//自触发线程收尾等待(有界: MSR 6s>3+3窗口; 多hook序列40s>
 	//5s落定+装卸/触发/移除全程~25s——防序列在途回调撞卸载)
 	if (g_demoMsrArmed)
@@ -634,6 +687,47 @@ VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
 	FlLog("[Unload] MultiHook总结: T1=%lld T2=%lld N=%lld, LSTAR读拦截=%lld次, 写拦截=%lld次",
 		g_demoTCall[0], g_demoTCall[1], g_demoNCall, g_demoRdmsr, g_demoWrmsr);
 	GnptMsrHookRemove(0xC0000082);
+}
+
+//demo层启动(DriverEntry调用, 仅Debug构建有实体)。
+//故事面探针先行(全功能立即自证, 独立于demo hook轮序列)。
+//仅虚拟化核安全: 拦截位是探针的防弹衣——裸核上STGI/SKINIT被
+//硬件真实执行(APM三人组#UD条件带SVML/DEV豁免, SKINIT特性位
+//在场时SVME=0不#UD), SKINIT=安全重初始化+跳转垃圾SLB=整机
+//复位(C0轮实锤)。零接管轮跳过; 有接管核时钉核0防线程迁移
+//落裸核
+static VOID DemoStart(VOID)
+{
+	if (g_svmVcpuCount == 0)
+	{
+		FlLog("[S1] 零接管对照: 故事面探针跳过(裸核SKINIT被硬件真实执行=复位)");
+	}
+	else
+	{
+		//KeSetSystemAffinityThread返回void(WDK无旧值可存):
+		//恢复亲和=重建全活跃核掩码
+		ULONG cpuTotal = KeQueryActiveProcessorCount(NULL);
+		KAFFINITY allAff = (cpuTotal >= 64) ? ~(KAFFINITY)0
+			: (((KAFFINITY)1 << cpuTotal) - 1);
+		KeSetSystemAffinityThread((KAFFINITY)1);
+		DemoStoryProbe();
+		DemoTscDeadlineProbe();
+		DemoPmuProbe();
+		DemoDebugFaithProbe();    //调试面忠实性(TF/自断点/回读/INT1)——须先于MultiHook(其阶段B将hook冷靶=②的零干扰前提)
+		KeSetSystemAffinityThread(allAff);
+	}
+	DemoMultiHookStart();
+	DemoMsrInstall();
+}
+
+#endif  //#if DBG——demo验证层结束(Release构建不编译)
+
+VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
+{
+	UNREFERENCED_PARAMETER(pDriverObject);
+#if DBG
+	DemoShutdown();    //demo收尾: 线程等待+总结+MSR hook移除
+#endif
 	//关停: 移除残余hook(引擎仍在位=在途回调安全完成)→全核去虚拟化→释放资源
 	GnptHookRemoveAll();
 	if (SvmShutdownAllCpus())
@@ -666,66 +760,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	//放行T2的Desktop镜像(加载窗口期已过)
 	FlMarkEntryDone();
 
-	//变体形态标识(横幅外第二证据, 防测错形态)
-#if GNPT_M92_VARIANT == 1
-	FlLog("[Entry] M9.2鉴别构建: 全停基座(隐蔽/hook/MSR全停; 引擎+哨兵+TSC钳制在位)");
-#elif GNPT_M92_VARIANT == 2
-	FlLog("[Entry] M9.2鉴别构建: 裸隐蔽(hook/MSR停)");
-#elif GNPT_M92_VARIANT == 3
-	FlLog("[Entry] M9.2鉴别构建: 裸hook(隐蔽/MSR停)");
-#elif GNPT_M92_VARIANT == 4
-	FlLog("[Entry] M9.2鉴别构建: 裸MSR(隐蔽/hook停)");
-#elif GNPT_M92_VARIANT == 5
-	FlLog("[Entry] M9.2鉴别构建: 隐蔽+MSR(hook停)——死亡时刻活跃面复刻");
-#elif GNPT_M92_VARIANT == 6
-	FlLog("[Entry] M9.2鉴别构建: 隐蔽+hook(MSR停)");
-#elif GNPT_M92_VARIANT == 7
-	FlLog("[Entry] M9.2鉴别构建: hook+MSR(隐蔽停)");
-#elif GNPT_M92_VARIANT == 9
-	FlLog("[Entry] M10.2决策轮: 全功能(v0.9y基线)+CPUID拦截回归(单变量)");
-#elif GNPT_M92_VARIANT == 10
-	FlLog("[Entry] M10.5细分轮: 全功能+CPUID拦截+CPUID exit绕过TSC壳(毒位裁决)");
-#endif
-
-	//接管成功, 安装演示hook。
+#if DBG
+	//接管成功, 安装演示hook(验证轮: 故事面探针+多hook序列+MSR hook)。
 	//目标解析=调用者责任(GNPT_HOOK.Target直接传函数指针, 无SSDT/
 	//名称定位器——与EPT型框架契约一致)
-	//变体门: hook面=全功能(0)/裸hook(3)/隐蔽+hook(6)/hook+MSR(7);
-	//序列线程沿用内层门语义, 线程恒启动
-	//故事面探针先行(全功能立即自证, 独立于demo hook轮序列)。
-	//仅虚拟化核安全: 拦截位是探针的防弹衣——裸核上STGI/SKINIT被
-	//硬件真实执行(APM三人组#UD条件带SVML/DEV豁免, SKINIT特性位
-	//在场时SVME=0不#UD), SKINIT=安全重初始化+跳转垃圾SLB=整机
-	//复位(C0轮实锤)。零接管轮跳过; 有接管核时钉核0防线程迁移
-	//落裸核
-	if (g_svmVcpuCount == 0)
-	{
-		FlLog("[S1] 零接管对照: 故事面探针跳过(裸核SKINIT被硬件真实执行=复位)");
-	}
-	else
-	{
-		//KeSetSystemAffinityThread返回void(WDK无旧值可存):
-		//恢复亲和=重建全活跃核掩码
-		ULONG cpuTotal = KeQueryActiveProcessorCount(NULL);
-		KAFFINITY allAff = (cpuTotal >= 64) ? ~(KAFFINITY)0
-			: (((KAFFINITY)1 << cpuTotal) - 1);
-		KeSetSystemAffinityThread((KAFFINITY)1);
-#if GNPT_SVM_ALIGN && GNPT_ALIGN_PROBES
-		//对齐形态(探针停用轮): 故事/PMU探针全停(无#UD注入链与
-		//额外exit源, 入口行为对齐参考实现=纯接管+驻留);
-		//ALIGN_PROBES=0(探针回加轮, 第五刀)=探针复活=bb同款启动
-		FlLog("[Entry] 对齐形态: 故事/PMU探针全停");
-#else
-		DemoStoryProbe();
-		DemoTscDeadlineProbe();
-		DemoPmuProbe();
-#endif
-		KeSetSystemAffinityThread(allAff);
-	}
-	DemoMultiHookStart();
-	//变体门: MSR面独立调用(全功能/裸MSR/隐蔽+MSR/hook+MSR/CPUID决策轮)
-#if GNPT_M92_VARIANT == 0 || GNPT_M92_VARIANT == 4 || GNPT_M92_VARIANT == 5 || GNPT_M92_VARIANT == 7 || GNPT_M92_VARIANT == 9 || GNPT_M92_VARIANT == 10
-	DemoMsrInstall();
+	DemoStart();
 #endif
 	FlLog("[Entry] 完成(%s)", GNPT_BUILD_TAG);
 	return STATUS_SUCCESS;

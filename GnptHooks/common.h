@@ -79,8 +79,9 @@ extern volatile LONG g_gnptParkedMask;
 #define GNPT_VMMCALL_SIG0 0x8F3C1D7A9E2B5461ULL
 #define GNPT_VMMCALL_SIG1 0x3A7C5E1F9B2D8467ULL
 
-//内部vmmcall功能码(后续功能预留, 当前未接线):
-//  10=TSC校准探针(空handler)  11=时钟布防  13=私有Host CR3 protect
+//内部vmmcall功能码总表见svm.h(已实现: STOP/KEEP/NPTSYNC/NPTSET/
+//NPTRES/MSRBIT/MEMCPY/CONCEAL/DRSET); 后续功能预留未接线:
+//  10=TSC校准探针(空handler)  11=时钟布防
 
 //当前虚拟化目标核(-1=未启动), 启动循环置位, 日志心跳读它
 extern volatile LONG g_gnptVcpuCpu;
@@ -122,14 +123,16 @@ typedef struct _GNPT_RING_ENTRY
 //  V=NPT视图切换采样(a=视图 b=每核计数) H=detour分发入口(a=目标)
 //  O=CallOriginal入口(a=重定位跳板) N=NPF留痕(rsn=0x400, a=gpa, b=错误码)
 //  h=hook命中采样(用户回调发出, rsn=Arg1低32位, a=命中计数) w=CallOriginal误用警告(非回调上下文)
-//  s=单步arm(rsn=用途1读透明/2临时RW/3REHIDE, a=hook条目, b=采样计数; 读透明链起点)
+//  s=单步arm(rsn=用途1读透明/2临时RW, a=hook条目, b=采样计数; 读透明链起点)
 //  e=单步#DB收尾(rsn=用途, a=0(BS=1 TF引发)/1(BS=0 Dr断点抢入), b=计数; 链终点)
 //  b=MSRBIT root位图原语(rsn=0x81, a=msr, b=op)
 //  n=NPT root原语(rsn=功能码5/6, a=gpa, b=pa|view或view, c=flags)
 //  m=MSR exit采样(rsn=0x7C, a=msr, b=读写1位, c=计数; 首条+每4096条)
 //  Z=自我隐蔽完成(rsn=0, a=零页pa, b=登记页数, c=页表页数; 一次)
 //  o=隐蔽页兜底恢复(rsn=0x400, a=隐蔽页pa, b=faulting gpa, c=累计次数)
-//  F=TRANSPARENT风暴自保护解除(rsn=0x400, a=目标, b=累计NPF数)
+//  F=NPF风暴五档转储(rsn=1-5档位: 1=RIP/错误码/gpa 2-3=易失GPR
+//    4=指令字节(DecodeAssists) 5=guest CR组; 同gpa连续32次单发,
+//    此后该核'N'静音)
 //  Y=复位类事件命中(rsn=exit码0x7F/0x63/0x52, a=RIP, b/c=Info; 随后
 //    0xDEADDEAD标记蓝屏——把无痕迹硬复位变成带dump可分析崩溃)
 //  P=pushf仿真(窗口内) p=popf仿真(窗口内)
@@ -149,6 +152,17 @@ typedef struct _GNPT_RING_ENTRY
 //  J=安装/移除阶段面包屑(cpu=阶段号, rsn=阶段号; 表见hook.c——
 //    冻结吞环尾时HB行st=字段仍能指示最后阶段)
 //  j=全核同步DPC跳过(rsn=NPTSYNC; 非in-guest核留痕)
+//  g=DR-TRANSPARENT武装/解除(rsn=DRSET, a=slot|on<<8, b=入口
+//    线性地址, c=VMCB.Dr7; 每核逐条——install/remove广播面包屑)
+//  y=DR断点改道采样(rsn=B位图, a=跳板槽RIP, b=计数; 首条+每
+//    4096条——TRANSPARENT触发链起点)
+//  q=MOV DR影子仿真采样(rsn=exit码0x20-0x3F, a=推进后RIP,
+//    b=计数, c=EXITINFO1; 首条+每1024条; rsn&0xF>7或4/5=#UD注入)
+//  a=guest #DB忠实投递(rsn=B位图|BS<<8|BD<<12, a=RIP, b=投递
+//    后影子DR6——guest单步/其断点/GD访问=裸机等价语义)
+//  f=DR hook探测期让位(rsn=1 guest单步中BP命中fail-open/
+//    2槽被guest占用跳过武装/3 guest断点同场冲突; a=RIP, b=计数
+//    ——让位审计面, 高频出现=探测者在场的信号)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -212,6 +226,11 @@ VOID FlWdDisarm(VOID);
 extern volatile LONG64 g_flWriteGuardTsc;   //护卫武装时刻(100ns单位)——超时未清=T1强制解除并补写
 extern GNPT_BLACKBOX g_flBlackBox;
 extern volatile LONG64 g_flWdTscPerSec;     //TSC频率(标定, 默认2GHz)
+//探针窗口写盘护卫(仅Debug构建有消费者): 置位期间T1停止ZwWriteFile
+//(事件照常入环), probe返回后补写
+extern volatile LONG g_flWriteGuard;
+//exit精确计数(仅Debug构建累加于FlRingExit): HB心跳/黑匣子/卸载总结读
+extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 #else
 //Release构建: 空操作宏——调用点连参数带格式串整体消失
 #define FlInit()
@@ -226,124 +245,51 @@ extern volatile LONG64 g_flWdTscPerSec;     //TSC频率(标定, 默认2GHz)
 #define FlWdDisarm()
 #endif
 
-//常驻全局(两种构建都在, svm.c无条件引用):
-//vmrun热轮询标志: vmrun前置1, 结果行落盘后清0(T1热模式毫秒级落盘)
+//===== 采样面包屑宏(Debug构建专用) =====
+//热路径观测点统一入口: 每核计数+首条/每Mod条采样入环(Mod=采样掩码,
+//0xFFF=每4096条)。Release构建整体消失(计数与入环皆无=调用点零开销)
+//——"调试功能仅在Debug构建工作"的机制化保证。Cnt=LONG[64]静态数组;
+//Push=入环表达式, 可引用gnCrumb(本次计数值)入载荷
+#if DBG
+#define GNPT_CRUMB(Cnt, Mod, Cpu, Push) do { \
+	LONG gnCrumb = InterlockedIncrement((Cnt) + ((Cpu) & 63)); \
+	if (gnCrumb == 1 || (gnCrumb & (Mod)) == 0) { Push; } \
+} while (0)
+#else
+#define GNPT_CRUMB(Cnt, Mod, Cpu, Push)
+#endif
+
+//vmrun热轮询标志(两种构建都在, svm.c无条件写): vmrun前置1,
+//结果行落盘后清0(T1热模式毫秒级落盘)
 extern volatile LONG g_flLaunchHot;
-//探针窗口写盘护卫: 置位期间T1停止ZwWriteFile(事件照常入环), probe返回后补写
-extern volatile LONG g_flWriteGuard;
-//exit精确计数: exit handler累加(HB心跳/黑匣子/卸载总结读取)
-extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9bt"
-//变体开关=开发期单变量鉴别脚手架(正式版恒0=全功能; 各变体仅控制
-//对应的演示面门, 引擎本体不变; 历史实验语义见开发文档, 不入代码):
-//0=全功能 1=全停 2=裸隐蔽 3=裸hook 4=裸MSR 5=隐蔽+MSR 6=隐蔽+hook
-//7=hook+MSR 8=机制轮 9=+CPUID拦截 10=+CPUID拦截且绕TSC壳 11=已移除
-//bn轮注: M14终局后恢复=0(全功能: hook/隐蔽/MSR面复活),
-//进入M13验收协议Step2(accel Full+视频30min, DWM判据)
-//bq轮注(A刀, M14.20): hook面冷窗单变量——VARIANT=0激活hook+自我
-//隐蔽, 其余面全留bp位(见下方各子开关); 冷刀矩阵第一刀
-//br轮注(B刀, M14.21): hook面已出罪——本刀=bo精确复刻减hook面
-//(VARIANT=1), 其余子开关全bo位(见下方); 非hook面七项联合单变量
-//bs轮注(C刀, M14.22): bo精确复刻(VARIANT=0+全bo位)确认杀手今日仍在
-//(两段协议), 兼作M3a配对/M3b剂量判别
-//bt轮注(M14.24法证修复): bs配置+Install布防/隐蔽改译后即刻全核
-//TLB同步(hook.c两处HookSyncAllCpus前移)——消灭conceal路径600ms
-//混合翻译窗口(0x3B蓝屏判例yhnflt的崩溃时点); Remove路径本就
-//restore→sync紧邻无窗口, 不动
-#define GNPT_M92_VARIANT 0
-//哨兵v2运行时开关(默认开; 0=关——纯引擎最小观测面场景)
+#define GNPT_BUILD_TAG "v0.9ce"
+
+//==================== 引擎配置开关(功能语义; 历史演进见开发文档) ====================
+//TRANSPARENT模式=DR机件(DR0-3线性地址执行断点作入口陷阱, 原页恒等
+//不动=读/写透明结构性成立, PG覆盖×热靶×长驻全兼容; 每次目标调用恰
+//1 exit; 零翻译翻转=op-cache类陈旧译码缺陷结构性缺席; 每核≤4个
+//(DR硬件数, 超出fail-loud), guest自身调试断点被MOV DR影子吸收
+//(同KVM/VMware调试影子语义)。机制详见hook.c的DR-TRANSPARENT机件节
+
+//每核DPC哨兵(崩溃取证, Debug构建): 1=挂死核检测+黑匣子蓝屏留证
 #define GNPT_DPC_SENTINEL 1
-//接管核数旋钮(诊断剂量轮脚手架, 正式版恒64=全核):
-//0=零接管对照(NPT+心跳+哨兵全套在位但零VMRUN) 1..63=只接管前N核
-//部分接管仅限纯引擎变体(svm.c设#error门): 全功能下hook布防/
-//root原语落裸核=蓝屏; 纯引擎下探针/故事面在裸核与接管核逐位一致
-//剂量旋钮本值=64: 全核终验形态——冷启窗口期全核+CPUID伪装
-//完整性唯一验收场(伪装面=接管核集合的函数, 部分接管形态下
-//裸核直通真值=无全核一致性可言); 纯冒烟无负载, 全核与低剂量
-//构建唯一差异=接管集合扩展到全部逻辑核
+
+//接管核数: 64=全核(正式值)。部分接管仅限纯引擎诊断形态(hook布防/
+//root原语落裸核=蓝屏, 低剂量轮须零hook零MSR面); 剂量敏感平台
+//可用低剂量构建做日常观测
 #define GNPT_TAKE_CORES 64
-//故事面读者陷阱(诊断轮): 1=guest写EFER.SVME=1(运行时无人合法做=
-//SVM启动尝试)时武装该核——EFER读改回显值/VM_CR读改回真值, 读者
-//协议可推进(其VMRUN必经0x80拦截=全程可见); 探针写回恒SVME=0不误触
-#define GNPT_STORY_TRAP 1
-//故事MSR拦位轮(诊断二分): 1=MSRPM布防EFER/VM_CR/HSAVE读写
-//双拦位(S1故事面=读伪造/写代写, 正式形态); 0=三MSR全直通
-//(位图空=硬件零exit, EFER读回真值SVME=1=故事破但引擎语义不变;
-//探针②RMW写真值无害——读到的就是真值)
-//br轮注(B刀): 1=bo位
-#define GNPT_STORY_MSR 1
-//LBR虚拟化轮(诊断二分): 1=LbrVirtEnable按特性置位(世界切换硬件
-//交换guest/host LBR寄存器组=root驻留分支不泄漏进guest, 正式形态);
-//0=恒不置位(LBR MSR对guest直通, 世界切换少一组硬件保存/恢复;
-//参考实现SimpleSvm/NoirVisor均不置0xB8任何位)。特性纯隐蔽性,
-//关闭零引擎语义变化
-//br轮注(B刀): 1=bo位
-#define GNPT_LBRVIRT 1
-//NPT对齐形态轮(诊断二分): 1=四棵树改参考实现形状——仅PML4[0..1]
-//两入口、全2MB叶、覆盖1TB(高MMIO窗在第二入口内); 0=正式形态
-//(PML4[0]512GB全2MB+PML4[1..511]全空间1GB大页层)。纯驻留期
-//(零exit)硬件持续访问的唯一引擎配置=活跃NPT形状, 本轮单变量
-//切换形状以观测平台敏感度
-//br轮注(B刀): 0=bo位(正式形状)
-#define GNPT_NPT_ALIGN 0
-//SVM对齐形态轮(诊断二分→转正底盘): 1=对齐底盘——与参考实现
-//同构的驻留基座(拦截面/VMCR/TSC/探针/树数全部由下方子开关
-//矩阵表达: 全1=bg最小对齐形态, 全0=正式形态全功能, 两极间
-//任意组合可表达)。0=正式形态旧代码路径(历史bl复活轮形态,
-//语义上与"底盘+全0子开关"等价)。VMCALL位为STOP桥生命线不可
-//砍(APM §15.9: 未拦截的VMMCALL在guest内#UD)。M14终局判定:
-//两形态安全性等价(九差异全出罪), 底盘=配置表达力超集,
-//转正默认=1(平台兼容面最大+回归粒度最细)
-#define GNPT_SVM_ALIGN 1
-//TSC补偿壳轮(诊断回加): 1=补偿壳在位(每exit负向累计TscOffset+
-//全局水位跨核钳制, 正式形态; RDTSC直通但硬件应用偏移=纯驻留期
-//持续在场的唯一VMCB字段); 0=旁路(直通dispatch, TscOffset恒0=
-//参考实现同款零跨核发散)。仅SVM_ALIGN形态下区分生效
-//br轮注(B刀): 1=bo位(补偿壳在位)
-#define GNPT_TSC_CC 1
-//INIT重定向轮(诊断回加): 1=启动时写VM_CR.R_INIT=1(外部INIT经
-//#SX可见化=观测面; 真MSR硬件状态, 纯驻留期持续在场); 0=不写
-//(外部INIT走原生路径=参考实现同款)。仅SVM_ALIGN形态下区分
-//br轮注(B刀): 1=bo位
-#define GNPT_RINIT 1
-//树数轮(诊断回加, 第四刀甲): 1=对齐形态仅建P树(其余视图NCR3
-//复制P, 页表足迹≈参考实现单树~4MB); 0=四树全建(P/HOOKS/HIDE/
-//EXEC各自NCR3, 足迹4×1027页≈16MB=bb同款; 无hook时树1-3纯驻留
-//足迹, 视图永不切换)。NPT形状已出罪(M14.2), 四树仍用对齐形状
-//=纯足迹单变量。仅SVM_ALIGN形态下区分
-//bq轮注(A刀): 0=四树——hook视图切换的硬依赖(单树形态下
-//SECONDARY/HIDE/EXEC改译无树可落); 已随A刀冷窗出罪
-//br轮注(B刀): 0=bo位(四树足迹保留=bo减hook面后的最接近形态)
-#define GNPT_ALIGN_TREES 0
-//拦截位全集轮(诊断回加, 第四刀乙): 1=对齐形态最小拦截面(CPUID+
-//MSR_PROT+VMRUN/VMMCALL, 异常拦截/指令族/SHUTDOWN/INIT/INVLPGA
-//全关); 0=控制区拦截位全集回加(Misc1+SHUTDOWN/INIT/INVLPGA,
-//异常+DB/MC/GP, Misc2+VMLOAD/VMSAVE/CLGI/SKINIT——bg/bb控制区
-//差异位; dispatch处置路径本就编译在内, 位回加即复活)。CPUID位
-//保留底盘(bg/bh/bi已出罪的流量画像)。仅SVM_ALIGN形态下区分
-//br轮注(B刀): 0=bo位
-#define GNPT_ALIGN_BITS 0
-//启动探针回加轮(诊断回加, 第五刀=终局刀): 1=对齐形态启动故事/
-//PMU探针全停(bg底盘); 0=探针回加(bb同款启动行为——DemoStory
-//Probe 11条SVM指令族#UD注入链+DemoTscDeadlineProbe 0x6E0探针
-//+DemoPmuProbe万级PMU自证, 启动期一次性; bg/bb差异清单最后一项)。
-//仅SVM_ALIGN形态下区分
-//br轮注(B刀): 0=bo位
-#define GNPT_ALIGN_PROBES 0
-//CPUID伪装轮: 1=置INTERCEPT_CPUID+handler伪装(Fn8000_0001
-//SVM位清零——固件级禁用形态, 与S1故事面VM_CR伪LOCK|SVMDIS自洽;
-//无签名leaf归零; maxleaf真值不收敛)。CPUID exit短路于TSC壳的
-//快路径恒在位(高频风暴不进补偿壳)。转正门槛=accel Full+视频
-//叠加三因子同场双绿(DWM判据), 门槛不过不交付
-//br轮注(B刀): 1=bo位
+
+//CPUID伪装: 1=置INTERCEPT_CPUID+handler伪装(Fn8000_0001 SVM位
+//清零=固件级禁用形态, 与VM_CR伪LOCK|SVMDIS读伪造自洽; 无签名
+//leaf归零; maxleaf真值不收敛)。伪装面=接管核集合的函数, 全核
+//形态是唯一完整伪装
 #define GNPT_CPUID_STEALTH 1
-//SMI拦截轮(诊断→修复候选): 1=置INTERCEPT_SMI+0x62处置(STGI手册
-//协议: SMI从root进SMM, 绕开guest态SMM/RSM=无痕复位轴)。
-//HWCR.SMMLOCK(bit0)=1时硬件忽略拦截(启动横幅读报go/no-go)
-//bl复活轮注: bb值=1(9600X上SMMLOCK=1硬件忽略=死位, 考古已
-//清白——回加以忠实复刻bb编译产物)
+
+//SMI拦截: 1=置INTERCEPT_SMI+0x62处置(STGI手册协议: SMI从root
+//进SMM, 绕开guest态SMM/RSM窗口)。HWCR.SMMLOCK=1时硬件忽略
+//(启动横幅读报go/no-go)
 #define GNPT_SMI_INTERCEPT 1
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 

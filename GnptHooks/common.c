@@ -8,10 +8,6 @@
 CHAR g_gnptBuildTag[24] = GNPT_BUILD_TAG;
 //launch热轮询标志(svm.c置位/清零)——Debug构建下T1据此进入1ms热节奏
 volatile LONG g_flLaunchHot = 0;
-//探针窗口写盘护卫(svm.c置位/清零)——Debug构建下T1护卫期间停写盘
-volatile LONG g_flWriteGuard = 0;
-//exit精确计数(exit handler无条件累加; Debug构建的HB/黑匣子/卸载总结读)
-volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX] = { 0 };
 
 #if DBG
 //==================== 文件日志(仅Debug构建编译) ====================
@@ -37,9 +33,14 @@ static volatile LONG g_flT1Seq = 0;       //Temp已写行游标(仅T1推进, FlL
 static LONG g_flT2Seq = 0;                //T2(Desktop)已写行游标(仅T2触碰)
 static volatile LONG g_flWriteFailsT1 = 0;
 static volatile LONG g_flWriteFailsT2 = 0;
-static volatile LONG g_flT1Lag = 0;     //FlLog等待T1落盘超时(500ms)累计次数
+static volatile LONG g_flT1Lag = 0;      //FlLog等待T1落盘超时(500ms)累计次数
 //护卫武装时刻(100ns单位)——超时未清=T1强制解除并补写
 volatile LONG64 g_flWriteGuardTsc = 0;
+//探针窗口写盘护卫(仅Debug构建有消费者): 置位期间T1停止ZwWriteFile
+//(事件照常入环), probe返回后补写
+volatile LONG g_flWriteGuard = 0;
+//exit精确计数(FlRingExit累加): HB心跳/黑匣子/卸载总结读
+volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX] = { 0 };
 
 //日志运行态标志: FlInit置1; Release构建本区整体不编译(#if DBG)
 volatile LONG g_flEnabled = 0;

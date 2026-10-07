@@ -1,18 +1,18 @@
 ﻿#include"npt.h"
 #include"svm.h"
 
-//==================== NPT实例状态(四棵静态共享树) ====================
+//==================== NPT实例状态(两棵静态共享树) ====================
 #define NPT_POOL_TAG        'MemN'          //中性池tag
 #define NPT_COVER_LIMIT     0x8000000000ULL //512GB覆盖上限(对齐资源分配界)
-//页表页数组容量: 4树×514 + 拆分PT页(自我隐蔽: 框架页聚簇后
-//~170个2MB区/树, 256拆分区上限覆盖+余量; 含arena块数上限)
+//页表页数组容量: 2树×514 + 拆分PT页(自我隐蔽: 框架页聚簇后
+//~90个2MB区/树, 256拆分区上限覆盖+余量; 含arena块数上限)
 #define NPT_MAX_PAGES       (1025 * GNPT_VIEW_COUNT + 1024 + 8)
 #define NPT_MAX_SPLITS      256             //每树最大拆分区数(2MB区)
 
 //页表页arena(自我隐蔽级联对策: 散池分配每页几乎独占一个2MB帧,
 //隐蔽登记拆该帧=登记数级联放大): 页表页从2MB连续块切槽, 同帧
-//第二页起零新拆分, 级联坍缩——2056树页+~700拆分PT页聚在~10个
-//2MB帧内(vs散池~2000帧)。块数: (2056+1024+8)/512≈7块, 给8块
+//第二页起零新拆分, 级联坍缩——两树~1030页+~350拆分PT页聚在
+//~3个2MB帧内(vs散池~1400帧)。块数: (1030+1024+8)/512≈5块, 给余量
 #define NPT_ARENA_BLOCKS    20
 #define NPT_ARENA_SLOTS     512             //2MB/PAGE_SIZE
 
@@ -27,16 +27,12 @@ typedef struct _NPT_TREE
 {
 	PULONG64  Pml4Va;
 	PULONG64  PdptVa;
-#if GNPT_NPT_ALIGN
-	PULONG64  PdVa[1024];     //PD页: 对齐形态两入口各512个(1TB全2MB叶)
-#else
 	PULONG64  PdVa[512];      //PD页: 每页覆盖1GB(512个2MB条目)
-#endif
 	ULONG64   Ncr3;
 	NPT_SPLIT Splits[NPT_MAX_SPLITS];
 } NPT_TREE, *PNPT_TREE;
 
-//树布局: [0]=P [1]=HOOKS [2]=HIDE [3]=EXEC(全核共享, 静态)
+//树布局: [0]=P [1]=HOOKS(全核共享, 静态)
 static NPT_TREE  g_nptTree[GNPT_VIEW_COUNT];
 static PVOID     g_nptPages[NPT_MAX_PAGES];
 static ULONG     g_nptPageCount = 0;
@@ -47,16 +43,15 @@ static PVOID     g_nptArena[NPT_ARENA_BLOCKS];
 static ULONG     g_nptArenaUsed = 0;         //已切槽bump(PASSIVE单线程)
 
 //==== 自我隐蔽登记 ====
-//零页: 四视图共享改译目标(guest物理扫描只见零)
+//零页: 两视图共享改译目标(guest物理扫描只见零)
 static PVOID     s_hideZeroVa = NULL;
 static ULONG64   s_hideZeroPa = 0;
 //登记表: 已改译零页的框架页gpa(驱动.data, 非隐蔽页, root/guest均
 //可读写); 改译循环与诊断API迭代它。
-//容量推导(bn轮溢出判例M14.17): 每核资源11页×最大64核=704 +
-//页表页上限NPT_MAX_PAGES(四树正式形状实测4100/理论上限5132)
-//+hook工件页(CodePage/跳板/拆分PT, 百级)≈6300 → 8192含余量;
-//旧值4096为单树时代估算(注释"~2900"), 四树正式形状+全核
-//VARIANT=0首跑即在页表页3964处撞顶(132+3964=4096精确吻合)
+//容量推导(历史教训: 页表页数必须计入容量, 溢出=登记静默丢失):
+//每核资源11页×最大64核=704 + 页表页上限NPT_MAX_PAGES(两树~3100/
+//理论上限3078) + hook工件页(CodePage/跳板/拆分PT, 百级)≈3900
+//→ 8192余量充足(四树时代实测4100页表页, 两树收缩后减半)
 #define NPT_CONCEAL_MAX     8192
 static ULONG64   s_concealPa[NPT_CONCEAL_MAX];
 static ULONG     s_concealCount = 0;
@@ -160,46 +155,6 @@ static BOOLEAN SvmNptBuildTree(PNPT_TREE Tree, ULONG64 Cover, ULONG64 MaxPhy)
 		return FALSE;
 	}
 	Tree->Pml4Va[0] = pa | NPT_PTE_FLAGS_INTER;    //顶层链接: PML4[0]→PDPT(缺此=全NPF活锁冻结)
-#if GNPT_NPT_ALIGN
-	//对齐形态: PML4[0..1]两入口, 每入口独立PDPT+512个PD页(全2MB叶),
-	//覆盖1TB——与参考实现同形状(高MMIO窗≈1.08TB在第二入口内);
-	//PML4[2..511]不链(P=0)。页数: 1+2+1024=1027/树(与正式形态1025
-	//同量级, 物理足迹不变, 形状为唯一变量)
-	{
-		PULONG64 pdpt2 = (PULONG64)SvmNptAllocPage(&pa);
-		if (pdpt2 == NULL)
-		{
-			return FALSE;
-		}
-		Tree->Pml4Va[1] = pa | NPT_PTE_FLAGS_INTER;
-		ULONG64 pdPages = Cover >> 30;    //1GB区数=PD页数(两入口合计)
-		if (pdPages > 1024)
-		{
-			pdPages = 1024;
-		}
-		for (ULONG64 i = 0; i < pdPages; i++)
-		{
-			Tree->PdVa[i] = (PULONG64)SvmNptAllocPage(&pa);
-			if (Tree->PdVa[i] == NULL)
-			{
-				return FALSE;
-			}
-			if (i < 512)
-			{
-				Tree->PdptVa[i] = pa | NPT_PTE_FLAGS_INTER;
-			}
-			else
-			{
-				pdpt2[i - 512] = pa | NPT_PTE_FLAGS_INTER;
-			}
-			ULONG64 base = i << 30;
-			for (ULONG64 k = 0; k < 512; k++)
-			{
-				Tree->PdVa[i][k] = (base + (k << 21)) | NPT_PTE_FLAGS_LEAF2MB;
-			}
-		}
-	}
-#else
 	ULONG64 pdPages = Cover >> 30;    //1GB区数=PD页数
 	for (ULONG64 i = 0; i < pdPages; i++)
 	{
@@ -238,12 +193,11 @@ static BOOLEAN SvmNptBuildTree(PNPT_TREE Tree, ULONG64 Cover, ULONG64 MaxPhy)
 			}
 		}
 	}
-#endif
 	Tree->Ncr3 = MmGetPhysicalAddress(Tree->Pml4Va).QuadPart;
 	return TRUE;
 }
 
-//==================== 构建(四棵共享) ====================
+//==================== 构建(两棵共享) ====================
 BOOLEAN SvmBuildNptViews(PULONG64 Ncr3Out,
 	PULONG64 CoverOut, PULONG PagesOut)
 {
@@ -262,36 +216,12 @@ BOOLEAN SvmBuildNptViews(PULONG64 Ncr3Out,
 		return TRUE;    //已构建(幂等)
 	}
 	ULONG64 cover = SvmNptComputeCoverage();
-#if GNPT_NPT_ALIGN
-	//对齐形态覆盖=1TB(两入口全2MB; 参考实现同款)。超MaxPhy截断
-	if (cover < 0x10000000000ULL && maxPhy >= 0x10000000000ULL)
-	{
-		cover = 0x10000000000ULL;
-	}
-	if (cover > maxPhy)
-	{
-		cover = maxPhy & ~(0x200000ULL - 1);
-	}
-#endif
 	if (cover == 0)
 	{
 		return FALSE;
 	}
 	for (ULONG t = 0; t < GNPT_VIEW_COUNT; t++)
 	{
-#if GNPT_SVM_ALIGN && GNPT_ALIGN_TREES
-		//对齐形态(单树轮): 仅建P树(活跃NCR3唯一指向; 其余视图
-		//NCR3复制P——无hook时视图永不切换), 页表足迹对齐参考实现
-		//单树; ALIGN_TREES=0(四树回加轮)=全建, 足迹复刻bb
-		if (t != 0)
-		{
-			if (Ncr3Out != NULL)
-			{
-				Ncr3Out[t] = g_nptTree[0].Ncr3;
-			}
-			continue;
-		}
-#endif
 		if (!SvmNptBuildTree(&g_nptTree[t], cover, maxPhy))
 		{
 			SvmFreeNpt();
@@ -303,10 +233,7 @@ BOOLEAN SvmBuildNptViews(PULONG64 Ncr3Out,
 	{
 		for (ULONG t = 0; t < GNPT_VIEW_COUNT; t++)
 		{
-			//单树轮(ALIGN_TREES=1): 四NCR3全=P树(仅建树0, 见上方
-			//构建循环); 四树回加轮(=0)=各自NCR3
-			Ncr3Out[t] = g_nptTree[
-				(GNPT_SVM_ALIGN && GNPT_ALIGN_TREES) ? 0 : t].Ncr3;
+			Ncr3Out[t] = g_nptTree[t].Ncr3;
 		}
 	}
 	if (CoverOut != NULL)
@@ -396,7 +323,7 @@ VOID SvmNptRestoreIdentity(ULONG View, ULONG64 Gpa)
 	SvmNptSetPte(View, Gpa, Gpa, NPT_PTE_FLAGS_LEAF4K_RWX);
 }
 
-//释放全部页表页(四棵)+arena块; 构建失败路径与卸载共用(幂等)
+//释放全部页表页(两棵)+arena块; 构建失败路径与卸载共用(幂等)
 VOID SvmFreeNpt(VOID)
 {
 	//arena块整体释放(页表页全在块内, 无独立释放)
@@ -473,7 +400,7 @@ ULONG64 SvmNptPeekPte(ULONG View, ULONG64 Gpa)
 	return pd[pdIdx];    //2MB大页条目
 }
 
-//'O'兜底(exit handler): faulting页已隐蔽(gpa∈登记表)→四树恢复
+//'O'兜底(exit handler): faulting页已隐蔽(gpa∈登记表)→两树恢复
 //恒等+计数+留痕。返回TRUE=已处置(重执行=访问自愈)
 BOOLEAN SvmNptConcealFaultFix(ULONG64 Gpa)
 {
@@ -556,7 +483,7 @@ BOOLEAN SvmNptConcealAll(VOID)
 			return FALSE;
 		}
 	}
-	//四树统一改译零页(P|US|A; RW=0=写fault, X=0=执行fault——
+	//两树统一改译零页(P|US|A; RW=0=写fault, X=0=执行fault——
 	//两路都进'O'兜底; 读=静默零)。改译的PTE写自身会拆分出新PT页
 	//(arena槽)——新页也是框架页, 须登记并改译, 迭代到不动点
 	//(arena聚簇使新PT页落在已拆分帧内, 收敛快)

@@ -30,17 +30,24 @@
 //     (PatchGuard/内核扫描器)读到的是CodePage跳转码, 对SSDT/
 //     系统服务等PG覆盖目标=0x109蓝屏(PG检查周期随机, 短浸泡
 //     不触发不代表安全)。高频且非PG覆盖的普通内核函数用Flags=0;
-//     PG覆盖目标用HOOK_TRANSPARENT(外部读=原始字节, 仅低频)。
-//     AMD NPT无exec-only权限位, 普通模式无免费读透明
-//  6. TRANSPARENT页热纪律: 布防是**页级**的——同页一切执行都走
-//     单步窗口(2 exit/指令), 且"页冷"是运行时性质(Nt体按字母序
-//     聚簇, 名字冷≠页冷; 页可运行中变热)。引擎双层防线: 安装期
-//     热探测(布防后实测250ms窗口, NPF超限=拒绝安装)+运行期速率
-//     脱落(≈700ms桶超限=自动解除布防, 'F'环留痕)。预算线≈页执行
-//     ≤5000次/s持续; 目标函数冷≠达标——页邻域实测说了算
-//  7. 模式互斥(混装拒绝): TRANSPARENT与普通模式的驻留视图体系
-//     不同, 并存时互相按核静默失效——任一模式驻留期间Install
-//     另一模式=拒绝(fail-loud); 全部Remove后方可换装
+//     **PG覆盖目标(含热靶)用HOOK_TRANSPARENT**——DR机件下原页
+//     恒等不动, 外部读恒=原始字节(结构性读透明, 零exit),
+//     PG覆盖×热页×长驻全兼容。AMD NPT无exec-only权限位=普通
+//     模式无免费读透明(架构边界, 非可修缺陷)
+//  6. TRANSPARENT容量与边界(DR机件): 每核≤4个(DR0-3硬件数,
+//     超出Install拒绝fail-loud); 断点=线性地址标记(同页多目标
+//     各自独立=页粒度限制不存在); 每次目标函数调用恰1 exit
+//     (热页无惩罚); **探测期让位(fail-open)**——guest调试活动
+//     (单步TF/自身断点/GD)期间被探测的hook对该次调用走原函数
+//     (裸机等价优先: 调试子系统必须"正常工作", 否则=可检出
+//     指纹), 监控回调在探测窗口内可能丢事件; guest占用的DR槽
+//     所在核上hook同样让位(guest释放后自动恢复)。DR0-3对guest
+//     可见面=影子(其断点真实可触发+回读一致, DR7回读恒含
+//     bit10 RA1=裸机形态)
+//  7. 模式并存: TRANSPARENT(DR线性断点)与普通模式(NPT视图)
+//     机制正交, 可同机并存(不同目标); 唯余约束=普通模式同页
+//     多hook的NPF首匹配边界(引擎按TargetPa首匹配, 同页第二
+//     个普通hook永不可达)。单写者契约见纪律8
 //  8. 单写者契约: Install/Remove/RemoveAll/Enumerate内部无锁
 //     (条目分配/隐蔽登记/树游标均为单写者设计), 调用方须自行
 //     串行化(专用工作线程或互斥); 并发调用=条目与登记表竞态
@@ -73,26 +80,29 @@ typedef struct _GNPT_HOOK
 	                          //>0时回调收StackArgs指针+CallOriginal
 	                          //自动转发; 超上限Install拒绝)
 	ULONG Flags;               //位0=HOOK_TRANSPARENT: 读透明模式
-	                          //(潜伏P=0+执行窗口翻转, PG/扫描器读
-	                          //=原始字节; 每指令2exit只适合低频
-	                          //目标; 见hook.c/npt.h)
+	                          //(DR0-3执行断点入口陷阱+原页恒等,
+	                          //外部读=原始字节, PG覆盖/热靶可用;
+	                          //每核≤4个, 见使用纪律6)
 } GNPT_HOOK, *PGNPT_HOOK;
 
 //hook模式标志(Flags位)
-#define HOOK_TRANSPARENT        0x1   //读透明: 每核S副本潜伏P=0,
-                                       //取指→执行窗口(#DB复位潜伏);
-                                       //外部读→切P读原始字节。
-                                       //低频目标专用(高频目标=每指令
-                                       //2exit风暴, 见使用纪律5)
+#define HOOK_TRANSPARENT        0x1   //读透明(DR机件): DRn=目标入口
+                                       //线性地址执行断点(仅执行1B),
+                                       //入口取指#DB fault→root改道
+                                       //RIP=跳板槽(等价补丁跳转);
+                                       //原页恒等原始字节=读/写透明
+                                       //结构性成立; 函数体自原页
+                                       //执行零exit
 
-//安装hook(PASSIVE_LEVEL, 引擎运行中): CodePage构建+多视图布防
-//+CodePage工件隐蔽(身份PTE四视图零页——guest物理扫描不可见)
-//+全核TLB同步(布防即刻生效)
+//安装hook(PASSIVE_LEVEL, 引擎运行中): TRANSPARENT=DR槽分配+全核
+//武装广播; 普通模式=CodePage构建+两视图布防+CodePage工件隐蔽
+//(身份PTE两视图零页——guest物理扫描不可见)+全核TLB同步
 NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook);
 
-//移除hook(PASSIVE_LEVEL): 布防PTE恒等还原+全核TLB同步→hook立即
-//失效; 随后root代写还原CodePage补丁字节+解除工件隐蔽(PFN复用
-//安全)。在途回调安全完成(槽/条目延迟到卸载释放)
+//移除hook(PASSIVE_LEVEL): TRANSPARENT=全核DR解除广播; 普通模式=
+//布防PTE恒等还原+全核TLB同步→hook立即失效; 随后root代写还原
+//CodePage补丁字节+解除工件隐蔽(PFN复用安全)。在途回调安全完成
+//(槽/条目延迟到卸载释放)
 NTSTATUS GnptHookRemove(PVOID Target);
 
 //枚举live hook(Buffer=NULL时*InOutCount返回数量; 容量不足=
@@ -126,5 +136,27 @@ BOOLEAN GnptHookStepEmuPopf(struct _VMCB* Vmcb, ULONG Cpu);
 //单步窗口泄漏防御收口: svm.c每exit首查——armed而guest TF
 //已失(清TF类指令使#DB永不到达)=拦截位+视图泄漏, 统一收尾
 VOID GnptHookStepLeakCheck(struct _VMCB* Vmcb, ULONG Cpu);
+
+//DR-TRANSPARENT机件(svm.c的0x41 case与0x20-0x3F(MOV DR拦截)入口)
+//  DbExit: #DB的DR6位路由+guest忠实投递——guest断点/TF陷阱=
+//  裸机等价投递(含影子DR6的B/BS位同步); 我方断点=改道跳板槽
+//  +清位(返回TRUE); 探测期(guest TF置位/断点同场)=让位该次
+//  调用(消费我方位+置RFLAGS.RF防重执行再触发断点=exit死循环;
+//  RF只压指令断点恰一指令, 不影响guest TF陷阱下exit投递)。
+//  可在单步机件收尾后调用(同场合并事件)
+//  MovExit: MOV DR仿真(guest优先租用制)——读=影子(DR7回读含
+//  bit10 RA1); 写DR0-3=仅影子(硬件装填延迟到DR7启用); 写DR7
+//  =合并重算(guest槽装填+我方槽自动重武装); GD=投递#DB(BD);
+//  DR4/5/8-15=注入#UD。恒返回TRUE
+BOOLEAN GnptHookDrBpDbExit(struct _VMCB* Vmcb, ULONG Cpu);
+BOOLEAN GnptHookDrMovExit(struct _VMCB* Vmcb, ULONG Cpu,
+	PGUEST_REGS Regs, ULONG ExitCode);
+//每核武装/解除(svm.c的DRSET case调用): guest占用槽=让位,
+//否则__writedr+VMCB.Dr7合并置位(仅执行1B)
+VOID GnptHookDrArmCore(struct _VMCB* Vmcb, ULONG Cpu, ULONG Slot,
+	BOOLEAN On, ULONG64 Addr);
+//每核DR影子初始化(svm.c的VMCB init DR卫生段调用): DR7影子
+//=裸机恒读值0x400(bit10 RA1)——guest读DR7零差异, 写读幂等
+VOID GnptHookDrShadowInit(ULONG Cpu);
 
 #endif // HOOK_H
