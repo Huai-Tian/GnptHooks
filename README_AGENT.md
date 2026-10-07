@@ -1,4 +1,4 @@
-# README_AGENT.md — AI 协作者契约文档 (v0.9bb 现状)
+# README_AGENT.md — AI 协作者契约文档 (v0.9ce 现状)
 
 > **本文档的读者是大语言模型 / 编码 Agent，不是人类。** 人类请阅读 [README.md](README.md) / [README_ZH.md](README_ZH.md)。
 >
@@ -54,7 +54,7 @@
 | bug = 蓝屏/冻结 | 没有用户态容错边界，一切以裸机正确性为准 |
 | 嵌套环境是开发形态 | VMware 嵌套 SVM 特性位失真；异常先物理机复现再定性（勿追鬼） |
 
-**当前版本 v0.9bb = M13 毕业（双物理平台收官）**：M0-M9 同前（引擎/双 NPT/单步/TRANSPARENT/TSC 补偿/MSR 面/自我隐蔽/三体竞态修复，v0.9y）；M10 CPUID 拦截裁决 + SSDT 终裁（425a2e8-5e1d2ae）；M11 自洽故事面 + 工件隐蔽 + API 收口 + 平台风险定案（v0.9ar, f50a881）+ 新平台双根因修复（v0.9au, ffd92b2）；**M12 第二平台杀手刻画**（剂量模型：全核 SVM 驻留消耗可恢复"额度"，静默复位/0x101 双外显，复位不清零、分钟-小时级恢复；C-state 与负载水平实验排除；vmload/vmsave 循环剥除 = CVE-2024-53114 预防性合规，v0.9az, eeadb66）；**M13 CPUID 伪装转正**（拦截位服务于隐蔽：Fn8000_0001 SVM 位清零/无签名 leaf 归零/maxleaf 真值；三步验证：低剂量冒烟+加速 Full 30min×2（两轮合计 1,015 次 exit 零异常）+全核 3003s 含任务管理器全核"虚拟化： 已禁用"一致性验收；GNPT_CPUID_STEALTH=1 为正式默认，v0.9ba）。**MSR API 竞态纪律见 msr.h 使用纪律第 5 条——隐蔽在场时置读拦截的 MSR 禁止写直通，违例 = 已定罪的 0x101 三体竞态**。
+**当前版本 v0.9ce = M15.4 毕业（DR-TRANSPARENT 转正 + 检测面甄别）**：M0-M9 同前（引擎/双 NPT/单步/TRANSPARENT/TSC 补偿/MSR 面/自我隐蔽/三体竞态修复，v0.9y）；M10 CPUID 拦截裁决 + SSDT 终裁（425a2e8-5e1d2ae）；M11 自洽故事面 + 工件隐蔽 + API 收口 + 平台风险定案（v0.9ar, f50a881）+ 新平台双根因修复（v0.9au, ffd92b2）；**M12 第二平台杀手刻画**（剂量模型：全核 SVM 驻留消耗可恢复"额度"，静默复位/0x101 双外显，复位不清零、分钟-小时级恢复；C-state 与负载水平实验排除；vmload/vmsave 循环剥除 = CVE-2024-53114 预防性合规，v0.9az, eeadb66）；**M13 CPUID 伪装转正**（拦截位服务于隐蔽：Fn8000_0001 SVM 位清零/无签名 leaf 归零/maxleaf 真值；三步验证：低剂量冒烟+加速 Full 30min×2（两轮合计 1,015 次 exit 零异常）+全核 3003s 含任务管理器全核"虚拟化： 已禁用"一致性验收；GNPT_CPUID_STEALTH=1 为正式默认，v0.9ba）；**M14 死亡四实体法证闭环**（PatchGuard 0x109 定罪 + op-cache 陈旧译码定罪，WBINVD 收口双绿，v0.9bx）；**M15 DR-TRANSPARENT 转正**（DR0-3 线性断点入口陷阱 = 结构性读/写透明 + 每调用恰 1 exit + guest 优先 DR 租用制；M15.3 大清理：P=0 舞步退役/四视图收缩两视图/探针 Debug-only 机制化；M15.4 检测面甄别：公开检测文献 11 向量三分法判读（真实已防/普通模式已知边界/臆想不防），LBR virt 复位 + int1/ICEBP 忠实投递 + 探测期让位置 RF + MOV DR 读路径 RAX 写回，调试面四探针（TF/自断点/DR 回读/INT1）真机全绿，v0.9ce）。**MSR API 竞态纪律见 msr.h 使用纪律第 5 条——隐蔽在场时置读拦截的 MSR 禁止写直通，违例 = 已定罪的 0x101 三体竞态**。
 
 ---
 
@@ -135,7 +135,7 @@
 | "SvmShutdownAllCpus 返回 void 够了" | park 拒绝时引擎仍在位, 卸载方不能释放 hook 内存 | BOOLEAN：TRUE=全核裸机可 FreeMemory |
 | "重定位跳板失败可以警告后继续安装" | 带病上机 = 不可调试时机的蓝屏 | FAIL → 拒绝安装（安全门语义） |
 | "VMware 嵌套 SVM 测出的异常就是 bug" | 嵌套环境特性位失真（无 vGIF 判例等） | 先物理机复现再定性（勿追鬼） |
-| "LeakCheck 每个 exit 都跑一遍太浪费, 该缓存/挪位/删除" | 清 TF 类指令（syscall/sysret/iret）使 #DB 永不到达 → 单步窗口永不关闭 → 拦截位+EXEC 视图永久泄漏（0x1E 判例: r70 心跳风暴 44→2542） | `GnptHookStepLeakCheck` 必须保持在 exit handler 每个 exit 首查；判据"armed 而 guest TF 已失"开销 = 窗口外 2 读+1 比较 |
+| "LeakCheck 每个 exit 都跑一遍太浪费, 该缓存/挪位/删除" | 清 TF 类指令（syscall/sysret/iret）使 #DB 永不到达 → 单步窗口永不关闭 → 拦截位永久泄漏（0x1E 判例: r70 心跳风暴 44→2542） | `GnptHookStepLeakCheck` 必须保持在 exit handler 每个 exit 首查；判据"armed 而 guest TF 已失"开销 = 窗口外 2 读+1 比较 |
 | "#DB 拦截应随单步窗口关闭而解除" | 窗口外残余 TF 的 #DB 直送 guest = 0x3B/0x1E（两判例） | #DB 拦截**常驻**（VMCB init 即设）；IDLE #DB = 吞+清 TF 自愈；只有 PUSHF/POPF 是窗口位 |
 | "int 帧清洗加 DR6.BS 门控更严谨" | 嵌套环境以 BS=0 投递 TF 陷阱（实测铁证）→ 门控恒假 = 清洗永不执行 → iretq 弹回 TF 复活链（0x3B 根因） | 帧清洗只看 `g_stepArmIntn`，不看 bs |
 | "0x70/0x71 非窗口路径该推进 RIP 防死循环" | 推进 = 跳过 pushfq/popfq 的栈/标志效应 → guest 状态破坏（0x1E 根因之一） | 解除窗口位 + 不推 RIP = 重执行真指令 |
@@ -143,7 +143,7 @@
 
 ---
 
-## 4. 架构地图（v0.7e）
+## 4. 架构地图（v0.9ce）
 
 ```
 仓库根/
@@ -153,14 +153,18 @@
 │                                test_reloc.c 重定位器执行级单测（用户态 x64；
 │                                与 hook.c 生成器为镜像契约, 改动须双向同步）
 └── GnptHooks/                    源码（VS 工程）
-    ├── main.c                   使用示例：DriverEntry→SvmStartAllCpus→TRANSPARENT demo(自触发)→DriverUnload
-    ├── svm.c/.h                 SVM 核心：三态检测/资源分配/VMCB 填充/exit 分发/生命周期
+    ├── main.c                   使用示例：DriverEntry→SvmStartAllCpus→(Debug: demo验证轮)→DriverUnload
+    │                            demo层整体 #if DBG; Release=纯引擎生命周期
+    ├── svm.c/.h                 SVM 核心：三态检测/资源分配/VMCB 填充(含故事面MSRPM布防)/
+    │                            exit 分发(0x20-3F MOV DR影子/0x7C/0x400/0x41/0x4D/0x62/0x63/0x72/0x80-86)/生命周期
     ├── vmcb.h                   VMCB 结构（控制区+状态保存区, 逐偏移, clean bits 位表）
-    ├── npt.c/.h                 NPT：四棵静态共享树恒等构建/4KB 拆分/PTE 操作/释放
+    ├── npt.c/.h                 NPT：两棵静态共享树(P/HOOKS)恒等构建/4KB 拆分/PTE 操作/释放
     ├── hook.c/.h                Hook API：Install/Remove/CallOriginal + NPF 视图切换引擎
     │                            + 跳板槽池 + LDE 重定位跳板生成器（回扫自检+超±2GB改写）
-    │                            + TF+#DB 单步原语 + 单步窗口泄漏防御收口
-    ├── common.c/.h              观测体系（Fl* 家族/T1/T2/看门狗/黑匣子, 整体 #if DBG）
+    │                            + TF+#DB 单步原语(READ_TRANS/TEMP_RW) + 单步窗口泄漏防御收口
+    │                            + DR-TRANSPARENT 机件(DR0-3断点+MOV DR影子+全核武装广播)
+    ├── common.c/.h              观测体系（Fl* 家族/T1/T2/看门狗/黑匣子, 整体 #if DBG；
+    │                            GNPT_CRUMB 采样宏=探针 Debug-only 的机制保证）
     ├── common-asm.asm           CmVmmCall（签名门入口）/shutdown park
     ├── svm-asm.asm              世界开关（CmSvmEnter）/exit 汇编壳/STOP 桥/段助手
     ├── hook-asm.asm             GnptStubEntry（detour stub）/GnptCallOrigAsm（栈参转发桩）
@@ -171,26 +175,28 @@
 
 ```
 DriverEntry(main.c)
-  → FlInit → SvmStartAllCpus(svm.c): 三态检测→SvmBuildNptViews(四树恒等)
+  → FlInit → SvmStartAllCpus(svm.c): 三态检测→SvmBuildNptViews(两树恒等)
     →逐核资源预分配(VMCB/HSAVE/IOPM/MSRPM/VMM栈)→逐核发起线程
     →vmrun→CmGuestProbe自证('W')→KEEP('Q')→停泊(中断直通)
-  → GnptHookInstall(main.c demo): LDE重定位跳板(回扫自检)→跳板槽→CodePage
-    →多视图PTE布防(TRANSPARENT: HIDE潜伏P=0+EXEC全权)→HookSyncAllCpus('i'×N)
+  → (Debug demo) GnptHookInstall: TRANSPARENT→DR路径(DR槽+全核武装'g'×N)
+    /普通模式→LDE重定位跳板(回扫自检)→跳板槽→CodePage
+    →两视图PTE布防(P=Nx/HOOKS=CodePage)→HookSyncAllCpus('i'×N)
 
-hook 命中（常规hook: 双 NPT 稳态零 VM-Exit）:
+hook 命中（普通模式: 双 NPT 稳态零 VM-Exit）:
   每核首次: Primary取指hooked页→NPF(ID位)→GnptHookNpfEngine切Secondary('V')
   此后: guest取指→Secondary PTE→CodePage→目标偏移14B绝对跳转
     →跳板槽(mov r10,entry; jmp GnptStubEntry)→SAVE_ALL('H')
     →GnptCallbackDispatch→你的回调(可GnptCallOriginal('O'))
     →RESTORE_ALL→ret
 
-hook 命中（TRANSPARENT: 每指令2exit, 低频目标专用）:
-  潜伏态取指/读hooked页→NPF→EXEC窗口+arm TF('s' rsn=3)→1条指令
-    →#DB('e')→切回HIDE潜伏; 外部读→切P+TF读原始字节(读透明)
-  防线: 每exit首查LeakCheck(armed而TF已失=收口'L')+
-    #DB拦截常驻(IDLE残余=吞+清TF'D')+INTn帧清洗('I')
+hook 命中（TRANSPARENT/DR: 每调用恰1 exit, 原页恒等）:
+  入口取指#DB fault(执行前)→DR6.B0-3位检查('y')→root改道RIP=跳板槽
+    →同槽同效进detour→回调→CallOriginal(重放prologue+尾跳Target+ReplayLen)
+    →函数体余下自原页执行零exit
+  外部读/写hooked页=原页原始字节(结构性透明, 零exit零舞步)
+  guest的MOV DR→影子仿真('q'), 硬件DR0-3/VMCB.Dr6/7永不受guest触碰
 
-卸载(DriverUnload): 计数留痕→GnptHookRemoveAll(Remove OK+'i'×N)
+卸载(DriverUnload): (Debug: demo收尾)→GnptHookRemoveAll(Remove OK+'i'×N)
   →SvmShutdownAllCpus(STOP桥'S'×N, SVME回读=0)→TRUE→GnptHookFreeMemory
 ```
 
@@ -305,8 +311,11 @@ i=NPTSYNC每核TLB同步确认(rsn=0x81, 安装/移除布防面包屑)
 V=NPT视图切换采样(a=视图 b=每核计数) H=detour分发入口(a=目标)
 O=CallOriginal入口(a=重定位跳板) N=NPF留痕(rsn=0x400, a=gpa, b=错误码)
 h=hook命中采样(用户回调发出, rsn=Arg1低32位, a=命中计数) w=CallOriginal误用警告(非回调上下文)
-s=单步arm(rsn=用途1读透明/2临时RW/3REHIDE, a=hook条目, b=采样计数; 读透明链起点)
+s=单步arm(rsn=用途1读透明/2临时RW, a=hook条目, b=采样计数; 读透明链起点)
 e=单步#DB收尾(rsn=用途, a=0(BS=1 TF引发)/1(BS=0 Dr断点抢入), b=计数; 链终点)
+g=DR-TRANSPARENT武装/解除(rsn=DRSET, a=slot|on<<8, b=入口线性地址, c=VMCB.Dr7)
+y=DR断点改道采样(rsn=B位图, a=跳板槽RIP, b=计数)——TRANSPARENT触发链起点
+q=MOV DR影子仿真采样(rsn=exit码0x20-0x3F, a=推进后RIP, b=计数, c=EXITINFO1)
 b=EXITINTINFO.V=1重放(guest事件递送途中被拦) P=pushf仿真 p=popf仿真(窗口内)
 L=单步窗口泄漏收口(rsn=用途 a=RIP b=RFLAGS——armed而TF已失, 防御按use收尾)
 I=INTn步进帧清洗(a=RIP b=清洗后帧内RFLAGS——int压入活RFLAGS含注入TF)
@@ -379,7 +388,7 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | 0x1E，任意进程；心跳 r70(PUSHF/POPF exit) 指数爆炸（实测 44→2542/s） | 单步窗口泄漏：步进指令为 syscall/sysret/iret 清 TF 类 → #DB 永不到达 → 窗口拦截位+EXEC 视图永久泄漏；0x70/0x71 兜底"推进"跳过 pushfq/popfq 的栈/标志效应 → guest 状态破坏 | 每 exit LeakCheck 收口 + 0x70/0x71 兜底改重执行（M5.8） |
 | 0x3B Arg1=0x8000004（STATUS_SINGLE_STEP），nt!KiServiceInternal+4 取指 | int 2E 硬件帧压入活 RFLAGS（含注入 TF）→ 帧清洗被 bs 门控跳过（嵌套环境以 BS=0 投递 TF 陷阱）→ iretq 弹回 TF 复活 → 影子投毒 → 窗口外 guest 可见 #DB | #DB 拦截常驻 + IDLE 吞清 TF；int 帧清洗不门控 bs（M5.9） |
 | 0x101 (CLOCK_WATCHDOG_TIMEOUT)，钉C0/深闲置数分钟内，DWM 崩溃循环、黑屏-恢复、无声冻结；历史上 30s~2h "随机"概率死 | **三体竞态（M9.6 定罪）**：NPT 自我隐蔽（改译页表页）× MSRPM 读拦截（LSTAR 读 exit）× 直通 WRMSR 的硬件级竞态——三者齐备时挂核，无任何一行代码"错" | 写位拦截（OnWrite=root 忠实代写，msr.h 使用纪律第 5 条）：x5_v2 直通死 107s vs x8 双拦绿 15min+，单变量翻转；修复后加速 Full 双绿、C 轮历史首过（v0.9y）。**鉴别方法论**：IDLEDISABLE(钉C0)=确定性死亡复现器；单因子/双因子/组合变体矩阵定位共因子；勿再用"改代码等死"的玄学排查 |
-| 安装期/运行初期 tstorm：NPF 计数 4 位数暴涨（1,024–2,600 NPF/250ms），伴随 [F] 脱落行 | hook 目标页"热"（同步原语页或高频页）——页级单步成本不可承受 | 安装期热探测门拒绝（换候选）+ 运行期 tstorm 脱落（留 [F] 审计行）；候选禁类：wait 家族同页目标（M8 判例，3/3 DWM 事故相关） |
+| 安装期/运行初期 tstorm：NPF 计数 4 位数暴涨（1,024–2,600 NPF/250ms），伴随 [F] 脱落行 | hook 目标页"热"（同步原语页或高频页）——P=0 舞步的页级单步成本不可承受 | **历史判例（机制已退役）**：热探测门/tstorm 脱落属 P=0 舞步防线, 随 M15.3 舞步退役整体删除; DR-TRANSPARENT 无页热约束; 候选禁类纪律（wait 家族同页目标, M8 判例）仍适用于普通模式选型 |
 | vmmcall 在 guest 内执行 = #UD；#DB 在非拦截核逃逸 | SMT 部分虚拟化的固有缺陷：兄弟核未虚拟化 → 指令语义不一致 | **全核接管是硬约束**（M8 两轮实测证伪 SMT 隔离方案）；root 原语钉核 API 保留但 guest 侧永远全核 |
 | **0x139 (KERNEL_SECURITY_CHECK_FAILURE) Arg1=4=FAST_FAIL_INCORRECT_STACK**，帧链=nt!KiGeneralProtectionFault←驱动 exit 处置内（含 asm 世界开关帧），故障线程=System | **root 处置内物理 #GP（M11.30 定罪）**：处置代码访问了模式依赖 MSR（0x6E0）而本机 LAPIC 未处 TSC-deadline 模式 → 硬件 #GP 在 GIF=0 上下文 raise，无 SEH 防护且 SEH 链跨世界错位 → 异常分发栈检查 fail-fast | **root 处置 MSR 安全门**：任何模式依赖 MSR 必须先在裸机 PASSIVE 上下文（启动期，SEH 可用）探测；探测失败=不置拦截位（guest 直通 #GP 走原生路径=裸机等价）。0x6E0 已按此门控（g_svmTscDlMode，启动横幅如实报告） |
 | 静默复位（无蓝屏/dump、Kernel-Power 41 BugcheckCode=0、无 WHEA、日志戛然而止，死亡时 exit 账目冻结） | **sub-SMM 平台杀手（M11.27/28 定案）**：全核 guest 停泊时 SMM 之下的外部事件（SMU/EC 类）直接复位整机；驱动缺席也死（复位循环）；SMMLOCK=1 封死 SMI 拦截观测 | **已知边界勿当 bug 修**：操作规程=凉机+晚载+默认电源+短突发+死后即停；秒卸载（`[Entry] 完成` 立即 sc stop）实测可行；README"平台边界"章节已文档化；该机已于 2026-10-01 退货（M11.33），Zen5 新平台第二数据点待测 |
