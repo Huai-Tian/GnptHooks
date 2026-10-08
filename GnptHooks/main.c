@@ -23,11 +23,15 @@
 //  ①"SVM未激活"自洽故事面探针(DriverEntry内联): 三MSR读+EFER回写+
 //    SVM指令族11条逐条执行, 全走guest硬件路径=与真实探测器同型
 //  ②多hook验证轮: TRANSPARENT(DR机件)与普通模式并存+触发+选择性移除
+//  ③NX-FENCE容量位验证轮(阶段C, 时序在A/B之间): 页级NX入口陷阱+
+//    rearm闭环+miss窗口边界+信标回P+同页互斥门+独占页并装(容量位)
+//    +零工件自证(安装前后靶字节等值)+选择性移除
 //demo候选(阶段A): T目标=DR0-3线性断点(每核≤4), 原页恒等
 //    不动=读/写透明结构性成立; 触发=入口#DB改道跳板槽(每调用1 exit)
 //候选纪律: 按名导出+可重定位+同页防御跳过(NPF引擎按TargetPa首匹配;
 //DR断点按线性地址不受页约束)。普通模式目标选Ke*普通内核函数
-//(hook.h使用纪律5: PG不覆盖类)
+//(hook.h使用纪律5: PG不覆盖类); fence目标选驱动本地专用节
+//(code_seg独占页, hook.h使用纪律9: 冷页/页隔离)
 #define DEMO_T_MAX 2
 static PVOID g_demoT[DEMO_T_MAX];               //live TRANSPARENT目标(触发/移除键)
 static const char* g_demoTName[DEMO_T_MAX];     //窄名(日志)
@@ -36,6 +40,8 @@ static BOOLEAN g_demoTFree[DEMO_T_MAX];         //触发返回值须ExFreePool�
 static PVOID g_demoN = NULL;                    //阶段B普通模式目标
 static volatile LONG64 g_demoNCall = 0;
 static volatile LONG64 g_demoColdCall = 0;      //冷靶计数槽
+static volatile LONG64 g_demoFxCall[2] = { 0 }; //阶段C fence计数槽(A/B独立)
+static ULONG64 g_demoFxOrig = 0;                //靶A安装前首8B(零工件比对基准)
 
 //冷靶(驱动本地): 普通模式hook对照目标——与热Ke*目标同构走
 //CodePage全链, 但页冷无自然流量=单变量隔离"热页"因素。
@@ -50,6 +56,52 @@ static ULONG64 DemoColdTargetFn(ULONG64 a1, ULONG64 a2, ULONG64 a3,
 	r ^= 0x5A5A5A5A5A5A5A5AULL;
 	return r;
 }
+
+//======== NX-FENCE容量位测试靶(阶段C) ========
+//专用code_seg节=映像内独占页(驱动SectionAlignment=4K, 每节自成
+//页)——fence使用纪律9"冷页/页隔离目标"的结构化实现:
+//  .NXF1 = 靶A+邻函数(同页双函数: 邻函数连坐驻留+信标回P测试
+//          素材, 亦是同页互斥门的fail-loud素材)
+//  .NXF2 = 靶B(独占页: 与A并装=容量位证据——DR机件每核≤4,
+//          fence仅条目数限, 同页唯一为唯一约束)
+//noinline=杜绝直调被内联绕过靶体(内联后调用不经靶页=fence
+//永不触发); 两靶异体=防COMDAT折叠(ICF)
+#pragma code_seg(".NXF1")
+static __declspec(noinline) ULONG64 DemoNxFenceTargetA(ULONG64 a1,
+	ULONG64 a2, ULONG64 a3, ULONG64 a4)
+{
+	ULONG64 r = a1;
+	r ^= a2;
+	r += a3;
+	r -= a4;
+	r ^= 0x1F2E3D4C5B6A7988ULL;
+	r += 0x1122334455667788ULL;
+	return r;
+}
+
+//邻函数(与靶A同页, 永不hook): 调用即触发页级NPF连坐——该核
+//驻留HOOKS+fence旗置位(下个任意exit信标回P=fence重武装)
+static __declspec(noinline) ULONG64 DemoNxFenceNeighbor(ULONG64 a1,
+	ULONG64 a2)
+{
+	ULONG64 r = a1;
+	r += a2;
+	r ^= 0x0E0D0C0B0A090807ULL;
+	return r;
+}
+#pragma code_seg()
+
+#pragma code_seg(".NXF2")
+static __declspec(noinline) ULONG64 DemoNxFenceTargetB(ULONG64 a1,
+	ULONG64 a2)
+{
+	ULONG64 r = a1;
+	r = r * 3 + a2;
+	r ^= 0x9182736455041321ULL;
+	r -= 0x0011223344556677ULL;
+	return r;
+}
+#pragma code_seg()
 
 //demo回调(detour语义, 返回值=新函数返回值)。
 //回调运行在任意线程/任意IRQL(含DISPATCH级): 只做IRQL安全操作,
@@ -147,6 +199,27 @@ static VOID DemoFireN(VOID)
 	NTSTATUS r = ((GNPT_DEMO_N_FN)g_demoN)((HANDLE)0);
 	FlLog("[MultiHook] N(NtClose)触发: st=0x%X 累计=%lld",
 		(ULONG)r, g_demoNCall);
+}
+
+//自触发阶段C fence hook一次并留痕(返回值=原函数直算值——回调
+//经GnptCallOriginal透传; 命中判据=计数槽增长, 返回值两种路径
+//同值不可判)
+static VOID DemoFireFx(ULONG idx, const char* tag)
+{
+	ULONG64 r;
+	if (idx == 0)
+	{
+		r = DemoNxFenceTargetA(0x1111111111111111ULL,
+			0x2222222222222222ULL, 0x3333333333333333ULL,
+			0x4444444444444444ULL);
+	}
+	else
+	{
+		r = DemoNxFenceTargetB(0x5555555555555555ULL,
+			0x6666666666666666ULL);
+	}
+	FlLog("[MultiHook] 阶段C %s触发: 返回=%llX 累计=%lld",
+		tag, (unsigned long long)r, g_demoFxCall[idx]);
 }
 
 //注: 未按名导出的Nt系目标无SSDT兜底——x64内核不导出
@@ -556,6 +629,112 @@ static VOID DemoMultiHookThread(PVOID Context)
 			FlLog("[MultiHook] 阶段A: 单T(tLive=1), 双T格本轮无样本");
 		}
 	}
+	//======== 阶段C: NX-FENCE容量位(HOOK_NXFENCE) ========
+	//时序约束: 必须先于阶段B——fence入口陷阱仅P视图触发, 普通
+	//hook驻留HOOKS的核上fence不触发(纪律7折损, 边界非缺陷)。
+	//此刻零普通hook(阶段A为DR机件, 零视图切换)=全核P视图=
+	//确定性触发。钉核2(与阶段A的核1/阶段B的核3分离)
+	KeSetSystemAffinityThread((KAFFINITY)1 << 2);
+	{
+		//①安装+零工件自证: 安装前后靶头字节比对(等值=两视图皆
+		//原始字节, PG面结构性安全; 普通模式此读=CodePage跳转码)
+		GNPT_HOOK hf = { 0 };
+		hf.Target = DemoNxFenceTargetA;
+		hf.Callback = DemoCountCallback;
+		hf.Context = &g_demoFxCall[0];
+		hf.Flags = HOOK_NXFENCE;    //容量位(纪律9): 页级NX入口陷阱
+		g_demoFxOrig = *(volatile ULONG64*)(ULONG_PTR)DemoNxFenceTargetA;
+		NTSTATUS fst = GnptHookInstall(&hf);
+		FlLog("[MultiHook] 阶段C fence A安装(.NXF1独占页): %s",
+			NT_SUCCESS(fst) ? "OK" : "FAIL(见[Hook]行)");
+		if (NT_SUCCESS(fst))
+		{
+			ULONG64 now = *(volatile ULONG64*)(ULONG_PTR)DemoNxFenceTargetA;
+			FlLog("[MultiHook] 阶段C 零工件自证: 装前%llX 装后%llX "
+				"(等值=零补丁字节, PG面安全)",
+				(unsigned long long)g_demoFxOrig,
+				(unsigned long long)now);
+			KeSetSystemAffinityThread((KAFFINITY)1 << 2);
+			//②入口陷阱+rearm闭环: 连发两弹——第二弹命中=第一弹
+			//stub尾rearm已回P重武装(rearm失效=该核滞留HOOKS=
+			//第二弹miss)
+			DemoFireFx(0, "A#1");
+			DemoFireFx(0, "A#2");
+			FlLog("[MultiHook] 阶段C rearm判读: 上行两次累计应各+1"
+				"(第二弹命中=rearm回P重武装活)");
+			//③miss窗口演示(纪律7/9文档化边界): 邻函数同页连坐
+			//→该核驻留HOOKS+置旗; 无exit介入即调靶A=HOOKS视图
+			//恒等可执行→原函数直跑(计数冻结)
+			{
+				ULONG64 r = DemoNxFenceNeighbor(0x7070707070707070ULL,
+					0x9090909090909090ULL);
+				FlLog("[MultiHook] 阶段C 邻函数连坐: 返回=%llX"
+					"(该核现驻留HOOKS, fence页恒等可执行)",
+					(unsigned long long)r);
+			}
+			DemoFireFx(0, "A(miss窗)");
+			FlLog("[MultiHook] 阶段C miss窗判读: 上行累计应冻结"
+				"(驻留期原函数直跑; 若命中=窗口内恰有exit信标"
+				"[中断], 非缺陷)");
+			//④信标回P重武装: 显式cpuid(任意exit)→beacon消费驻
+			//留旗+回P→fence重武装('A'环留痕)
+			{
+				int ci[4];
+				__cpuidex(ci, 1, 0);
+			}
+			DemoFireFx(0, "A(信标后)");
+			FlLog("[MultiHook] 阶段C 信标判读: 上行累计应+1"
+				"(任意exit信标回P=fence重武装活, 'A'环为证)");
+			//⑤同页互斥门(fail-loud): 邻函数与靶A同.NXF1页,
+			//Install应被拒(页级NX=共享资产, 同页唯一)
+			{
+				GNPT_HOOK hn = { 0 };
+				hn.Target = DemoNxFenceNeighbor;
+				hn.Callback = DemoCountCallback;
+				hn.Context = &g_demoFxCall[0];
+				hn.Flags = HOOK_NXFENCE;
+				NTSTATUS rst = GnptHookInstall(&hn);
+				FlLog("[MultiHook] 阶段C 同页门: 邻函数Install→0x%X"
+					"(%s)", (ULONG)rst,
+					!NT_SUCCESS(rst) ?
+					"拒绝=fail-loud正确" : "**放行=门失效**");
+			}
+		}
+		//⑥容量位: 靶B独占.NXF2页并装OK——DR机件每核≤4, fence
+		//仅条目数限(64), 同页唯一为唯一约束
+		KeSetSystemAffinityThread((KAFFINITY)1 << 2);
+		{
+			GNPT_HOOK hb = { 0 };
+			hb.Target = DemoNxFenceTargetB;
+			hb.Callback = DemoCountCallback;
+			hb.Context = &g_demoFxCall[1];
+			hb.Flags = HOOK_NXFENCE;
+			NTSTATUS bst = GnptHookInstall(&hb);
+			FlLog("[MultiHook] 阶段C fence B安装(.NXF2独占页): %s"
+				"(与A并装=容量位: DR≤4/核, fence仅条目数限)",
+				NT_SUCCESS(bst) ? "OK" : "FAIL(见[Hook]行)");
+			if (NT_SUCCESS(bst))
+			{
+				KeSetSystemAffinityThread((KAFFINITY)1 << 2);
+				DemoFireFx(1, "B#1");
+				DemoFireFx(1, "B#2");
+			}
+		}
+		//⑦选择性移除: 摘A(其页恒等还原)→直跑冻结; B仍活续增
+		KeSetSystemAffinityThread((KAFFINITY)1 << 2);
+		{
+			NTSTATUS rrst = GnptHookRemove(DemoNxFenceTargetA);
+			FlLog("[MultiHook] 阶段C 选择性Remove A: %s",
+				NT_SUCCESS(rrst) ? "OK" : "FAIL");
+			KeSetSystemAffinityThread((KAFFINITY)1 << 2);
+			DemoFireFx(0, "A(移除后)");
+			FlLog("[MultiHook] 阶段C 移除判读: 上行累计应冻结"
+				"(页恒等还原=原函数直跑)");
+			DemoFireFx(1, "B(对照)");
+			FlLog("[MultiHook] 阶段C 对照判读: 上行累计应续增"
+				"(B仍活=选择性移除正确; B交卸载RemoveAll)");
+		}
+	}
 	//======== 阶段B: 并存格+冷热靶(T驻留→N接管→冷热靶) ========
 	//DR-TRANSPARENT契约: T(线性断点)与N(NPT视图)机制正交,
 	//T驻留期间N Install成功=并存验证; N=NtClose此时布防,
@@ -683,9 +862,11 @@ static VOID DemoShutdown(VOID)
 			KernelMode, FALSE, &to);
 	}
 	//多hook总结: 各槽独立计数=并存证据; 阶段B双向冻结=互偷证据
-	//(序列内已显式Remove的T1不再出现在RemoveAll清单)
-	FlLog("[Unload] MultiHook总结: T1=%lld T2=%lld N=%lld, LSTAR读拦截=%lld次, 写拦截=%lld次",
-		g_demoTCall[0], g_demoTCall[1], g_demoNCall, g_demoRdmsr, g_demoWrmsr);
+	//(序列内已显式Remove的T1/fence A不再出现在RemoveAll清单)
+	FlLog("[Unload] MultiHook总结: T1=%lld T2=%lld N=%lld, "
+		"fenceA=%lld(已移除应冻结) fenceB=%lld, LSTAR读拦截=%lld次, 写拦截=%lld次",
+		g_demoTCall[0], g_demoTCall[1], g_demoNCall,
+		g_demoFxCall[0], g_demoFxCall[1], g_demoRdmsr, g_demoWrmsr);
 	GnptMsrHookRemove(0xC0000082);
 }
 
@@ -760,10 +941,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	//放行T2的Desktop镜像(加载窗口期已过)
 	FlMarkEntryDone();
 
-#if DBG
+#if DBG && !GNPT_L3_MINIMAL && !GNPT_L3_G2 && !GNPT_L3_NODEMO
 	//接管成功, 安装演示hook(验证轮: 故事面探针+多hook序列+MSR hook)。
 	//目标解析=调用者责任(GNPT_HOOK.Target直接传函数指针, 无SSDT/
-	//名称定位器——与EPT型框架契约一致)
+	//名称定位器——与EPT型框架契约一致)。L3探针形态demo禁用——
+	//纯引擎纪律(零hook零MSR面, 见common.h L3注释)
 	DemoStart();
 #endif
 	FlLog("[Entry] 完成(%s)", GNPT_BUILD_TAG);

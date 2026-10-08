@@ -163,6 +163,12 @@ typedef struct _GNPT_RING_ENTRY
 //  f=DR hook探测期让位(rsn=1 guest单步中BP命中fail-open/
 //    2槽被guest占用跳过武装/3 guest断点同场冲突; a=RIP, b=计数
 //    ——让位审计面, 高频出现=探测者在场的信号)
+//  k=NX-Fence入口陷阱(rsn=0x400, a=改道后跳板槽RIP, b=fault gpa;
+//    fence触发链起点)
+//  r=NX-Fence rearm完成(rsn=0x81, a=vmmcall处RIP; stub尾收尾=
+//    在途旗清+视图回P, fence触发链终点)
+//  A=NX-Fence信标回P(rsn=0, a=当前RIP; fence页邻函数驻留旗被
+//    任意exit消费=fence重武装)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -264,7 +270,29 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9ce"
+#define GNPT_BUILD_TAG "v0.9cg"
+//L系列配置二分探针(临时, 实验后删除; 默认全0=生产形态)。组表:
+//G1=异常拦截(#DB/#GP/#MC)+DR位 G2=MSRPM故事位 G3=SMI/SHUTDOWN/
+//INIT/INVLPGA/SVM族 G4=TSC补偿壳
+//毕业链(2026-10-08): L3(骨架)/L3G2(MSR故事面)/L3G2G4(+壳)
+//五轮全活(13h断电新鲜态机器)。
+//**FULL轮死亡(同日, 决定性)**: fresh boot(up=535s)+满配+demo
+//=163s死亡, 签名与v0.9cc逐字段一致(up=433s处st=11世界丢失
+//→13应用崩溃级联2min→Kernel-Power 41; r41=227/r400=20/r7C=12/
+//r72=16K洪泛)。三理论齐死: 衰减态理论(新鲜boot照死)/渐进论
+//(11核瞬间失联在先, 用户层级联在后)/壳×密度理论(M16.18档案
+//已证r7C=8)。
+//**快速复现环到手: 每boot~3min定案**。FULL vs L3G2G4差集=
+//嫌疑名单: G1(异常+DR拦截) G3(SVM族/SMI/SHUTDOWN/INIT/INVLPGA)
+//LBRvirt(0xB8=1) demo运转(NtClose热靶普通模式hook 23K触发/
+//DR hook/信标/MSR hook)。v0.9ce/cd满配+demo空闲短轮活=凶手
+//需满配要素×accel风暴联合在场。
+//实验开关: GNPT_L3_NODEMO=1(FULL全拦截+demo禁用=零hook零MSR
+//面, 用于拦截配置vs hook活动二分); 其余组合见NOTES M16.13-19
+#define GNPT_L3_MINIMAL 0
+#define GNPT_L3_G2      0
+#define GNPT_L3_G4      0
+#define GNPT_L3_NODEMO  0
 
 //==================== 引擎配置开关(功能语义; 历史演进见开发文档) ====================
 //TRANSPARENT模式=DR机件(DR0-3线性地址执行断点作入口陷阱, 原页恒等
@@ -278,7 +306,8 @@ extern volatile LONG g_flLaunchHot;
 
 //接管核数: 64=全核(正式值)。部分接管仅限纯引擎诊断形态(hook布防/
 //root原语落裸核=蓝屏, 低剂量轮须零hook零MSR面); 剂量敏感平台
-//可用低剂量构建做日常观测
+//可用低剂量构建做日常观测(死亡率∝接管核数, 低剂量+高负载
+//触发器存活——平台SMI×VMRUN碰撞模型, 详见开发文档)
 #define GNPT_TAKE_CORES 64
 
 //CPUID伪装: 1=置INTERCEPT_CPUID+handler伪装(Fn8000_0001 SVM位

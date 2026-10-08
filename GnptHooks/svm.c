@@ -164,6 +164,24 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//---- FS/GS/TR/LDTR+系统MSR集: 硬件真值预同步 ----
 	__svm_vmsave((void*)(ULONG_PTR)Vcpu->VmcbPa);    //参数=VMCB物理地址(按指针值传递, MSVC契约)
 	//---- 拦截配置 ----
+#if GNPT_L3_G2
+	//L3+G2探针: L3底座+MSR_PROT单bit加回(其余组全剥)——故事三MSR
+	//(EFER/VM_CR/HSAVE)与0x6E0(TSC_DEADLINE, g_svmTscDlMode在位
+	//时)exit进handler(MSRPM位图填充本无条件在跑)。0x6E0=热键
+	//风暴最可能载体(定时器编程exit)。TscOffset恒0=0x6E0换算
+	//退化为恒等(TSC壳属G4组, 不在本形态)
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;
+	vmcb->Control.LbrVirtEnable = 0;
+#elif GNPT_L3_MINIMAL
+	//L3探针极简底座: CPUID(骨架原样)+VMMCALL(STOP桥生命线)仅存,
+	//其余全剥=SimpleSvm同构形态。guest内SVM指令族(SVME=1下硬件
+	//真实执行)不拦=探针协议下无人自发执行(Windows不用SVM指令);
+	//#MC直达=硬件reset(裸机等价, 死=真硬件事件)
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;
+	vmcb->Control.LbrVirtEnable = 0;
+#else
 	//Misc1: CPUID(伪装面载体; 快路径短路于TSC壳——高频风暴不进
 	//补偿壳)+MSR_PROT(MSR hook面载体)+SHUTDOWN/INIT/INVLPGA(观测/
 	//自愈位)+SMI(观测位, SMMLOCK=1平台硬件忽略)
@@ -210,7 +228,7 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	{
 		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
 	}
-	
+
 	//VMCB 0xB8指令虚拟化使能族(§15.33/§15.23/§15.38/§15.39): 仅LBR
 	//virt(b0)按Fn8000_000A_EDX bit1特性门控置位——世界开关硬件交换
 	//guest/host LBR寄存器组(含DebugCtl)=root驻留分支不泄漏进guest
@@ -224,6 +242,7 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//bit1=VMSAVEvirt不使能(该路径要#UD注入非guest执行)
 	vmcb->Control.LbrVirtEnable =
 		(g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL;
+#endif
 	//MSRPM布防(自我隐蔽生效前=本核发起线程裸机root态, 直写位图
 	//合法, 无需vmmcall root原语):
 	//  三故事MSR(EFER/VM_CR/HSAVE_PA)读写双拦位="SVM未激活"自洽
@@ -459,7 +478,8 @@ KAFFINITY SvmPinVirtualizedCpus(VOID)
 }
 
 //部分接管安全门: 裸核上hook布防/root原语=蓝屏, 低剂量(TAKE_CORES<64)
-//仅限纯引擎诊断形态(零hook零MSR面)放行
+//仅限纯引擎诊断形态(零hook零MSR面)放行; 纯引擎Debug诊断构建经
+//显式临时宏豁免先例(改门时保留该豁免通道语义)
 #if GNPT_TAKE_CORES < 64
 #error "GNPT_TAKE_CORES<64 仅限纯引擎诊断形态(零hook零MSR面)"
 #endif
@@ -912,7 +932,8 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					func != GNPT_VMCALL_STOP && func != GNPT_VMCALL_NPTSYNC &&
 					func != GNPT_VMCALL_NPTSET && func != GNPT_VMCALL_NPTRES &&
 					func != GNPT_VMCALL_MSRBIT && func != GNPT_VMCALL_MEMCPY &&
-					func != GNPT_VMCALL_CONCEAL && func != GNPT_VMCALL_DRSET))
+					func != GNPT_VMCALL_CONCEAL && func != GNPT_VMCALL_DRSET &&
+					func != GNPT_VMCALL_NXREARM))
 			{
 				//签名门拒绝采样(防刷爆环; Release构建零开销)
 				static volatile LONG s_sigCnt[64] = { 0 };
@@ -1041,7 +1062,15 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					SvmAdvanceRip(vmcb);
 					return 0;
 				}
-				case GNPT_VMCALL_MSRBIT:    //root位图原语: 全核MSRPM位操作
+				case GNPT_VMCALL_NXREARM:    //NX-Fence detour收尾(stub尾自发):
+				{
+					//在途detour旗清+视图回P(fence重武装); 旗不在=
+					//移除后补发等竞态形态(hook.c静默)。处置见GnptHookNxRearm
+					GnptHookNxRearm(vmcb, cpu);
+					SvmAdvanceRip(vmcb);
+					return 0;
+				}
+			case GNPT_VMCALL_MSRBIT:    //root位图原语: 全核MSRPM位操作
 				{
 					ULONG32 msr = (ULONG32)arg1;
 					BOOLEAN isWrite = ((arg2 & 2) != 0);
@@ -1432,6 +1461,12 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 		}
 	}
 #endif
+	//NX-FENCE统一信标(任意exit皆信标, 先于CPUID短路): fence页邻
+	//函数驻留旗在且无在途detour→回P重武装fence(miss窗口=exit间隔,
+	//CPUID/MSR等常规流量秒级必达)。在途detour护旗——其间exit
+	//(如detour函数体内CPUID)不得翻视图(函数体自HOOKS执行)。
+	//快路径2读+2比较(无fence流量近零开销; 旗恒0时纯直通)
+	GnptHookNxBeacon((PVMCB)Vcpu->VmcbVa, (ULONG)(UCHAR)Vcpu->CpuIndex);
 	//CPUID exit短路于TSC壳——不进T0/T1/扣除/水位/钳制(哨兵照常
 	//刷新, dispatch/观测/计数照常走)。原因: TSC补偿壳的水位/钳制
 	//与高频exit存在交互风险, 绕过壳消除交互; exit成本(~1500周期)
@@ -1454,6 +1489,10 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 		Vcpu->ExitTsc;                      //停泊哨兵刷新(核号取VCPU)
 #endif
 	ULONG stop = SvmExitDispatch(Vcpu, Regs);
+#if !GNPT_L3_MINIMAL && (!GNPT_L3_G2 || GNPT_L3_G4)
+	//L系列探针形态门: L3/L3G2=壳不编译(TscOffset恒0); L3G2G4=壳加回
+	//(A轮IDLEDEMOTE的35.6/s EFER写exit全部过壳=壳×MSR密度交互探针,
+	//见common.h L系列注释); 全配=壳常在
 	if (stop == 0)
 	{
 		PVMCB vmcb = (PVMCB)Vcpu->VmcbVa;
@@ -1483,6 +1522,7 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			vmcb->Control.TscOffset += (w - virt) - GNPT_TSC_CC_EPS;
 		}
 	}
+#endif
 	return stop;
 }
 

@@ -3,6 +3,24 @@
 #include"vmcb.h"
 #include"npt.h"
 #include"LDasm.h"
+#include<ntimage.h>      //PE结构体(IMAGE_DOS_HEADER/NT_HEADERS/
+                         //SECTION_HEADER/FIRST_SECTION——ntifs/ntddk
+                         //链不含, 槽池选址用)
+
+//RtlPcToFileHeader: 本机映像基定位(ntoskrnl导出, wdm.h族未声明
+//=显式声明; 与任何在位声明签名兼容, 版本无关)
+NTKERNELAPI PVOID RtlPcToFileHeader(
+	_In_ PVOID PcValue, _Out_ PVOID *BaseOfImage);
+
+//单参包装: 返回Pc所属映像基(NULL=裸内存地址)。原语双参形态
+//(PcValue, &BaseOfImage), 成功时出参=映像基; 失败出参未定义=
+//预置NULL兜底(调用点一律走本包装)
+static PVOID HookImageBaseOf(PVOID Pc)
+{
+	PVOID base = NULL;
+	RtlPcToFileHeader(Pc, &base);
+	return base;
+}
 
 //====================================================================
 // Hook引擎实现(双模式)
@@ -77,6 +95,12 @@ static volatile LONG g_slotUsed = 0;
 //每核当前视图(0=Primary 1=Secondary)
 static volatile LONG g_view[64];
 
+//NX-FENCE每核状态(机件节见下方NX-FENCE段): 在途detour旗(入口NPF
+//置/stub尾rearm清; 跨核迁移时由GnptCallbackDispatch远程清)+fence页
+//邻函数驻留旗(页级NX连坐切HOOKS时置/任意exit信标消费)
+static volatile LONG g_nxInDetour[64];
+static volatile LONG g_nxFenceRes[64];
+
 //detour上下文环(迁移安全): 每核槽位方案在回调跨核迁移时失配
 //(丢调用或误调他hook原函数)。改用全局序号环按发起线程解析——
 //同线程顺序执行, 其最大序号条目=当前最内层分发; 嵌套=内层序号
@@ -113,17 +137,74 @@ extern ULONG64 GnptCallOrigAsm(GNPT_ORIG_CALL* Call);
 //槽机器码(24B): [0..9]=mov r10,imm64(条目) | [10..15]=jmp [rip+0]
 //| [16..23]=GnptStubEntry地址(指针落t+16: jmp的RIP_after=t+16,
 //disp32=0→CPU从t+16读操作数)。回读自检防编码错位(jmp处#GP)
+//
+//槽池选址(LBR被动残余缓解): 池页地址必须落在某模块映像范围内
+//——guest LBR栈记录目标→槽的jmp, 分支目标=池地址; 池地址在
+//裸内存区(ExAllocatePool返回的系统VA区无模块归属)=任何正常
+//系统都不存在的分支目标形态=LBR栈扫描指纹。槽池挂靠模块后
+//分支目标=模块内地址=与正常调用形态不可区分。挂靠失败
+//(无可用洞)=回退池分配(fail-open: 功能保全, LBR残余在)
+static PUCHAR HookSlotPoolAlloc(VOID)
+{
+	//候选: 本驱动映像(节尾对齐空隙)。映像基=RtlPcToFileHeader
+	//(本函数地址属于映像)——槽池落本驱动映像范围内即达"模块
+	//归属"目的(检测者无法区分是哪个模块的code cave)。驱动
+	//映像大小由SectionAlignment界(4KB), 实际映像尾与PE声明
+	//SizeOfImage间=驻留洞; 运行期以映像头SizeOfImage字段
+	//自证边界, 洞搜索=映像尾页的页内余量
+	PUCHAR base = (PUCHAR)HookImageBaseOf((PVOID)HookSlotPoolAlloc);
+	if (base != NULL)
+	{
+		PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+		if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+		{
+			PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)
+				(base + dos->e_lfanew);
+			if (nt->Signature == IMAGE_NT_SIGNATURE &&
+				nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+			{
+				//末节尾部碎片: 节对齐后通常无整页洞——常态走池
+				//回退; 判据在=形态自适应(链接器布局变化时自动挂靠)
+				PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+				PIMAGE_SECTION_HEADER last =
+					&sec[nt->FileHeader.NumberOfSections - 1];
+				ULONG lastEnd = last->VirtualAddress + last->Misc.VirtualSize;
+				ULONG lastAligned = (lastEnd + nt->OptionalHeader.SectionAlignment - 1) &
+					~(nt->OptionalHeader.SectionAlignment - 1);
+				ULONG tailGap = lastAligned - lastEnd;
+				ULONG imgSize = nt->OptionalHeader.SizeOfImage;
+				//整页洞条件: 尾节页内碎片≥1页且洞全在SizeOfImage内
+				//(理论常态不成立——保底判据, 命中即用)
+				if (tailGap >= PAGE_SIZE && lastAligned <= imgSize)
+				{
+					return base + lastEnd;
+				}
+			}
+		}
+	}
+	return (PUCHAR)ExAllocatePoolWithTag(
+		NonPagedPool, PAGE_SIZE, HOOK_POOL_TAG);
+}
+
 static PUCHAR HookAllocSlot(PGNPT_ENTRY Entry)
 {
 	if (g_slotPool == NULL)
 	{
-		g_slotPool = (PUCHAR)ExAllocatePoolWithTag(
-			NonPagedPool, PAGE_SIZE, HOOK_POOL_TAG);
+		g_slotPool = HookSlotPoolAlloc();
 		if (g_slotPool == NULL)
 		{
 			return NULL;
 		}
-		RtlZeroMemory(g_slotPool, PAGE_SIZE);
+		//挂靠形态(映像尾页): 槽码落映像范围内=模块归属达成;
+		//池形态: 首槽清零(池页语义); 挂靠页本为零区不动
+		if (HookImageBaseOf((PVOID)g_slotPool) == NULL)
+		{
+			RtlZeroMemory(g_slotPool, PAGE_SIZE);
+		}
+		FlLog("[Hook] 槽池选址: %p(%s)",
+			g_slotPool,
+			(HookImageBaseOf((PVOID)g_slotPool) != NULL) ?
+			"模块映像code cave=LBR指纹缓解" : "池分配(挂靠失败回退)");
 	}
 	if (g_slotUsed >= HOOK_SLOT_PER_PAGE)
 	{
@@ -175,6 +256,25 @@ ULONG64 GnptCallbackDispatch(PVOID EntryPtr, PGUEST_REGS Regs)
 	{
 		slot->thread = NULL;
 		slot->seq = 0;
+	}
+	//NX-FENCE收尾: 视图回P重武装fence(stub尾ret回调用者前)。
+	//入口仅自P视图fault=回P即归位; vmmcall经签名门(外来者#UD),
+	//exit全账走TSC补偿壳(两exit之一)。回调异常不返回=旗滞留
+	//(该核fence miss, 边界=回调契约)
+	//跨核迁移自愈: 回调期间线程迁移(入口核cpu≠当前核)=入口核的
+	//在途旗+HOOKS视图滞留(其rearm永不至=beacon被护旗旗永久挡死
+	//=该核fence无界miss)。远程清入口核在途旗+置其驻留旗——入口
+	//核的下个任意exit信标即回P(fence重武装)。边界: trap→stub首
+	//指令间的迁移窗口不在覆盖内(见hook.h纪律9⑤)
+	if (e->pub.Flags & HOOK_NXFENCE)
+	{
+		ULONG curCpu = KeGetCurrentProcessorNumber();
+		if (curCpu != cpu && cpu < 64)
+		{
+			g_nxInDetour[cpu] = 0;    //弃置核在途旗远程清
+			g_nxFenceRes[cpu] = 1;    //弃置核驻留旗置=下个exit信标回P
+		}
+		CmVmmCall(GNPT_VMCALL_NXREARM, 0, 0, 0);
 	}
 	return ret;
 }
@@ -468,6 +568,7 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutL
 //IRET/SYSCALL/SYSRET不拦(清TF类→LeakCheck收口); INTn不拦但arm时
 //探测+#DB收尾清洗int帧内TF。
 static VOID HookSwitchView(PVMCB Vmcb, ULONG Cpu, ULONG View);    //前向(定义在NPF引擎段)
+static NTSTATUS HookNxFenceInstall(const GNPT_HOOK* Hook);       //前向(定义在NX-FENCE段)
 #define RFLAGS_TF               (1ULL << 8)
 #define RFLAGS_RF               (1ULL << 16)  //Resume Flag: 压制指令断点一指令(架构位)
 #define RFLAGS_FIXED1           (1ULL << 1)
@@ -1344,6 +1445,58 @@ static NTSTATUS HookDrRemove(PGNPT_ENTRY e)
 	return STATUS_SUCCESS;
 }
 
+//==================== NX-FENCE机件(HOOK_NXFENCE容量位) ====================
+//PG安全+无限容量的第三模式: 目标页P视图置NX(可读可写不可执行),
+//HOOKS视图保持恒等RWX(零PTE写)。入口取指NPF(P视图)→root改道
+//RIP=跳板槽+切HOOKS(detour/CallOriginal/函数体自HOOKS执行);
+//回调返回前经CmVmmCall(NXREARM)回P=fence重新武装。稳态2 exit/
+//调用。零工件(无CodePage无补丁字节, 两视图皆原始字节=读透明
+//结构性成立, PG覆盖目标可用)。边界见hook.h使用纪律9
+//每核状态数组见文件头(g_nxInDetour/g_nxFenceRes)
+
+//svm.c的NXREARM case入口(stub尾vmmcall, GIF=0上下文): 在途detour
+//收尾——清旗+视图回P(入口仅自P视图fault=回P即归位)。旗不在=
+//移除后补发等竞态形态: 静默(调用方仅推进RIP)
+VOID GnptHookNxRearm(PVMCB Vmcb, ULONG Cpu)
+{
+	if (g_nxInDetour[Cpu & 63] != 0)
+	{
+		g_nxInDetour[Cpu & 63] = 0;
+		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
+		{
+			static volatile LONG s_reCnt[64] = { 0 };
+			GNPT_CRUMB(s_reCnt, 0xFFF, Cpu,
+				FlRingPush('r', Cpu & 63, 0,
+					(ULONG64)(ULONG_PTR)Vmcb->State.Rip,
+					(ULONG64)gnCrumb, 0));
+		}
+	}
+}
+
+//svm.c的exit外壳统一信标(先于CPUID短路): fence页邻函数执行曾
+//驻留HOOKS(旗在)且无在途detour→回P(fence重新武装)。任意exit皆
+//信标(CPUID/MSR等常规流量秒级必达)=miss窗口有界; 在途detour护旗
+//(其中段exit不得翻视图——函数体自HOOKS执行)
+VOID GnptHookNxBeacon(PVMCB Vmcb, ULONG Cpu)
+{
+	if (g_nxFenceRes[Cpu & 63] == 0 || g_nxInDetour[Cpu & 63] != 0)
+	{
+		return;
+	}
+	g_nxFenceRes[Cpu & 63] = 0;
+	if (g_view[Cpu & 63] != GNPT_VIEW_PRIMARY)
+	{
+		HookSwitchView(Vmcb, Cpu, GNPT_VIEW_PRIMARY);
+		{
+			static volatile LONG s_bcCnt[64] = { 0 };
+			GNPT_CRUMB(s_bcCnt, 0xFFF, Cpu,
+				FlRingPush('A', Cpu & 63, 0,
+					(ULONG64)(ULONG_PTR)Vmcb->State.Rip,
+					(ULONG64)gnCrumb, 0));
+		}
+	}
+}
+
 //==================== NPF视图切换引擎(svm.c exit handler调用) ====================
 //返回TRUE=已处理(重入guest); FALSE=未处理(异常留痕由调用方)
 
@@ -1473,12 +1626,40 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 		//取指NPF
 		if (hit != NULL)
 		{
+			//NX-FENCE入口甄别(先于驻留路径; 同页唯一fence安装门
+			//→hit即fence条目): 取指fault的RIP精确命中fence入口=
+			//入口陷阱——置在途旗+切HOOKS+改道跳板槽(fault语义:
+			//RIP=入口未执行, 改道后slot自HOOKS取指)
+			if ((hit->pub.Flags & HOOK_NXFENCE) != 0 &&
+				(ULONG64)(ULONG_PTR)hit->pub.Target == Vmcb->State.Rip)
+			{
+				g_nxInDetour[Cpu] = 1;
+				HookSwitchView(Vmcb, Cpu, GNPT_VIEW_SECONDARY);
+				Vmcb->State.Rip = (ULONG64)(ULONG_PTR)hit->Slot;
+#if DBG
+				g_npfLoopCnt[Cpu] = 0;    //fence稳态同gpa高频fault=合法形态, 防'X'误触
+#endif
+				{
+					static volatile LONG s_fxCnt[64] = { 0 };
+					GNPT_CRUMB(s_fxCnt, 0xFFF, Cpu,
+						FlRingPush('k', Cpu, 0x400,
+							(ULONG64)(ULONG_PTR)Vmcb->State.Rip,
+							ExitInfo2, 0));
+				}
+				return TRUE;
+			}
 			//常规hook: P态→HOOKS驻留(该核后续取指零exit);
 			//HOOKS态取指fault理论不可达(CodePage可执行)——
 			//防御留痕+切P自愈
 			if (g_view[Cpu] == GNPT_VIEW_PRIMARY)
 			{
 				HookSwitchView(Vmcb, Cpu, GNPT_VIEW_SECONDARY);
+				//fence页邻函数驻留(页级NX连坐): 置旗=下个任意
+				//exit信标回P重武装fence(miss窗口=exit间隔)
+				if (hit->pub.Flags & HOOK_NXFENCE)
+				{
+					g_nxFenceRes[Cpu] = 1;
+				}
 				return TRUE;
 			}
 			FlRingPush('N', Cpu, 0x400, ExitInfo2, ExitInfo1, 0);
@@ -1615,11 +1796,25 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
+	//模式标志互斥: TRANSPARENT与NXFENCE为不同机件, 同置=参数错误
+	if ((Hook->Flags & (HOOK_TRANSPARENT | HOOK_NXFENCE)) ==
+		(HOOK_TRANSPARENT | HOOK_NXFENCE))
+	{
+		FlLog("[Hook] Install拒绝: TRANSPARENT与NXFENCE互斥(目标%p)",
+			Hook->Target);
+		return STATUS_INVALID_PARAMETER;
+	}
 	//TRANSPARENT分流(DR机件): 独立路径——无CodePage/无NPT布防/
 	//无工件隐蔽, 与普通模式机制正交(可并存, hook.h使用纪律7)
 	if (Hook->Flags & HOOK_TRANSPARENT)
 	{
 		return HookDrInstall(Hook);
+	}
+	//NX-FENCE分流(容量位): P视图页级NX入口陷阱, 独立路径
+	//(无CodePage/无DR/零工件)
+	if (Hook->Flags & HOOK_NXFENCE)
+	{
+		return HookNxFenceInstall(Hook);
 	}
 	HookStagePaced(HKST_INS_ENTRY);
 	if (Hook->StackArgs > GNPT_MAX_STACK_ARGS)
@@ -1741,6 +1936,23 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 			(unsigned long long)SvmNptCoverageBytes());
 		return STATUS_NOT_SUPPORTED;
 	}
+	//fence同页互斥门(对称): 本Install的恒等还原路径会拔掉同页
+	//fence的页级NX布防=fence静默死亡
+	for (ULONG i = 0; i < GNPT_MAX_HOOKS; i++)
+	{
+		PGNPT_ENTRY o = &g_hooks[i];
+		if (o->Used && !o->Removed && (o->pub.Flags & HOOK_NXFENCE) != 0 &&
+			o->TargetPa == e->TargetPa)
+		{
+			ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+			MmFreeContiguousMemory(e->CodePageVa);
+			e->Used = 0;
+			FlLog("[Hook] Install拒绝: 目标%p与fence hook%p同页"
+				"(普通模式恒等还原会拔掉fence页级NX)",
+				Hook->Target, o->pub.Target);
+			return STATUS_UNSUCCESSFUL;
+		}
+	}
 	HookStagePaced(HKST_INS_CPALLOC);
 	//root原语前置: 钉到虚拟化核集(SMT隔离下裸机兄弟核
 	//vmmcall=#UD→0x7E); 完事还原亲和
@@ -1834,6 +2046,151 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	return STATUS_SUCCESS;
 }
 
+//NX-FENCE安装(GnptHookInstall分流): 重定位跳板+跳板槽+P视图页级
+//NX布防+全核同步。无CodePage/无工件隐蔽/无DR——零工件PG安全,
+//容量仅受条目数限(同页唯一=页级NX共享资产)
+static NTSTATUS HookNxFenceInstall(const GNPT_HOOK* Hook)
+{
+	HookStage(HKST_INS_ENTRY);
+	//安装gate: 引擎运行中(同DR/普通)
+	{
+		BOOLEAN ready = (SvmNptViewNcr3(GNPT_VIEW_PRIMARY) != 0);
+		if (ready)
+		{
+			ULONG n = KeQueryActiveProcessorCount(NULL);
+			ULONG inGuest = 0;
+			for (ULONG i = 0; i < n && i < 64; i++)
+			{
+				if (g_svmVcpu[i].base.bInGuest)
+				{
+					inGuest++;
+				}
+			}
+			ready = (inGuest != 0);
+		}
+		if (!ready)
+		{
+			FlLog("[Hook] Install拒绝: 引擎未运行(零核in-guest或NPT未建)");
+			return STATUS_NOT_SUPPORTED;
+		}
+	}
+	//14B页边界(重定位跳板同源同长)
+	ULONG off = (ULONG)((ULONG_PTR)Hook->Target & (PAGE_SIZE - 1));
+	if (off + 14 > PAGE_SIZE)
+	{
+		FlLog("[Hook] Install拒绝: 目标%p偏移%u+14跨页", Hook->Target, off);
+		return STATUS_UNSUCCESSFUL;
+	}
+	//条目分配+重复安装检查
+	PGNPT_ENTRY e = NULL;
+	for (ULONG i = 0; i < GNPT_MAX_HOOKS; i++)
+	{
+		if (g_hooks[i].Used && !g_hooks[i].Removed &&
+			g_hooks[i].pub.Target == Hook->Target)
+		{
+			FlLog("[Hook] Install拒绝: 目标%p已安装(Remove后可重装)",
+				Hook->Target);
+			return STATUS_UNSUCCESSFUL;
+		}
+		if (e == NULL && !g_hooks[i].Used)
+		{
+			e = &g_hooks[i];
+		}
+	}
+	if (e == NULL)
+	{
+		FlLog("[Hook] Install拒绝: 条目满(%u)", (ULONG)GNPT_MAX_HOOKS);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	//目标物理页+覆盖预检(同普通模式)
+	ULONG64 pa = MmGetPhysicalAddress(
+		(PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1))).QuadPart;
+	if (pa >= SvmNptCoverageBytes())
+	{
+		FlLog("[Hook] Install拒绝: 目标%p物理%llX超NPT覆盖%llX",
+			Hook->Target, (unsigned long long)pa,
+			(unsigned long long)SvmNptCoverageBytes());
+		return STATUS_NOT_SUPPORTED;
+	}
+	//同页互斥门(fail-loud): 页级NX为共享资产——同页任何live hook
+	//(普通模式布防的恒等还原/另一fence的还原判定)与其冲突
+	for (ULONG i = 0; i < GNPT_MAX_HOOKS; i++)
+	{
+		PGNPT_ENTRY o = &g_hooks[i];
+		if (o->Used && !o->Removed && o->TargetPa == pa)
+		{
+			FlLog("[Hook] Install拒绝: 目标%p与已装hook%p同页"
+				"(fence页级NX=共享资产, 同页唯一)",
+				Hook->Target, o->pub.Target);
+			return STATUS_UNSUCCESSFUL;
+		}
+	}
+	RtlZeroMemory(e, sizeof(GNPT_ENTRY));
+	e->pub = *Hook;
+	e->Used = 1;
+	e->Removed = 0;
+	e->DrSlot = 0xFF;    //非DR模式
+	e->TargetPa = pa;
+	e->ReplayVA = HookBuildRelocTrampoline((ULONG64)Hook->Target, 14,
+		&e->ReplayLen);
+	if (e->ReplayVA == NULL)
+	{
+		e->Used = 0;
+		FlLog("[Hook] Install失败: 目标%p prologue不可重定位(见[Reloc]行)",
+			Hook->Target);
+		return STATUS_UNSUCCESSFUL;
+	}
+	e->Slot = HookAllocSlot(e);
+	if (e->Slot == NULL)
+	{
+		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+		e->Used = 0;
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	//root原语前置: 钉到虚拟化核集(P视图PTE写经vmmcall)
+	KAFFINITY oldAff = SvmPinVirtualizedCpus();
+	if (oldAff == 0)
+	{
+		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+		e->Used = 0;
+		FlLog("[Hook] Install失败: 引擎未起(无虚拟化核)");
+		return STATUS_NOT_SUPPORTED;
+	}
+	//发布先行(live++先于树写, 同普通模式不变量)
+	InterlockedIncrement(&g_hookLive);
+	HookStage(HKST_INS_LIVE);
+	//P视图布防: 原页RW|NX(取指NPF入口陷阱)。HOOKS树保持恒等
+	//RWX零PTE写(detour函数体执行面); 布防即刻全核同步(混合
+	//翻译窗口压缩到IPI延迟, 同普通模式纪律)
+	HookNptSetPteRoot(GNPT_VIEW_PRIMARY, e->TargetPa, e->TargetPa,
+		NPT_PTE_FLAGS_HOOKP);
+	HookSyncAllCpus();
+	HookStage(HKST_INS_ARMED);
+	FlLog("[Hook] Install OK(NX-Fence): 目标=%p 回调=%p 跳板槽=%p "
+		"重定位跳板=%p(%uB) 零工件(PG面) 稳态2exit/调用 栈参=%u",
+		Hook->Target, Hook->Callback, e->Slot, e->ReplayVA,
+		e->ReplayLen, Hook->StackArgs);
+	KeSetSystemAffinityThread(oldAff);
+	return STATUS_SUCCESS;
+}
+
+//NX-FENCE移除(GnptHookRemove分流; 路由已钉核): P视图恒等还原+
+//全核同步。在途detour(他核HOOKS执行函数体)不受影响——stub尾
+//rearm照常(per-core旗), 页已恒等=回P无害; 槽/条目延迟到卸载释放
+static NTSTATUS HookNxFenceRemove(PGNPT_ENTRY e)
+{
+	HookStage(HKST_RM_ENTRY);
+	HookNptRestoreRoot(GNPT_VIEW_PRIMARY, e->TargetPa);
+	HookStage(HKST_RM_ARMED);
+	HookSyncAllCpus();
+	e->Removed = 1;
+	InterlockedDecrement(&g_hookLive);
+	HookStage(HKST_RM_DONE);
+	FlLog("[Hook] Remove OK(NX-Fence): 目标=%p 全核恒等还原+同步"
+		"(在途回调安全完成)", e->pub.Target);
+	return STATUS_SUCCESS;
+}
+
 NTSTATUS GnptHookRemove(PVOID Target)
 {
 	//root原语前置: 钉到虚拟化核集(还原路径同发NPTRES)
@@ -1848,6 +2205,13 @@ NTSTATUS GnptHookRemove(PVOID Target)
 		if (!e->Used || e->Removed || e->pub.Target != Target)
 		{
 			continue;
+		}
+		//NX-FENCE分流(容量位): P视图恒等还原+同步(路由已钉核)
+		if (e->pub.Flags & HOOK_NXFENCE)
+		{
+			NTSTATUS fst = HookNxFenceRemove(e);
+			KeSetSystemAffinityThread(oldAff);    //钉核还原(提前返回)
+			return fst;
 		}
 		//TRANSPARENT分流(DR机件): 解除广播+槽释放, 无NPT/CodePage工作
 		if (e->DrSlot != 0xFF)
@@ -2014,14 +2378,21 @@ VOID GnptHookFreeMemory(VOID)
 	if (g_slotPool != NULL)
 	{
 		RtlZeroMemory(g_slotPool, PAGE_SIZE);
-		ExFreePoolWithTag(g_slotPool, HOOK_POOL_TAG);
+		//挂靠形态(映像code cave)=映像内存不可ExFreePool(非法
+		//池指针=池损坏), 只清零(映像随驱动卸载整体回收);
+		//池形态=正常释放
+		if (HookImageBaseOf((PVOID)g_slotPool) == NULL)
+		{
+			ExFreePoolWithTag(g_slotPool, HOOK_POOL_TAG);
+		}
 		g_slotPool = NULL;
 	}
 	g_slotUsed = 0;
 	g_hookLive = 0;
 	if (entries != 0)
 	{
-		FlLog("[Hook] FreeMemory: 条目%u个(重定位跳板%u+CodePage%u)+槽池已释放(清零后释放)",
+		FlLog("[Hook] FreeMemory: 条目%u个(重定位跳板%u+CodePage%u)"
+			"+槽池已清零释放",
 			entries, replays, codepages);
 	}
 }

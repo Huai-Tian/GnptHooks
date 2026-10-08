@@ -258,6 +258,9 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
                                //  on(bit8) r8=入口线性地址(on=1)→
                                //  __writedr(slot)+VMCB.Dr7合并置位;
                                //  on=0→Dr7撤位('g'环逐核留痕)
+#define GNPT_VMCALL_NXREARM 14 //NX-Fence detour收尾(stub尾经CmVmmCall
+                               //  自发, 处置在hook.c的GnptHookNxRearm):
+                               //  在途旗清+视图回P(fence重武装)→推进RIP
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)

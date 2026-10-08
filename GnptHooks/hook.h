@@ -44,13 +44,40 @@
 //     所在核上hook同样让位(guest释放后自动恢复)。DR0-3对guest
 //     可见面=影子(其断点真实可触发+回读一致, DR7回读恒含
 //     bit10 RA1=裸机形态)
+//  6b. DR槽选址纪律(检测面): **纯监控优先**——回调透传
+//     (GnptCallOriginal转发)或仅计数统计的hook用TRANSPARENT
+//     安全; **拦截型(改参/改返回值/阻断调用)慎用**——DR断点
+//     作用域=线性地址, 检测方对目标函数做**重映射别名调用**
+//     (映射同一物理页的其他VA调用函数=绕过DR断点)可差分出
+//     "某VA被hook而别名未hook"=改道式hook的返回值不一致指纹
+//     (普通/NX-FENCE为物理页作用域, 对别名调用同样生效=结构性
+//     免疫)。透传监控无返回值差分面=DR线性作用域不可探测。
+//     拦截需求×PG覆盖目标=权衡接受残余或改普通模式冷靶
 //  7. 模式并存: TRANSPARENT(DR线性断点)与普通模式(NPT视图)
-//     机制正交, 可同机并存(不同目标); 唯余约束=普通模式同页
-//     多hook的NPF首匹配边界(引擎按TargetPa首匹配, 同页第二
-//     个普通hook永不可达)。单写者契约见纪律8
+//     机制正交, 可同机并存(不同目标); NX-FENCE与TRANSPARENT同为
+//     PG安全族可并存; **fence与普通模式并存时, 普通hook驻留HOOKS
+//     的核上fence不触发**(fence页HOOKS恒等RWX无fault=miss窗口,
+//     退出驻留即恢复)——混用场景fence命中率按普通hook驻留时长
+//     折损, 见纪律9。唯一余约束=普通模式同页多hook的NPF首匹配
+//     边界(引擎按TargetPa首匹配, 同页第二个普通hook永不可达)。
+//     单写者契约见纪律8
 //  8. 单写者契约: Install/Remove/RemoveAll/Enumerate内部无锁
 //     (条目分配/隐蔽登记/树游标均为单写者设计), 调用方须自行
 //     串行化(专用工作线程或互斥); 并发调用=条目与登记表竞态
+//  9. NX-FENCE容量位边界(HOOK_NXFENCE): PG安全零工件(两视图皆
+//     原始字节)+无限容量(仅条目数限)。稳态2 exit/调用(入口NPF
+//     改道+rearm vmmcall)。边界: ①同页唯一且不得与任何已有hook
+//     同页(页级NX为共享资产, Install fail-loud拒绝); ②目标页
+//     邻函数执行触发页级NPF→该核驻留HOOKS+置旗, 下个任意exit
+//     信标回P(fence重武装; miss窗口=exit间隔, 加载态µs级/空闲
+//     态秒级)——热页邻函数=exit流量放大, fence选**冷页/页隔离**
+//     目标(驱动本地目标用#pragma code_seg专用节=结构性隔离);
+//     ③detour回调内直调其他fence目标不触发(fail-open原函数
+//     直跑); ④回调必须正常返回(stub尾rearm依赖返回路径);
+//     ⑤回调期间线程跨核迁移=入口核远程自愈(dispatch检测迁移→
+//     清入口核在途旗+置驻留旗→该核下个任意exit信标回P); 入口
+//     trap→stub首指令间的迁移窗口不在覆盖内(该核fence miss
+//     直至外部写/后续迁移自愈, 概率~ns级窗口)
 //
 //硬件要求: 引擎运行中(全核in-guest)才可安装; 目标prologue含相对
 //  分支/RIP-relative超±2GB=Install拒绝(日志[Reloc]行留痕)
@@ -83,6 +110,8 @@ typedef struct _GNPT_HOOK
 	                          //(DR0-3执行断点入口陷阱+原页恒等,
 	                          //外部读=原始字节, PG覆盖/热靶可用;
 	                          //每核≤4个, 见使用纪律6)
+	                          //位1=HOOK_NXFENCE: 容量位(NX-Fence,
+	                          //见使用纪律9)
 } GNPT_HOOK, *PGNPT_HOOK;
 
 //hook模式标志(Flags位)
@@ -93,9 +122,18 @@ typedef struct _GNPT_HOOK
                                        //原页恒等原始字节=读/写透明
                                        //结构性成立; 函数体自原页
                                        //执行零exit
+#define HOOK_NXFENCE            0x2   //容量位(NX-Fence机件): 目标页
+                                       //P视图RW|NX(取指NPF→root改道
+                                       //RIP=跳板槽+切HOOKS恒等RWX),
+                                       //回调返回前rearm vmmcall回P。
+                                       //零工件(无CodePage无补丁字节,
+                                       //两视图皆原始字节=PG安全),
+                                       //无限容量(同页唯一), 稳态
+                                       //2 exit/调用
 
 //安装hook(PASSIVE_LEVEL, 引擎运行中): TRANSPARENT=DR槽分配+全核
-//武装广播; 普通模式=CodePage构建+两视图布防+CodePage工件隐蔽
+//武装广播; NX-FENCE=P视图页级NX布防+全核TLB同步(无CodePage);
+//普通模式=CodePage构建+两视图布防+CodePage工件隐蔽
 //(身份PTE两视图零页——guest物理扫描不可见)+全核TLB同步
 NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook);
 
@@ -158,5 +196,16 @@ VOID GnptHookDrArmCore(struct _VMCB* Vmcb, ULONG Cpu, ULONG Slot,
 //每核DR影子初始化(svm.c的VMCB init DR卫生段调用): DR7影子
 //=裸机恒读值0x400(bit10 RA1)——guest读DR7零差异, 写读幂等
 VOID GnptHookDrShadowInit(ULONG Cpu);
+
+//NX-FENCE机件(svm.c调用)
+//  NxRearm: NXREARM vmmcall处置(stub尾自发)——在途detour旗清
+//  +视图回P(fence重武装); 旗不在=移除后补发/跨核迁移(入口核
+//  由dispatch远程自愈)等竞态形态, 静默(调用方推进RIP即可)
+//  NxBeacon: exit外壳统一信标(先于CPUID短路)——fence页邻函数
+//  驻留旗在且无在途detour→回P重武装; 任意exit皆信标(CPUID/
+//  MSR等常规流量秒级必达)=miss窗口有界; 在途detour护旗(其中
+//  段exit不得翻视图, 函数体自HOOKS执行)
+VOID GnptHookNxRearm(struct _VMCB* Vmcb, ULONG Cpu);
+VOID GnptHookNxBeacon(struct _VMCB* Vmcb, ULONG Cpu);
 
 #endif // HOOK_H
