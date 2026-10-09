@@ -7,6 +7,16 @@
    .\accel_test.ps1 -Minutes 60                 # 加速轮A加长
    .\accel_test.ps1 -Mode C                     # 负载轮C(忙负载+默认idle, 真实形态)
    .\accel_test.ps1 -Mode Full                  # A + C 连跑
+ v6 变更:
+   - 预检退役向量残留: 轮起检测IDLEDISABLE≠0(v1-v4 C轮"钉C0死亡
+     复现器"崩溃后finally未还原的powercfg持久化自续——实测
+     10/7 14:07以来每轮基线AC=1 DC=1, 判例M16.38)→响亮警告+
+     自动还原0后再记基线
+   - 电源设置回读验证: set后重查生效值, 别名不解析/静默失败从此
+     可见(实测本机IDLEDEMOTE查询在全部历史progress log中无一次
+     记录=别名不解析, A轮"深idle降级"向量疑从未生效, A轮实际=
+     纯切换器负载churn)
+   - AC/DC分别忠实还原(旧版把保存的AC值拍平写到两个索引)
  v5 变更:
    - C轮重定义: IDLEDISABLE(钉C0, 历史死亡复现器, 三体竞态已修复
      而退役)→忙负载+默认idle——测真实使用形态, 此格史上未正经测
@@ -119,15 +129,22 @@ function Get-HexIndexes([string]$setting) {
     } catch { return $null }
 }
 
+# v6: 单设置写入+回读验证——set后重查生效值, 别名不解析/静默失败
+# 从此可见(本机IDLEDEMOTE曾全程静默失败而不自知, 判例M16.38)
+function Set-Setting([string]$setting, [int]$ac, [int]$dc) {
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR $setting $ac | Out-Null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR $setting $dc | Out-Null
+    $chk = Get-HexIndexes $setting
+    if ($null -eq $chk) {
+        Log ('警告: {0} 写入后查询失败——本机不解析该别名, 此电源向量未生效!' -f $setting)
+    } elseif ($chk[0] -ne $ac -or $chk[1] -ne $dc) {
+        Log ('警告: {0} 写入未生效(期望 AC={1} DC={2}, 实测 AC={3} DC={4})' -f $setting, $ac, $dc, $chk[0], $chk[1])
+    }
+}
+
 function Set-Power([int]$demote, [int]$disable) {
-    if ($demote -ge 0) {
-        powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDEMOTE $demote | Out-Null
-        powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDEMOTE $demote | Out-Null
-    }
-    if ($disable -ge 0) {
-        powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE $disable | Out-Null
-        powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE $disable | Out-Null
-    }
+    if ($demote -ge 0)  { Set-Setting 'IDLEDEMOTE'  $demote  $demote }
+    if ($disable -ge 0) { Set-Setting 'IDLEDISABLE' $disable $disable }
     powercfg /setactive SCHEME_CURRENT | Out-Null
 }
 
@@ -200,9 +217,19 @@ function Invoke-Round([string]$roundMode, [int]$minutes) {
     Save-State $testStart $roundMode $false
     Set-Content -Path $ProgF -Value ('==== 加速轮{0} 开始 {1} (预期横幅 {2}) ====' -f $roundMode, $testStart, $ExpectTag) -Encoding UTF8
 
+    # v6预检: IDLEDISABLE≠0 = 退役向量残留(v1-v4 C轮钉C0死亡复现器,
+    # 某轮崩溃finally未还原→powercfg持久化自续, 判例M16.38):
+    # 警告+自动归零, 基线回到真实默认
+    $pre = Get-HexIndexes 'IDLEDISABLE'
+    if ($pre -and ($pre[0] -ne 0 -or $pre[1] -ne 0)) {
+        Log ('警告: 空闲禁用残留 IDLEDISABLE AC={0} DC={1}(退役向量自续)——自动还原为0' -f $pre[0], $pre[1])
+        Set-Setting 'IDLEDISABLE' 0 0
+    }
+
     $savedDemote  = Get-HexIndexes 'IDLEDEMOTE'
     $savedDisable = Get-HexIndexes 'IDLEDISABLE'
     if ($savedDemote)  { Log ('记录: IDLEDEMOTE 当前 AC={0} DC={1}' -f $savedDemote[0],  $savedDemote[1]) }
+    else { Log '警告: IDLEDEMOTE 查询失败——本机不解析该别名, A轮深idle向量不可用(实际=纯切换器负载churn)' }
     if ($savedDisable) { Log ('记录: IDLEDISABLE 当前 AC={0} DC={1}' -f $savedDisable[0], $savedDisable[1]) }
 
     $procs = @()
@@ -303,8 +330,9 @@ function Invoke-Round([string]$roundMode, [int]$minutes) {
             Start-Sleep -Seconds 5
         }
         Log '清理: 还原电源设置...'
-        if ($savedDemote)  { Set-Power -demote $savedDemote[0]  -disable -1 }
-        if ($savedDisable) { Set-Power -demote -1 -disable $savedDisable[0] }
+        # v6: AC/DC分别忠实还原(旧版把保存的AC值拍平写到两索引)+回读验证
+        if ($savedDemote)  { Set-Setting 'IDLEDEMOTE'  $savedDemote[0]  $savedDemote[1] }
+        if ($savedDisable) { Set-Setting 'IDLEDISABLE' $savedDisable[0] $savedDisable[1] }
         powercfg /setactive SCHEME_CURRENT | Out-Null
         Save-State $testStart $roundMode $true
 

@@ -32,11 +32,13 @@
 //DR断点按线性地址不受页约束)。普通模式目标选Ke*普通内核函数
 //(hook.h使用纪律5: PG不覆盖类); fence目标选驱动本地专用节
 //(code_seg独占页, hook.h使用纪律9: 冷页/页隔离)
-//阶段B热靶选择(v0.9cl): PsGetProcessId(默认)——NtClose经五时代
-//    实测(M16.35 WER法证42份同位素)定罪与DWM句柄churn交互
-//    (唯一高频穿越DWM渲染环的syscall钩)后撤出验收面(601k净
-//    分发+'w'=0已使detour引擎毕业); GNPT_DEMO_TORTURE=1复装
-//    NtClose=Debug酷刑压力轮(非验收项)
+//阶段B热靶选择(v0.9cm): PsGetProcessId经**HOOK_TRANSPARENT**(DR
+//    机件)——归因实验: cj/ck(NtClose)/cl(PsGetProcessId)三代DWM
+//    首崩均钉普通模式CodePage热靶上线±1s(M16.37), cm=同函数同
+//    流量换机制(DR原页零接触无CodePage无视图驻留), DWM零崩=
+//    CodePage机制定罪, 仍崩=机制无关共性→fence/安装序列二分。
+//    GNPT_DEMO_TORTURE=1复装NtClose普通模式=Debug酷刑压力轮
+//    (22B自含过拒装门, 非验收项)
 #define GNPT_DEMO_TORTURE 0
 #if GNPT_DEMO_TORTURE
 #define GNPT_DEMO_N_NAME  "NtClose"
@@ -204,8 +206,9 @@ static VOID DemoFireT(ULONG idx)
 //自触发阶段B普通模式hook一次(签名随热靶形态切换)。热靶选择史:
 //KeInitializeDpc=PG监视集成员实证(0x109, P3逐位匹配——普通模式
 //读透明漏洞)→NtClose(cc~ck时代=PG面oracle+最强压测, ck轮601k
-//净分发+'w'=0毕业)→v0.9cl换PsGetProcessId(纯查询单指针参零
-//状态突变; 引擎零调用=无自穿越; 内核内部API=非DWM渲染环路径)
+//净分发+'w'=0毕业)→cl轮PsGetProcessId普通模式("离体"误判:
+// 实躺Ob句柄churn下游, 装机即8000/s且DWM崩23起)→cm轮同函数
+//改HOOK_TRANSPARENT=同函数同流量换机制的归因实验
 static VOID DemoFireN(VOID)
 {
 #if GNPT_DEMO_TORTURE
@@ -770,9 +773,12 @@ static VOID DemoMultiHookThread(PVOID Context)
 			FlLog("[MultiHook] 阶段B: %s解析失败, 本轮跳过",
 				GNPT_DEMO_N_NAME);
 		}
-		else if ((ULONG_PTR)PAGE_ALIGN(g_demoN) ==
+		else if (!GNPT_DEMO_TORTURE &&
+			(ULONG_PTR)PAGE_ALIGN(g_demoN) ==
 			(ULONG_PTR)PAGE_ALIGN(g_demoT[aIdx]))
 		{
+			//DR断点按线性地址不受页约束, 同页无需跳过; 普通模式
+			//(酷刑)沿用同页防御
 			FlLog("[MultiHook] 阶段B: %s与活T同页, 本轮跳过",
 				GNPT_DEMO_N_NAME);
 		}
@@ -782,14 +788,27 @@ static VOID DemoMultiHookThread(PVOID Context)
 			h.Target = g_demoN;
 			h.Callback = DemoCountCallback;
 			h.Context = &g_demoNCall;
-			h.Flags = 0;    //普通模式(热靶=PsGetProcessId: Ps*纯查询, 纪律5 PG不覆盖类)
-			//①并存格: T驻留时N Install——两机制无交集(线性断点×
-			//NPT视图), 应成功
+#if GNPT_DEMO_TORTURE
+			h.Flags = 0;    //酷刑: 普通模式CodePage(NtClose 22B自含过拒装门)
+#else
+			h.Flags = HOOK_TRANSPARENT;    //验收: DR机件(v0.9cm归因实验:
+			                               //同函数同流量换机制; 高频热靶
+			                               //纪律=TRANSPARENT)
+#endif
+			//①并存格: T驻留时N Install——验收形态=双DR槽并存(T1槽0+
+			//N槽1, 容量≤4/核); 酷刑形态=DR×NPT机制正交。应成功
 			NTSTATUS st = GnptHookInstall(&h);
+#if GNPT_DEMO_TORTURE
 			FlLog("[MultiHook] 阶段B 并存格: T驻留时N Install→0x%X(%s)",
 				(ULONG)st, NT_SUCCESS(st) ?
 				"成功=正交并存(DR机件: 断点与视图无交集)" :
 				"失败(应成功, 见[Hook]行)");
+#else
+			FlLog("[MultiHook] 阶段B 并存格: T驻留时N(DR) Install→0x%X(%s)",
+				(ULONG)st, NT_SUCCESS(st) ?
+				"成功=双DR槽并存(T槽0+N槽1, 容量≤4/核)" :
+				"失败(应成功, 见[Hook]行)");
+#endif
 			//②撤除最后的活T(此前T1已在阶段A被选择性移除)
 			NTSTATUS rst = GnptHookRemove(g_demoT[aIdx]);
 			FlLog("[MultiHook] 阶段B 撤T: Remove %s→%s",

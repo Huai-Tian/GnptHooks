@@ -270,26 +270,25 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9cl"
+#define GNPT_BUILD_TAG "v0.9cm"
 //L系列配置二分探针(已完成使命, 保留供复验)。组表:
 //G1=异常拦截(#DB/#GP/#MC)+DR位 G2=MSRPM故事位 G3=SMI/SHUTDOWN/
 //INIT/INVLPGA/SVM族 G4=TSC补偿壳; GNPT_L3_NODEMO=1(任意组合下
 //禁demo=纯引擎纪律)
-//毕业链(NOTES M16.23-16.35): 冻结族杀手=DR+#DB+#GP(生产已剥
-// #GP/#MC); ch死轮triple fault=平台衰减态腐败(引擎清白);
-// ch复跑=生产位图平反, "速死"主线收官; cj轮=ctx环全局序号
-//踩踏竞态定罪(CallOriginal回退返0→NtClose假成功→DWM MIL
-// failfast崩溃循环)——修复=线程键表+C栈上下文链(hook.c);
-// ck轮='w'=0×601k分发+H:O=152:152=竞态实证消灭, 但残余3起
-// DWM孤立崩(PCH_B1)——WER法证42份同位素收口: 崩溃簇与
-// NtClose demo轮五时代完全同构, NODEMO轮全零→NtClose钩=
-// 头号嫌疑(唯一高频穿越DWM GPU句柄churn的syscall钩)
-//当前形态: v0.9cl=ck引擎不动, demo热靶NtClose→PsGetProcessId
-// (离体: Ps*纯查询, 引擎零调用无自穿越, 非DWM渲染环路径;
-// NtClose已601k毕业, 酷刑开关GNPT_DEMO_TORTURE=1可复装)。
-//判读: 活且零DWM事件=
-// NtClose×DWM交互终审定罪+生产验收通过→commit(bu→cl)。
-//accel -ExpectTag v0.9cl
+//毕业链(NOTES M16.23-16.38): 冻结族杀手=DR+#DB+#GP(生产已剥
+// #GP/#MC); ch死轮=平台衰减态腐败(引擎清白); cj轮=ctx环竞态
+// 定罪→ck线程键表修复('w'=0×601k毕业); cl轮=归因反转——三代
+// DWM首崩均钉普通模式CodePage热靶上线±1s(机制共性非函数特异
+// ), PsGetProcessId"离体"误判(实躺Ob句柄churn下游8000/s),
+// 另机器383s静默硬死=衰减态独立实体; 电源法证: IDLEDISABLE=1
+// (C0钉死)残留≥2.5天自续+IDLEDEMOTE别名不解析=A轮加速双失效
+// (accel v6已硬化)
+//当前形态: v0.9cm=归因实验构建——①hook.c拒装门(普通模式14B
+// 补丁遇函数尾控制转移即拒, 短函数越权写邻码结构性不可能)
+// ②demo热靶PsGetProcessId改HOOK_TRANSPARENT(同函数同流量换
+// 机制: DR原页零接触)。判读: DWM零崩=CodePage机制定罪+热靶
+// 用DR纪律成立; 仍崩=机制无关共性→二分; DR热流量(8000/s #DB
+// exit)若致冻结=平台边界新知。accel -ExpectTag v0.9cm
 #define GNPT_L3_MINIMAL 0
 #define GNPT_L3_G2      0
 #define GNPT_L3_G4      0

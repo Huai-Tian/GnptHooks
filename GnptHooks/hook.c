@@ -457,7 +457,12 @@ static ULONG HookRewriteRipRelImm64(PUCHAR Dst, ldasm_data* Ld,
 	return 10;
 }
 
-static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutLen)
+//RejectCtrl=普通模式专用拒装门(v0.9cm, 判例M16.37 C1): 14B补丁
+//会写原页(HOOKS视图=CodePage副本), 函数尾早于补丁尾时后6B越权
+//写邻码——解码覆盖期遇控制转移即拒。DR/NX-FENCE路径原页恒等
+//不动(无补丁), 重放越过ret=尾跳死代码, 无害——传FALSE不设门
+static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen,
+	BOOLEAN RejectCtrl, PULONG OutLen)
 {
 	if (OutLen != NULL)
 	{
@@ -496,6 +501,32 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen, PULONG OutL
 				total, *(PUCHAR)src, *((PUCHAR)src + 1));
 			bad = TRUE;
 			break;
+		}
+		//普通模式拒装门: 控制转移@补丁覆盖内=函数短于14B补丁,
+		//补丁尾将越函数尾越权写邻码(实测形态: PsGetProcessId 8B
+		//函数mov+ret×14B补丁=+8..+13落邻码, M16.37)——fail-loud
+		//拒绝+指路TRANSPARENT。相对分支族已被上方拒绝, 此处收
+		//ret/iret/int/icebp/hlt/间接call-jmp/sysenter族
+		if (RejectCtrl)
+		{
+			PUCHAR opc = (PUCHAR)src + ld.opcd_offset;
+			UCHAR op1 = opc[0];
+			UCHAR op2 = (ld.opcd_size >= 2) ? opc[1] : 0;
+			BOOLEAN ctrl =
+				(op1 == 0xC3 || op1 == 0xC2 || op1 == 0xCF ||
+				 op1 == 0xCD || op1 == 0xF1 || op1 == 0xF4) ||
+				(op1 == 0x0F && (op2 == 0x34 || op2 == 0x35 ||
+					op2 == 0x07)) ||
+				(op1 == 0xFF && ((((ld.modrm >> 3) & 7) == 2) ||
+					(((ld.modrm >> 3) & 7) == 4)));
+			if (ctrl)
+			{
+				FlLog("[Reloc] 拒绝: 普通模式目标过短——控制转移@+%u"
+					"(函数尾早于14B补丁尾, 补丁将越权写邻码); 目标改用HOOK_TRANSPARENT",
+					total);
+				bad = TRUE;
+				break;
+			}
 		}
 		RtlCopyMemory(buf + total, (PVOID)src, len);
 		//RIP-relative数据寻址(非分支): 保绝对有效地址不变。
@@ -1464,9 +1495,10 @@ static NTSTATUS HookDrInstall(const GNPT_HOOK* Hook)
 	e->Removed = 0;
 	e->DrSlot = (UCHAR)slot;
 	//LDE重定位跳板(MinLen=14: 入口指令从未执行, CallOriginal重放
-	//覆盖字节后尾跳Target+ReplayLen=非断点地址不再触发)
+	//覆盖字节后尾跳Target+ReplayLen=非断点地址不再触发; 短函数重
+	//放越过ret=尾跳死代码, 无补丁不设门)
 	e->ReplayVA = HookBuildRelocTrampoline((ULONG64)Hook->Target, 14,
-		&e->ReplayLen);
+		FALSE, &e->ReplayLen);
 	if (e->ReplayVA == NULL)
 	{
 		e->Used = 0;
@@ -1945,9 +1977,10 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	e->Used = 1;
 	e->Removed = 0;
 	e->DrSlot = 0xFF;    //普通模式(零值0=合法槽号, 不可默认)
-	//LDE重定位跳板(MinLen=14=CodePage跳转覆盖长度, 两者同源同长)
+	//LDE重定位跳板(MinLen=14=CodePage跳转覆盖长度, 两者同源同长;
+	//TRUE=拒装门开: 短于补丁的函数在此被fail-loud拒绝, M16.37)
 	e->ReplayVA = HookBuildRelocTrampoline((ULONG64)Hook->Target, 14,
-		&e->ReplayLen);
+		TRUE, &e->ReplayLen);
 	if (e->ReplayVA == NULL)
 	{
 		e->Used = 0;
@@ -2199,8 +2232,10 @@ static NTSTATUS HookNxFenceInstall(const GNPT_HOOK* Hook)
 	e->Removed = 0;
 	e->DrSlot = 0xFF;    //非DR模式
 	e->TargetPa = pa;
+	//NX-FENCE零工件(原页恒等): 无补丁不设拒装门(短函数重放越ret
+	//=尾跳死代码, 同DR路径)
 	e->ReplayVA = HookBuildRelocTrampoline((ULONG64)Hook->Target, 14,
-		&e->ReplayLen);
+		FALSE, &e->ReplayLen);
 	if (e->ReplayVA == NULL)
 	{
 		e->Used = 0;
