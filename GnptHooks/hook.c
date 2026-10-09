@@ -101,21 +101,62 @@ static volatile LONG g_view[64];
 static volatile LONG g_nxInDetour[64];
 static volatile LONG g_nxFenceRes[64];
 
-//detour上下文环(迁移安全): 每核槽位方案在回调跨核迁移时失配
-//(丢调用或误调他hook原函数)。改用全局序号环按发起线程解析——
-//同线程顺序执行, 其最大序号条目=当前最内层分发; 嵌套=内层序号
-//更大, 跨核迁移天然正确。环深度上界=并发在途回调数(16核×浅
-//嵌套<<128); 超环覆写=降级为丢调用(非误调), 概率可忽略
-#define HOOK_CTX_RING  128             //2的幂(槽位掩码)
+//detour上下文表(v0.9ck重构, NOTES M16.32定罪修复): 每线程条目
+//+分发函数C栈局部上下文链。原全局序号环的结构性缺陷: 环按全局
+//分发计数轮转而非并发在途回调计数——热靶(v0.9cj轮NtClose实测
+//~3000分发/秒)下43ms被踏一遍, 在途回调槽被纯序号推进覆写(与
+//真实并发无关; 原注释"上界=并发在途回调数"混淆了两者)→
+//CallOriginal扫描失配→'w'回退返0→透传回调把0当API返回值
+//(NtClose=假成功不关句柄=静默句柄泄漏; 1.12M分发×ppm级槽覆写
+//≈数千次→GDI/句柄耗尽→DWM崩溃循环→会话重置, 用户目击"资源
+//不足"即此)。
+//新形态: ①上下文=分发函数C栈局部(线程挂起/迁移天然安全——
+//局部变量随内核栈走; 嵌套=分发函数自身保存/恢复外层指针=C栈
+//自然链) ②线程键小表+自旋锁(发布/回收/查询共用, 临界区纯内存
+//操作~百ns, 3000/s流量下开销可忽略; KeAcquireSpinLock抬DISPATCH
+//防持锁被抢占, 回调契约本禁>DISPATCH调用=fail-loud)。同线程
+//任意时刻恰一个最内层分发=表中恰一活跃条目; 条目数≤在途回调
+//线程数<<表深; 线程不可能终止于回调内(其内核栈正在回调中)
+//=活跃条目零泄漏。表满(极端抢占风暴, 防御): 该分发不发布,
+//其CallOriginal走'w'回退=fail-loud可见
+#define HOOK_CTX_MAX   128            //在途回调线程数上界(防御深度)
 typedef struct _HOOK_CTX
 {
-	volatile LONG64 seq;            //0=空; 发布序号(最后写=发布点)
-	PVOID volatile   thread;        //发起线程(分发期有效)
-	PGNPT_ENTRY volatile hook;
-	PGUEST_REGS volatile regs;
+	PVOID          thread;    //发起线程(校验键)
+	PGNPT_ENTRY    hook;
+	PGUEST_REGS    regs;
 } HOOK_CTX;
-static HOOK_CTX g_ctx[HOOK_CTX_RING];
-static volatile LONG64 g_ctxSeq = 0;
+typedef struct _HOOK_CTX_SLOT
+{
+	PVOID volatile thread;    //NULL=空槽(先写ctx后写thread=发布点)
+	HOOK_CTX* volatile ctx;   //该线程当前最内层上下文(在其C栈上)
+} HOOK_CTX_SLOT;
+static HOOK_CTX_SLOT g_ctxTab[HOOK_CTX_MAX];
+static KSPIN_LOCK g_ctxLock;
+
+//表操作(均须持g_ctxLock): 线性扫64/128槽, 在途回调数极小=微不足道
+static HOOK_CTX_SLOT* HookCtxSlotFind(PVOID Thread)
+{
+	for (ULONG i = 0; i < HOOK_CTX_MAX; i++)
+	{
+		if (g_ctxTab[i].thread == Thread)
+		{
+			return &g_ctxTab[i];
+		}
+	}
+	return NULL;
+}
+static HOOK_CTX_SLOT* HookCtxSlotFree(VOID)
+{
+	for (ULONG i = 0; i < HOOK_CTX_MAX; i++)
+	{
+		if (g_ctxTab[i].thread == NULL)
+		{
+			return &g_ctxTab[i];
+		}
+	}
+	return NULL;
+}
 
 //hook-asm.asm入口
 extern VOID GnptStubEntry(VOID);
@@ -225,7 +266,7 @@ static PUCHAR HookAllocSlot(PGNPT_ENTRY Entry)
 }
 
 //==================== detour分发与CallOriginal ====================
-//asm stub调用(rcx=API条目, rdx=GUEST_REGS帧): 设置每核detour上下文
+//asm stub调用(rcx=API条目, rdx=GUEST_REGS帧): 发布线程键detour上下文
 //后进用户回调。StackArgs>0时回调收第5+参数指针(=触发帧上实参
 //regs->rsp+28h, 可读可写, 写后按改写值转发)
 ULONG64 GnptCallbackDispatch(PVOID EntryPtr, PGUEST_REGS Regs)
@@ -239,24 +280,57 @@ ULONG64 GnptCallbackDispatch(PVOID EntryPtr, PGUEST_REGS Regs)
 			FlRingPush('H', cpu, 0, (ULONG64)(ULONG_PTR)e->pub.Target,
 				(ULONG64)gnCrumb, 0));
 	}
-	//发布detour上下文到全局序号环(线程键; seq最后写=发布点,
-	//读者以seq双重校验条目未被覆写/回收)
-	LONG64 mySeq = InterlockedIncrement64(&g_ctxSeq);
-	HOOK_CTX* slot = &g_ctx[mySeq & (HOOK_CTX_RING - 1)];
-	slot->thread = PsGetCurrentThread();
-	slot->hook = e;
-	slot->regs = Regs;
-	slot->seq = mySeq;
+	//发布detour上下文(线程键表; 上下文本体=本函数C栈局部,
+	//嵌套=保存外层指针于本帧, 出口恢复): 持锁临界区纯内存操作
+	HOOK_CTX myCtx;
+	myCtx.thread = PsGetCurrentThread();
+	myCtx.hook = e;
+	myCtx.regs = Regs;
+	HOOK_CTX* savedOuter;
+	KIRQL ctxIrql;
+	KeAcquireSpinLock(&g_ctxLock, &ctxIrql);
+	{
+		HOOK_CTX_SLOT* s = HookCtxSlotFind(myCtx.thread);
+		if (s != NULL)
+		{
+			savedOuter = s->ctx;    //嵌套: 外层上下文(其C帧上)
+			s->ctx = &myCtx;
+		}
+		else
+		{
+			HOOK_CTX_SLOT* free = HookCtxSlotFree();
+			if (free != NULL)
+			{
+				savedOuter = NULL;
+				free->ctx = &myCtx;
+				free->thread = myCtx.thread;    //发布点(thread最后写)
+			}
+			else
+			{
+				savedOuter = NULL;    //表满(防御不可达): 不发布, 其CallOriginal走'w'回退=fail-loud
+			}
+		}
+	}
+	KeReleaseSpinLock(&g_ctxLock, ctxIrql);
 	ULONG64* stackArgs = (e->pub.StackArgs != 0)
 		? (ULONG64*)(Regs->rsp + 0x28) : NULL;
 	ULONG64 ret = e->pub.Callback(e->pub.Context,
 		Regs->rcx, Regs->rdx, Regs->r8, Regs->r9, stackArgs);
-	//回收(条目未被环覆写才清; 此时本线程已无扫描者, 清序无害)
-	if (slot->seq == mySeq)
+	//回收(线程键条目恢复外层或置空; 嵌套内层已先行恢复本条目
+	//为其外层——本帧见s->ctx==&myCtx恰成立)
+	KeAcquireSpinLock(&g_ctxLock, &ctxIrql);
 	{
-		slot->thread = NULL;
-		slot->seq = 0;
+		HOOK_CTX_SLOT* s = HookCtxSlotFind(myCtx.thread);
+		if (s != NULL && s->ctx == &myCtx)
+		{
+			s->ctx = savedOuter;
+			if (savedOuter == NULL)
+			{
+				s->thread = NULL;    //最外层: 条目回收
+			}
+		}
 	}
+	KeReleaseSpinLock(&g_ctxLock, ctxIrql);
 	//NX-FENCE收尾: 视图回P重武装fence(stub尾ret回调用者前)。
 	//入口仅自P视图fault=回P即归位; vmmcall经签名门(外来者#UD),
 	//exit全账走TSC补偿壳(两exit之一)。回调异常不返回=旗滞留
@@ -282,32 +356,26 @@ ULONG64 GnptCallbackDispatch(PVOID EntryPtr, PGUEST_REGS Regs)
 ULONG64 GnptCallOriginal(ULONG64 Arg1, ULONG64 Arg2, ULONG64 Arg3, ULONG64 Arg4)
 {
 	ULONG cpu = KeGetCurrentProcessorNumber();
-	//解析当前线程最内层分发: 环内该线程最大序号条目(跨核迁移/
-	//嵌套均正确; seq双重校验排除覆写与回收竞态)
+	//解析当前线程最内层分发(线程键表直查; 嵌套=表恒持最内层,
+	//迁移/挂起天然安全——上下文在发起线程自身C栈上)
 	PVOID tid = PsGetCurrentThread();
 	PGNPT_ENTRY e = NULL;
 	PGUEST_REGS regs = NULL;
-	LONG64 best = 0;
-	for (ULONG i = 0; i < HOOK_CTX_RING; i++)
+	KIRQL ctxIrql;
+	KeAcquireSpinLock(&g_ctxLock, &ctxIrql);
 	{
-		HOOK_CTX* s = &g_ctx[i];
-		LONG64 sq = s->seq;
-		if (sq <= best)
+		HOOK_CTX_SLOT* s = HookCtxSlotFind(tid);
+		if (s != NULL)
 		{
-			continue;    //空槽或已有更新条目
+			e = s->ctx->hook;
+			regs = s->ctx->regs;
 		}
-		if (s->thread != tid || s->seq != sq)
-		{
-			continue;    //他线程条目或已被覆写/回收
-		}
-		best = sq;
-		e = s->hook;
-		regs = s->regs;
 	}
+	KeReleaseSpinLock(&g_ctxLock, ctxIrql);
 	if (e == NULL)
 	{
-		//非回调上下文调用(用户误用): 静默返回0+一次性留痕
-		//(留痕仅Debug构建; Release无观测面)
+		//非回调上下文调用(用户误用; 或表满防御路径=fail-loud):
+		//静默返回0+一次性留痕(留痕仅Debug构建; Release无观测面)
 #if DBG
 		{
 			static volatile LONG s_warned = 0;

@@ -32,6 +32,19 @@
 //DR断点按线性地址不受页约束)。普通模式目标选Ke*普通内核函数
 //(hook.h使用纪律5: PG不覆盖类); fence目标选驱动本地专用节
 //(code_seg独占页, hook.h使用纪律9: 冷页/页隔离)
+//阶段B热靶选择(v0.9cl): PsGetProcessId(默认)——NtClose经五时代
+//    实测(M16.35 WER法证42份同位素)定罪与DWM句柄churn交互
+//    (唯一高频穿越DWM渲染环的syscall钩)后撤出验收面(601k净
+//    分发+'w'=0已使detour引擎毕业); GNPT_DEMO_TORTURE=1复装
+//    NtClose=Debug酷刑压力轮(非验收项)
+#define GNPT_DEMO_TORTURE 0
+#if GNPT_DEMO_TORTURE
+#define GNPT_DEMO_N_NAME  "NtClose"
+#define GNPT_DEMO_N_WNAME L"NtClose"
+#else
+#define GNPT_DEMO_N_NAME  "PsGetProcessId"
+#define GNPT_DEMO_N_WNAME L"PsGetProcessId"
+#endif
 #define DEMO_T_MAX 2
 static PVOID g_demoT[DEMO_T_MAX];               //live TRANSPARENT目标(触发/移除键)
 static const char* g_demoTName[DEMO_T_MAX];     //窄名(日志)
@@ -188,17 +201,24 @@ static VOID DemoFireT(ULONG idx)
 		idx + 1, g_demoTName[idx], retVal, g_demoTCall[idx]);
 }
 
-//自触发阶段B普通模式hook一次: NtClose(NULL哑句柄=零副作用,
-//STATUS_INVALID_HANDLE返回值被弃)。目标选择: KeInitializeDpc已被
-//实证为PatchGuard监视集成员(0x109, P3逐位匹配——普通模式读透明
-//漏洞, NPT无X-only编码)→换NtClose(是否在PG集内未知——本demo即
-//实测oracle)
+//自触发阶段B普通模式hook一次(签名随热靶形态切换)。热靶选择史:
+//KeInitializeDpc=PG监视集成员实证(0x109, P3逐位匹配——普通模式
+//读透明漏洞)→NtClose(cc~ck时代=PG面oracle+最强压测, ck轮601k
+//净分发+'w'=0毕业)→v0.9cl换PsGetProcessId(纯查询单指针参零
+//状态突变; 引擎零调用=无自穿越; 内核内部API=非DWM渲染环路径)
 static VOID DemoFireN(VOID)
 {
+#if GNPT_DEMO_TORTURE
 	typedef NTSTATUS(*GNPT_DEMO_N_FN)(HANDLE);
 	NTSTATUS r = ((GNPT_DEMO_N_FN)g_demoN)((HANDLE)0);
-	FlLog("[MultiHook] N(NtClose)触发: st=0x%X 累计=%lld",
-		(ULONG)r, g_demoNCall);
+	FlLog("[MultiHook] N(%s)触发: st=0x%X 累计=%lld",
+		GNPT_DEMO_N_NAME, (ULONG)r, g_demoNCall);
+#else
+	typedef HANDLE(*GNPT_DEMO_N_FN)(PEPROCESS);
+	HANDLE pid = ((GNPT_DEMO_N_FN)g_demoN)(PsGetCurrentProcess());
+	FlLog("[MultiHook] N(%s)触发: pid=%p 累计=%lld",
+		GNPT_DEMO_N_NAME, pid, g_demoNCall);
+#endif
 }
 
 //自触发阶段C fence hook一次并留痕(返回值=原函数直算值——回调
@@ -737,22 +757,24 @@ static VOID DemoMultiHookThread(PVOID Context)
 	}
 	//======== 阶段B: 并存格+冷热靶(T驻留→N接管→冷热靶) ========
 	//DR-TRANSPARENT契约: T(线性断点)与N(NPT视图)机制正交,
-	//T驻留期间N Install成功=并存验证; N=NtClose此时布防,
-	//④热靶改为触发验证
+	//T驻留期间N Install成功=并存验证; N=热靶(GNPT_DEMO_N_NAME)
+	//此时布防, ④热靶改为触发验证
 	ULONG aIdx = (tLive >= 2) ? 1 : 0;    //仍活的T(移除后=T2; 单live=T1)
 	if (tLive >= 1)
 	{
 		UNICODE_STRING nName;
-		RtlInitUnicodeString(&nName, L"NtClose");
+		RtlInitUnicodeString(&nName, GNPT_DEMO_N_WNAME);
 		g_demoN = MmGetSystemRoutineAddress(&nName);
 		if (g_demoN == NULL)
 		{
-			FlLog("[MultiHook] 阶段B: NtClose解析失败, 本轮跳过");
+			FlLog("[MultiHook] 阶段B: %s解析失败, 本轮跳过",
+				GNPT_DEMO_N_NAME);
 		}
 		else if ((ULONG_PTR)PAGE_ALIGN(g_demoN) ==
 			(ULONG_PTR)PAGE_ALIGN(g_demoT[aIdx]))
 		{
-			FlLog("[MultiHook] 阶段B: NtClose与活T同页, 本轮跳过");
+			FlLog("[MultiHook] 阶段B: %s与活T同页, 本轮跳过",
+				GNPT_DEMO_N_NAME);
 		}
 		else
 		{
@@ -760,7 +782,7 @@ static VOID DemoMultiHookThread(PVOID Context)
 			h.Target = g_demoN;
 			h.Callback = DemoCountCallback;
 			h.Context = &g_demoNCall;
-			h.Flags = 0;    //普通模式: Nt系syscall函数(hook.h纪律5)
+			h.Flags = 0;    //普通模式(热靶=PsGetProcessId: Ps*纯查询, 纪律5 PG不覆盖类)
 			//①并存格: T驻留时N Install——两机制无交集(线性断点×
 			//NPT视图), 应成功
 			NTSTATUS st = GnptHookInstall(&h);
@@ -795,8 +817,8 @@ static VOID DemoMultiHookThread(PVOID Context)
 						(unsigned long long)r, g_demoColdCall);
 				}
 			}
-			//④热靶触发: NtClose已在①布防(T驻留期间)——自然流量
-			//累计+自触发双验证(detour全链路活)
+			//④热靶触发: 已在①布防(T驻留期间)——自然流量累计+
+			//自触发双验证(detour全链路活)
 			if (NT_SUCCESS(st))
 			{
 				DemoFireN();
@@ -863,7 +885,7 @@ static VOID DemoShutdown(VOID)
 	}
 	//多hook总结: 各槽独立计数=并存证据; 阶段B双向冻结=互偷证据
 	//(序列内已显式Remove的T1/fence A不再出现在RemoveAll清单)
-	FlLog("[Unload] MultiHook总结: T1=%lld T2=%lld N=%lld, "
+	FlLog("[Unload] MultiHook总结: T1=%lld T2=%lld N(" GNPT_DEMO_N_NAME ")=%lld, "
 		"fenceA=%lld(已移除应冻结) fenceB=%lld, LSTAR读拦截=%lld次, 写拦截=%lld次",
 		g_demoTCall[0], g_demoTCall[1], g_demoNCall,
 		g_demoFxCall[0], g_demoFxCall[1], g_demoRdmsr, g_demoWrmsr);

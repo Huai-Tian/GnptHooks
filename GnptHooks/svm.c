@@ -181,6 +181,159 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID;
 	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;
 	vmcb->Control.LbrVirtEnable = 0;
+#elif GNPT_L3_NOG1
+	//L系列NOG1探针: NOLBR形态剥G1——异常拦截全0(#DB/#GP/#MC)
+	//+DR读写位全0。零hook形态: STEP/DR-TRANSPARENT机件不触发,
+	//guest自身DR/TF活动=纯裸跑(硬件DR未被引擎触碰, 裸机行为)。
+	//G2/G3/G4/CPUID/VMMCALL保持(MSR_PROT/SHUTDOWN/INIT/INVLPGA/
+	//SVM族在场, SMI按开关)
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_SMI_INTERCEPT
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
+#endif
+	vmcb->Control.InterceptDrRead = 0;
+	vmcb->Control.InterceptDrWrite = 0;
+	vmcb->Control.InterceptException = 0;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
+		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
+	if (!g_svmStgiPass)
+	{
+		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
+	}
+	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
+#elif GNPT_L3_G1DR
+	//L系列G1DR探针: G1内部二分轮1——NOG1形态仅加回DR读写位
+	//(0x20-0x3F全拦, Mov DR进影子仿真; 流量=第三方驱动看门狗)。
+	//异常拦截保持全0(guest自身#DB/#GP/#MC=裸机直通IDT, 硬件DR
+	//未被引擎触碰)。NODEMO/NOLBR保持
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_SMI_INTERCEPT
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
+#endif
+	vmcb->Control.InterceptDrRead = 0xFF;
+	vmcb->Control.InterceptDrWrite = 0xFF;
+	vmcb->Control.InterceptException = 0;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
+		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
+	if (!g_svmStgiPass)
+	{
+		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
+	}
+	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
+#elif GNPT_L3_G1EXC
+	//L系列G1EXC探针: G1内部二分轮2——NOG1形态仅加回异常拦截位
+	//(#DB/#GP/#MC三bit, 甄别投递路径在场)。DR读写位保持全0(硬件
+	//DR不被引擎触碰, guest自身DR访问=裸机直通零exit)。NODEMO/
+	//NOLBR保持。G1DR轮活(DR位出狱: r27=1725读+r37=260写史上
+	//最重流量600s存活)=异常位成唯一残余嫌疑——本轮直接定罪
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_SMI_INTERCEPT
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
+#endif
+	vmcb->Control.InterceptDrRead = 0;
+	vmcb->Control.InterceptDrWrite = 0;
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB |
+		EXCP_INTERCEPT_MC | EXCP_INTERCEPT_GP;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
+		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
+	if (!g_svmStgiPass)
+	{
+		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
+	}
+	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
+#elif GNPT_L3_G1DDB
+	//L系列G1DDB探针: 2x2矩阵闭合后交互项分解轮1——NOG1形态
+	//加回DR读写位(0xFF/0xFF)+仅#DB异常位(bit1)。#GP/#MC缺席。
+	//动机: G1DR(仅DR)活/G1EXC(仅EXC三bit)活/NOLBR(DR+EXC全装)
+	//死×2=交互项定罪; DR×#DB=TRANSPARENT生产关键对(MOV DR影子
+	//与#DB入口陷阱必须同场), 本轮直接检验生产形态的生死
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_SMI_INTERCEPT
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
+#endif
+	vmcb->Control.InterceptDrRead = 0xFF;
+	vmcb->Control.InterceptDrWrite = 0xFF;
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
+		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
+	if (!g_svmStgiPass)
+	{
+		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
+	}
+	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
+#elif GNPT_L3_G1DGP
+	//L系列G1DGP探针: 交互项分解轮2——NOG1形态加回DR读写位
+	//(0xFF/0xFF)+仅#GP位(bit13)。#DB/#MC缺席。G1DDB(DR+#DB)活
+	//=生产关键对无辜; 本轮定罪DR×#GP(#GP有真实流量: G1EXC轮
+	//20次拦截+注入, NOLBR死轮3次=#GP嫌疑先于#MC的零流量)
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_SMI_INTERCEPT
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
+#endif
+	vmcb->Control.InterceptDrRead = 0xFF;
+	vmcb->Control.InterceptDrWrite = 0xFF;
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_GP;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
+		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
+	if (!g_svmStgiPass)
+	{
+		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
+	}
+	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
+#elif GNPT_L3_G1DMC
+	//L系列G1DMC探针: 交互项分解轮3——NOG1形态加回DR读写位
+	//(0xFF/0xFF)+仅#MC位(bit18)。#DB/#GP缺席。G1DDB(DR+#DB)/
+	//G1DGP(DR+#GP: r37=132+r4D=3注入零泄漏)均活=两两组合仅剩
+	//DR×#MC; 本轮闭合后若活=凶手为DR+≥2个EXC位组合
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_SMI_INTERCEPT
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
+#endif
+	vmcb->Control.InterceptDrRead = 0xFF;
+	vmcb->Control.InterceptDrWrite = 0xFF;
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_MC;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
+		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
+	if (!g_svmStgiPass)
+	{
+		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
+	}
+	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
+#elif GNPT_L3_G1DDBGP
+	//L系列G1DDBGP探针: 交互项分解轮4——NOG1形态加回DR读写位
+	//(0xFF/0xFF)+#DB+#GP两位(bit1|bit13)。#MC缺席。两两组合全
+	//无辜(G1DDB/G1DGP/G1DMC均活)=凶手=DR+≥2个EXC位; 本轮与
+	//NOLBR(死×2)差分仅#MC。死=生产剥#GP即活(#MC待定位);
+	//活=凶手含#MC(→G1DBMC/G1GPMC轮)
+	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
+#if GNPT_SMI_INTERCEPT
+	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
+#endif
+	vmcb->Control.InterceptDrRead = 0xFF;
+	vmcb->Control.InterceptDrWrite = 0xFF;
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB |
+		EXCP_INTERCEPT_GP;
+	vmcb->Control.InterceptMisc2 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL |
+		INTERCEPT_VMLOAD | INTERCEPT_VMSAVE |
+		INTERCEPT_CLGI | INTERCEPT_SKINIT;
+	if (!g_svmStgiPass)
+	{
+		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
+	}
+	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
 #else
 	//Misc1: CPUID(伪装面载体; 快路径短路于TSC壳——高频风暴不进
 	//补偿壳)+MSR_PROT(MSR hook面载体)+SHUTDOWN/INIT/INVLPGA(观测/
@@ -196,13 +349,20 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//流量, 仅启动/调试器路径)
 	vmcb->Control.InterceptDrRead = 0xFF;
 	vmcb->Control.InterceptDrWrite = 0xFF;
-	//异常拦截: #DB(单步窗口认领+DR断点入口陷阱+窗口外残余TF泄漏
-	//的最后防线——guest可见#DB=致命, 一律拦截)+#MC(静默复位转化
-	//器: 命中即留痕+bugcheck带dump)+#GP(SVM指令族#GP先于拦截位,
-	//Table 15-7——须拦截+RIP字节族判定改注入#UD, 维持裸机
-	//SVME=0全族#UD的自洽语义)
-	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB |
-		EXCP_INTERCEPT_MC | EXCP_INTERCEPT_GP;
+	//异常拦截: 仅#DB(单步窗口认领+DR断点入口陷阱+窗口外残余TF泄漏
+	//的最后防线——guest可见#DB=致命, 一律拦截)。#GP/#MC让位——
+	//定罪链(NOTES M16.23-16.29, v0.9cg系列九轮控制变量分解):
+	// DR位+#DB+#GP三位组合=本机杀手(两两组合均活: G1DDB 600s/
+	//G1DGP 694s/G1DMC 660s全净卸载; 三位组合装=死: G1DDBGP 367s
+	//+NOLBR 225s/479s, 全部深空闲停泊态零exit冻结, 死亡不经
+	//handler)。让位语义复核: #GP手术仅兜"硬件先于拦截位产生#GP"
+	//的边界(非法VMCB对齐类), SVM指令族主路径全由Misc1/Misc2
+	//拦截位承载(INVLPGA/VMRUN/VMMCALL/VMLOAD/VMSAVE/CLGI/SKINIT/
+	//STGI), guest内硬件#GP直通IDT=与第二实例SVME=1故事自洽;
+	//#MC=复位转化器(观测留痕), 让位后真#MC=裸机等价硬件reset。
+	//dispatch的#GP/#MC甄别代码保留(位不设不可达, Debug/未来硬件
+	//迭代可再启用)
+	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB;
 	//V_INTR_MASKING必须为0: 该位仅当"拦截INTR+host ISR"形态才有
 	//意义; 本框架type-2 in-place=INTR直通(物理中断由guest原生IF
 	//门控), 置位+host IF=1=物理中断无视guest cli直接投递=中断
@@ -240,8 +400,15 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//平台边界(PROBE[R]回退=安全网; PMC探针按"在场未使能"如实报告)。
 	//S1横幅的0xB8值=特性叙事面(第二实例故事), 与实际使能解耦。
 	//bit1=VMSAVEvirt不使能(该路径要#UD注入非guest执行)
+#if GNPT_L3_NOLBR
+	//L系列NOLBR探针(临时): 0xB8强制0——ND死亡配置唯一剥离项
+	//(LBRvirt嫌疑隔离, 见common.h L系列注释); 特性在场不使能
+	//=PROBE[R]按"在场未使能"如实报告
+	vmcb->Control.LbrVirtEnable = 0;
+#else
 	vmcb->Control.LbrVirtEnable =
 		(g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL;
+#endif
 #endif
 	//MSRPM布防(自我隐蔽生效前=本核发起线程裸机root态, 直写位图
 	//合法, 无需vmmcall root原语):

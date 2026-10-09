@@ -270,29 +270,38 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9cg"
-//L系列配置二分探针(临时, 实验后删除; 默认全0=生产形态)。组表:
+#define GNPT_BUILD_TAG "v0.9cl"
+//L系列配置二分探针(已完成使命, 保留供复验)。组表:
 //G1=异常拦截(#DB/#GP/#MC)+DR位 G2=MSRPM故事位 G3=SMI/SHUTDOWN/
-//INIT/INVLPGA/SVM族 G4=TSC补偿壳
-//毕业链(2026-10-08): L3(骨架)/L3G2(MSR故事面)/L3G2G4(+壳)
-//五轮全活(13h断电新鲜态机器)。
-//**FULL轮死亡(同日, 决定性)**: fresh boot(up=535s)+满配+demo
-//=163s死亡, 签名与v0.9cc逐字段一致(up=433s处st=11世界丢失
-//→13应用崩溃级联2min→Kernel-Power 41; r41=227/r400=20/r7C=12/
-//r72=16K洪泛)。三理论齐死: 衰减态理论(新鲜boot照死)/渐进论
-//(11核瞬间失联在先, 用户层级联在后)/壳×密度理论(M16.18档案
-//已证r7C=8)。
-//**快速复现环到手: 每boot~3min定案**。FULL vs L3G2G4差集=
-//嫌疑名单: G1(异常+DR拦截) G3(SVM族/SMI/SHUTDOWN/INIT/INVLPGA)
-//LBRvirt(0xB8=1) demo运转(NtClose热靶普通模式hook 23K触发/
-//DR hook/信标/MSR hook)。v0.9ce/cd满配+demo空闲短轮活=凶手
-//需满配要素×accel风暴联合在场。
-//实验开关: GNPT_L3_NODEMO=1(FULL全拦截+demo禁用=零hook零MSR
-//面, 用于拦截配置vs hook活动二分); 其余组合见NOTES M16.13-19
+//INIT/INVLPGA/SVM族 G4=TSC补偿壳; GNPT_L3_NODEMO=1(任意组合下
+//禁demo=纯引擎纪律)
+//毕业链(NOTES M16.23-16.35): 冻结族杀手=DR+#DB+#GP(生产已剥
+// #GP/#MC); ch死轮triple fault=平台衰减态腐败(引擎清白);
+// ch复跑=生产位图平反, "速死"主线收官; cj轮=ctx环全局序号
+//踩踏竞态定罪(CallOriginal回退返0→NtClose假成功→DWM MIL
+// failfast崩溃循环)——修复=线程键表+C栈上下文链(hook.c);
+// ck轮='w'=0×601k分发+H:O=152:152=竞态实证消灭, 但残余3起
+// DWM孤立崩(PCH_B1)——WER法证42份同位素收口: 崩溃簇与
+// NtClose demo轮五时代完全同构, NODEMO轮全零→NtClose钩=
+// 头号嫌疑(唯一高频穿越DWM GPU句柄churn的syscall钩)
+//当前形态: v0.9cl=ck引擎不动, demo热靶NtClose→PsGetProcessId
+// (离体: Ps*纯查询, 引擎零调用无自穿越, 非DWM渲染环路径;
+// NtClose已601k毕业, 酷刑开关GNPT_DEMO_TORTURE=1可复装)。
+//判读: 活且零DWM事件=
+// NtClose×DWM交互终审定罪+生产验收通过→commit(bu→cl)。
+//accel -ExpectTag v0.9cl
 #define GNPT_L3_MINIMAL 0
 #define GNPT_L3_G2      0
 #define GNPT_L3_G4      0
 #define GNPT_L3_NODEMO  0
+#define GNPT_L3_NOLBR   0
+#define GNPT_L3_NOG1    0
+#define GNPT_L3_G1DR    0
+#define GNPT_L3_G1EXC   0
+#define GNPT_L3_G1DDB   0
+#define GNPT_L3_G1DGP   0
+#define GNPT_L3_G1DMC   0
+#define GNPT_L3_G1DDBGP 0
 
 //==================== 引擎配置开关(功能语义; 历史演进见开发文档) ====================
 //TRANSPARENT模式=DR机件(DR0-3线性地址执行断点作入口陷阱, 原页恒等
