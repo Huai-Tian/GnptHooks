@@ -34,16 +34,14 @@
 //     恒等不动, 外部读恒=原始字节(结构性读透明, 零exit),
 //     PG覆盖×热页×长驻全兼容。AMD NPT无exec-only权限位=普通
 //     模式无免费读透明(架构边界, 非可修缺陷)
-//  5b. 热靶纪律(v0.9cm归因实验定罪, 判例M16.37/M16.40):
-//     **高频被调目标(≳100/s)一律HOOK_TRANSPARENT, CodePage
-//     模式=冷/稀疏目标专用**。三代实测: 同函数(PsGetProcessId)
-//     同流量(152k/10min): CodePage模式=DWM崩溃循环(cl轮23起
-//     0x8898009B+机器硬死), DR模式=零事件——机制定罪。CodePage
-//     热害两层: ①14B补丁短函数越尾越权写邻码(拒装门已堵, 见
-//     5c) ②页副本×视图翻转×驻留×高频调用的复合效应(DWM等
-//     fail-fast进程的MIL一致性检查敏感路径, 归因到机制级)。
-//     DR热流量平台边界实测: 2535/s #DB exit 600s全绿
-//  5c. 普通模式拒装门(引擎内置, v0.9cm): LDE解码覆盖期(14B)
+//  5b. 热靶纪律:
+//     **高频被调目标(≥100/s)一律HOOK_TRANSPARENT, CodePage
+//     模式=冷/稀疏目标专用**。CodePage热害两层: ①14B补丁短
+//     函数越尾越权写邻码(拒装门已堵, 见5c) ②页副本×视图翻转
+//     ×驻留×高频调用的复合效应(fail-fast进程如DWM的MIL一致
+//     性检查敏感路径对此敏感)。DR模式热流量平台边界: 2535/s
+//     #DB exit 600s全绿
+//  5c. 普通模式拒装门(引擎内置): LDE解码覆盖期(14B)
 //     遇控制转移指令(ret/间接call-jmp/iret/int族)=目标短于
 //     补丁, Install fail-loud拒绝([Reloc]行指路TRANSPARENT)
 //     ——越权写邻码结构性不可能; DR/NX-FENCE无补丁不受此门
@@ -82,7 +80,7 @@
 //     改道+rearm vmmcall)。边界: ①同页唯一且不得与任何已有hook
 //     同页(页级NX为共享资产, Install fail-loud拒绝); ②目标页
 //     邻函数执行触发页级NPF→该核驻留HOOKS+置旗, 下个任意exit
-//     信标回P(fence重武装; miss窗口=exit间隔, 加载态µs级/空闲
+//     信标回P(fence重武装; miss窗口=exit间隔, 加载态μs级/空闲
 //     态秒级)——热页邻函数=exit流量放大, fence选**冷页/页隔离**
 //     目标(驱动本地目标用#pragma code_seg专用节=结构性隔离);
 //     ③detour回调内直调其他fence目标不触发(fail-open原函数

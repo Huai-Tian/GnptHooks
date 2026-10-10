@@ -1,4 +1,4 @@
-//GnptHooks 重定位跳板单元测试(用户态Linux x64)——RIP-rel超距改写验证
+﻿//GnptHooks 重定位跳板单元测试(用户态Linux x64)——RIP-rel超距改写验证
 //被测逻辑镜像自 GnptHooks/hook.c(HookRewriteRipRelImm64/HookBuildRelocTrampoline),
 //**改动必须双向同步**。验证维度: 字节断言(改写/重算形态)+真实CPU执行级
 //语义等价(黄金断言: lea r10,[rip+X] 与改写后 mov r10,imm64 结果一致)。

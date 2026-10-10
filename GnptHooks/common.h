@@ -270,28 +270,22 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.9cq"
+#define GNPT_BUILD_TAG "v0.10"
 //L系列配置二分探针(已完成使命, 保留供复验)。组表:
 //G1=异常拦截(#DB/#GP/#MC)+DR位 G2=MSRPM故事位 G3=SMI/SHUTDOWN/
 //INIT/INVLPGA/SVM族 G4=TSC补偿壳; GNPT_L3_NODEMO=1(任意组合下
 //禁demo=纯引擎纪律)
-//毕业链(NOTES M16.23-16.38): 冻结族杀手=DR+#DB+#GP(生产已剥
-// #GP/#MC); ch死轮=平台衰减态腐败(引擎清白); cj轮=ctx环竞态
-// 定罪→ck线程键表修复('w'=0×601k毕业); cl轮=归因反转——三代
-// DWM首崩均钉普通模式CodePage热靶上线±1s(机制共性非函数特异
-// ), PsGetProcessId"离体"误判(实躺Ob句柄churn下游8000/s),
-// 另机器383s静默硬死=衰减态独立实体; 电源法证: IDLEDISABLE=1
-// (C0钉死)残留≥2.5天自续+IDLEDEMOTE别名不解析=A轮加速双失效
-// (accel v6已硬化)
-//当前形态(=GNPT_BUILD_TAG): cave写入原语二代——锁页RW重映射
+//毕业链要点: 冻结族杀手=DR+#DB+#GP三位组合(生产已剥#GP/#MC,
+//见svm.c填充注释); 三位以下组合与电源/剂量因素均已排除归因
+//当前形态(=GNPT_BUILD_TAG): cave写入原语——锁页RW重映射
 // (MmProbeAndLockPages(IoReadAccess)只读锁定+MmMapLockedPages
 // SpecifyCache建全新RW映射, 新PTE权限由映射API决定不继承源
-// RO)。上代非分页MDL组合(MmBuildMdlForNonPagedPool+MmGetSystem
-// AddressForMdlSafe)实测0xBE: 置MDL_SOURCE_IS_NONPAGED_POOL后
-// GetSystemAddress直接返回原VA="别名"=原地址=直写RX页(映像页
-// 非非分页池, 契约外)。CET行已实证本机CR4.CET=1(WP瞬清死路
-// 判据成立)。验收: 选址行段数>0+无蓝屏+demo全绿+卸载cave
-// 复原行。accel -ExpectTag与GNPT_BUILD_TAG同步
+// RO)。禁用组合: MmBuildMdlForNonPagedPool+MmGetSystemAddress
+// ForMdlSafe——置MDL_SOURCE_IS_NONPAGED_POOL后GetSystemAddress
+// 直接返回原VA="别名"=原地址=直写RX页(映像页非非分页池, 契约
+// 外)。CET在场平台(CR4.CET=1)WP瞬清=死路, 重映射为唯一正道。
+// 验收: 选址行段数>0+无蓝屏+demo全绿+卸载cave复原行。
+// accel -ExpectTag与GNPT_BUILD_TAG同步
 #define GNPT_L3_MINIMAL 0
 #define GNPT_L3_G2      0
 #define GNPT_L3_G4      0

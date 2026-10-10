@@ -51,7 +51,7 @@ static ULONG64   s_hideZeroPa = 0;
 //容量推导(历史教训: 页表页数必须计入容量, 溢出=登记静默丢失):
 //每核资源11页×最大64核=704 + 页表页上限NPT_MAX_PAGES(两树~3100/
 //理论上限3078) + hook工件页(CodePage/跳板/拆分PT, 百级)≈3900
-//→ 8192余量充足(四树时代实测4100页表页, 两树收缩后减半)
+//→ 8192余量充足(容量依据: 四树形态峰值4100页表页, 两树收缩后减半)
 #define NPT_CONCEAL_MAX     8192
 static ULONG64   s_concealPa[NPT_CONCEAL_MAX];
 static ULONG     s_concealCount = 0;

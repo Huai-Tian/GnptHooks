@@ -225,11 +225,8 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	}
 	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
 #elif GNPT_L3_G1EXC
-	//L系列G1EXC探针: G1内部二分轮2——NOG1形态仅加回异常拦截位
-	//(#DB/#GP/#MC三bit, 甄别投递路径在场)。DR读写位保持全0(硬件
-	//DR不被引擎触碰, guest自身DR访问=裸机直通零exit)。NODEMO/
-	//NOLBR保持。G1DR轮活(DR位出狱: r27=1725读+r37=260写史上
-	//最重流量600s存活)=异常位成唯一残余嫌疑——本轮直接定罪
+	//L系列G1EXC探针: NOG1形态仅加回异常拦截位(#DB/#GP/#MC三
+	//bit, 甄别投递路径在场)。DR读写位保持全0, NODEMO/NOLBR保持
 	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
 		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
 #if GNPT_SMI_INTERCEPT
@@ -248,11 +245,9 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	}
 	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
 #elif GNPT_L3_G1DDB
-	//L系列G1DDB探针: 2x2矩阵闭合后交互项分解轮1——NOG1形态
-	//加回DR读写位(0xFF/0xFF)+仅#DB异常位(bit1)。#GP/#MC缺席。
-	//动机: G1DR(仅DR)活/G1EXC(仅EXC三bit)活/NOLBR(DR+EXC全装)
-	//死×2=交互项定罪; DR×#DB=TRANSPARENT生产关键对(MOV DR影子
-	//与#DB入口陷阱必须同场), 本轮直接检验生产形态的生死
+	//L系列G1DDB探针: NOG1形态加回DR读写位(0xFF/0xFF)+仅#DB异常
+	//位(bit1), #GP/#MC缺席。DR×#DB=TRANSPARENT生产关键对(MOV
+	//DR影子与#DB入口陷阱必须同场)
 	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
 		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
 #if GNPT_SMI_INTERCEPT
@@ -270,10 +265,8 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	}
 	vmcb->Control.LbrVirtEnable = 0;   //NOLBR保持(0xB8=0)
 #elif GNPT_L3_G1DGP
-	//L系列G1DGP探针: 交互项分解轮2——NOG1形态加回DR读写位
-	//(0xFF/0xFF)+仅#GP位(bit13)。#DB/#MC缺席。G1DDB(DR+#DB)活
-	//=生产关键对无辜; 本轮定罪DR×#GP(#GP有真实流量: G1EXC轮
-	//20次拦截+注入, NOLBR死轮3次=#GP嫌疑先于#MC的零流量)
+	//L系列G1DGP探针: NOG1形态加回DR读写位(0xFF/0xFF)+仅#GP位
+	//(bit13), #DB/#MC缺席
 	vmcb->Control.InterceptMisc1 = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
 		INTERCEPT_SHUTDOWN | INTERCEPT_INIT | INTERCEPT_INVLPGA;
 #if GNPT_SMI_INTERCEPT
@@ -351,17 +344,15 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	vmcb->Control.InterceptDrWrite = 0xFF;
 	//异常拦截: 仅#DB(单步窗口认领+DR断点入口陷阱+窗口外残余TF泄漏
 	//的最后防线——guest可见#DB=致命, 一律拦截)。#GP/#MC让位——
-	//定罪链(NOTES M16.23-16.29, v0.9cg系列九轮控制变量分解):
-	// DR位+#DB+#GP三位组合=本机杀手(两两组合均活: G1DDB 600s/
-	//G1DGP 694s/G1DMC 660s全净卸载; 三位组合装=死: G1DDBGP 367s
-	//+NOLBR 225s/479s, 全部深空闲停泊态零exit冻结, 死亡不经
-	//handler)。让位语义复核: #GP手术仅兜"硬件先于拦截位产生#GP"
-	//的边界(非法VMCB对齐类), SVM指令族主路径全由Misc1/Misc2
-	//拦截位承载(INVLPGA/VMRUN/VMMCALL/VMLOAD/VMSAVE/CLGI/SKINIT/
-	//STGI), guest内硬件#GP直通IDT=与第二实例SVME=1故事自洽;
-	//#MC=复位转化器(观测留痕), 让位后真#MC=裸机等价硬件reset。
-	//dispatch的#GP/#MC甄别代码保留(位不设不可达, Debug/未来硬件
-	//迭代可再启用)
+	//平台约束: DR位+#DB+#GP三位组合=本机类冻结杀手(深空闲停泊态
+	//零exit冻结, 死亡不经handler; 任两两组合存活), 故生产形态
+	//#GP/#MC不设拦截位。让位语义复核: #GP手术仅兜"硬件先于拦截
+	//位产生#GP"的边界(非法VMCB对齐类), SVM指令族主路径全由
+	//Misc1/Misc2拦截位承载(INVLPGA/VMRUN/VMMCALL/VMLOAD/VMSAVE/
+	//CLGI/SKINIT/STGI), guest内硬件#GP直通IDT=与第二实例SVME=1
+	//故事自洽; #MC=复位转化器(观测留痕), 让位后真#MC=裸机等价
+	//硬件reset。dispatch的#GP/#MC甄别代码保留(位不设不可达,
+	//Debug/未来硬件迭代可再启用)
 	vmcb->Control.InterceptException = EXCP_INTERCEPT_DB;
 	//V_INTR_MASKING必须为0: 该位仅当"拦截INTR+host ISR"形态才有
 	//意义; 本框架type-2 in-place=INTR直通(物理中断由guest原生IF
@@ -396,7 +387,7 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	//VMCB位零exit成本, 代价=世界开关多一组寄存器保存/恢复。
 	//IBS virt(b2)/PMC virt(b3)特性在场也不置位: 两者使能依赖AVIC或
 	//NMI虚拟化的中断投递基础设施(§15.38/§15.39, 本框架未实现),
-	//违合置要求=全核VMEXIT_INVALID(Zen5实测)——PMC计数root泄漏=
+	//违合置要求=全核VMEXIT_INVALID(Zen5平台实证)——PMC计数root泄漏=
 	//平台边界(PROBE[R]回退=安全网; PMC探针按"在场未使能"如实报告)。
 	//S1横幅的0xB8值=特性叙事面(第二实例故事), 与实际使能解耦。
 	//bit1=VMSAVEvirt不使能(该路径要#UD注入非guest执行)
@@ -1160,7 +1151,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					//且自身序列化)——译码缓存唯一的文档化软件无效化
 					//手段(NPT改译无内存写, SMC检测永不触发, 别无他途)。
 					//op-cache命中绕过TLB行走=NX翻译拦不住, 故必须真冲。
-					//成本=每核一次全缓存写回+无效化(~百µs级), install/
+					//成本=每核一次全缓存写回+无效化(~百μs级), install/
 					//remove频度可接受; INVD(丢脏行)绝对禁止
 					vmcb->Control.TlbControl = 1;
 					__wbinvd();    //全缓存无效化: op-cache含

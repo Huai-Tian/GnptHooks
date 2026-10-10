@@ -100,16 +100,14 @@ static volatile LONG g_view[64];
 static volatile LONG g_nxInDetour[64];
 static volatile LONG g_nxFenceRes[64];
 
-//detour上下文表(v0.9ck重构, NOTES M16.32定罪修复): 每线程条目
-//+分发函数C栈局部上下文链。原全局序号环的结构性缺陷: 环按全局
-//分发计数轮转而非并发在途回调计数——热靶(v0.9cj轮NtClose实测
-//~3000分发/秒)下43ms被踏一遍, 在途回调槽被纯序号推进覆写(与
-//真实并发无关; 原注释"上界=并发在途回调数"混淆了两者)→
-//CallOriginal扫描失配→'w'回退返0→透传回调把0当API返回值
-//(NtClose=假成功不关句柄=静默句柄泄漏; 1.12M分发×ppm级槽覆写
-//≈数千次→GDI/句柄耗尽→DWM崩溃循环→会话重置, 用户目击"资源
-//不足"即此)。
-//新形态: ①上下文=分发函数C栈局部(线程挂起/迁移天然安全——
+//detour上下文表: 每线程条目+分发函数C栈局部上下文链。结构性
+//约束: 在途回调上下文必须按"并发在途回调数"跟踪, 不能按全局
+//分发计数轮转——纯序号环在高频分发下会覆写仍在途回调的槽(与
+//真实并发无关)→CallOriginal扫描失配→'w'回退返0→透传回调把
+//0当API返回值=假成功语义(如句柄类API不关句柄=静默泄漏, 高
+//流量下累计可耗尽会话资源)。设计结论: 上下文容量按并发在途
+//回调数而非吞吐计
+//形态: ①上下文=分发函数C栈局部(线程挂起/迁移天然安全——
 //局部变量随内核栈走; 嵌套=分发函数自身保存/恢复外层指针=C栈
 //自然链) ②线程键小表+自旋锁(发布/回收/查询共用, 临界区纯内存
 //操作~百ns, 3000/s流量下开销可忽略; KeAcquireSpinLock抬DISPATCH
@@ -578,7 +576,7 @@ static ULONG HookRewriteRipRelImm64(PUCHAR Dst, ldasm_data* Ld,
 	return 10;
 }
 
-//RejectCtrl=普通模式专用拒装门(v0.9cm, 判例M16.37 C1): 14B补丁
+//RejectCtrl=普通模式专用拒装门: 14B补丁
 //会写原页(HOOKS视图=CodePage副本), 函数尾早于补丁尾时后6B越权
 //写邻码——解码覆盖期遇控制转移即拒。DR/NX-FENCE路径原页恒等
 //不动(无补丁), 重放越过ret=尾跳死代码, 无害——传FALSE不设门
@@ -624,8 +622,8 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen,
 			break;
 		}
 		//普通模式拒装门: 控制转移@补丁覆盖内=函数短于14B补丁,
-		//补丁尾将越函数尾越权写邻码(实测形态: PsGetProcessId 8B
-		//函数mov+ret×14B补丁=+8..+13落邻码, M16.37)——fail-loud
+		//补丁尾将越函数尾越权写邻码(典型形态: 8B函数mov+ret
+		//×14B补丁=+8..+13落邻码)——fail-loud
 		//拒绝+指路TRANSPARENT。相对转移族(jcc/jmp/call rel/
 		//loop/jcxz——E0-E3经LDasm OP_RELATIVE表)已被上方拒绝,
 		//此处收非相对族: ret/retf近远(C3 C2 CB CA)/iret(CF)/
@@ -2104,7 +2102,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	e->Removed = 0;
 	e->DrSlot = 0xFF;    //普通模式(零值0=合法槽号, 不可默认)
 	//LDE重定位跳板(MinLen=14=CodePage跳转覆盖长度, 两者同源同长;
-	//TRUE=拒装门开: 短于补丁的函数在此被fail-loud拒绝, M16.37)
+	//TRUE=拒装门开: 短于补丁的函数在此被fail-loud拒绝)
 	e->ReplayVA = HookBuildRelocTrampoline((ULONG64)Hook->Target, 14,
 		TRUE, &e->ReplayLen);
 	if (e->ReplayVA == NULL)
@@ -2209,9 +2207,9 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 		NPT_PTE_FLAGS_HOOKP);
 	//布防即刻全核同步: PTE组写完→IPI全核TLB冲净。把同步推迟(步进轮
 	//窗口)会让系统处于混合翻译态(陈旧TLB核跑原代码/新鲜walk核跑补丁
-	//翻译/P-HOOKS不对称/拆分PDE刚换)——实测崩溃形态为SECONDARY常留核
+	//翻译/P-HOOKS不对称/拆分PDE刚换)——崩溃形态: SECONDARY常留核
 	//在窗口内对新arm页的首次取指-数据读序列收到not-present fault
-	//(软件侧任何可达状态均不可推导)。窗口压缩到IPI广播延迟(~百µs)
+	//(软件侧任何可达状态均不可推导)。窗口压缩到IPI广播延迟(~百μs)
 	//后, 混合态不再可观察
 	HookSyncAllCpus();
 	HookStagePaced(HKST_INS_ARMED);

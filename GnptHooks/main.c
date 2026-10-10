@@ -32,11 +32,8 @@
 //DR断点按线性地址不受页约束)。普通模式目标选Ke*普通内核函数
 //(hook.h使用纪律5: PG不覆盖类); fence目标选驱动本地专用节
 //(code_seg独占页, hook.h使用纪律9: 冷页/页隔离)
-//阶段B热靶选择(v0.9cm): PsGetProcessId经**HOOK_TRANSPARENT**(DR
-//    机件)——归因实验: cj/ck(NtClose)/cl(PsGetProcessId)三代DWM
-//    首崩均钉普通模式CodePage热靶上线±1s(M16.37), cm=同函数同
-//    流量换机制(DR原页零接触无CodePage无视图驻留), DWM零崩=
-//    CodePage机制定罪, 仍崩=机制无关共性→fence/安装序列二分。
+//阶段B热靶选择: PsGetProcessId经**HOOK_TRANSPARENT**(DR机件)
+//    ——高频被调目标按hook.h使用纪律5b一律TRANSPARENT。
 //    GNPT_DEMO_TORTURE=1复装NtClose普通模式=Debug酷刑压力轮
 //    (22B自含过拒装门, 非验收项)
 #define GNPT_DEMO_TORTURE 0
@@ -477,7 +474,7 @@ static VOID DemoPmuProbe(VOID)
 		"PMC观测=已知残余信道), 探针跳过");
 }
 
-//======== 调试子系统忠实性自证探针(M15.4判据②验收) ========
+//======== 调试子系统忠实性自证探针(判据②验收) ========
 //以检测方视角(设TF/设DR断点/回读DR/发int1)验证"调试面=裸机
 //等价"——检测方的标准手法: 设TF观察#DB是否到达/设DR断点观察
 //是否触发/DR写读一致性/int1陷阱投递。任一失败=裸机不可能的
@@ -791,9 +788,9 @@ static VOID DemoMultiHookThread(PVOID Context)
 #if GNPT_DEMO_TORTURE
 			h.Flags = 0;    //酷刑: 普通模式CodePage(NtClose 22B自含过拒装门)
 #else
-			h.Flags = HOOK_TRANSPARENT;    //验收: DR机件(v0.9cm归因实验:
-			                               //同函数同流量换机制; 高频热靶
-			                               //纪律=TRANSPARENT)
+			h.Flags = HOOK_TRANSPARENT;    //验收: DR机件(高频热靶
+			                               //纪律=TRANSPARENT,
+			                               //见hook.h 5b)
 #endif
 			//①并存格: T驻留时N Install——验收形态=双DR槽并存(T1槽0+
 			//N槽1, 容量≤4/核); 酷刑形态=DR×NPT机制正交。应成功

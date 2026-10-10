@@ -11,8 +11,8 @@ import re, sys, os
 
 # 禁词模式(注释行命中即违规; 白名单条目需人工确认语境)
 PATTERNS = [
-    (r'v0\.9[0-9a-z]*', '版本号'),
-    (r'\bM\d{1,2}\.\d{1,2}\b', '里程碑号'),
+    (r'v0\.[0-9]{1,2}[a-z]*', '版本号'),
+    (r'(?<![0-9A-Za-z.])M\d{1,2}\.\d{1,2}(?![0-9])', '里程碑号'),
     (r'判例', '判例引用'),
     (r'NOTES|HANDOFF', '内部文档交叉引用'),
     (r'GeptHooks|Gept', '姊妹项目名'),
@@ -25,8 +25,8 @@ LINE_ALLOW = re.compile(
 
 def strip_strings(code):
     # 去字符串字面量(注释审计不看日志文案)
-    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
-    code = re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
+    code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', code)
+    code = re.sub(r"'(?:\\.|[^'\\\n])*'", "''", code)
     return code
 
 def audit(path):
