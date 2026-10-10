@@ -169,6 +169,8 @@ typedef struct _GNPT_RING_ENTRY
 //    在途旗清+视图回P, fence触发链终点)
 //  A=NX-Fence信标回P(rsn=0, a=当前RIP; fence页邻函数驻留旗被
 //    任意exit消费=fence重武装)
+//  d=IOIO代答采样(rsn=0x7B, a=EXITINFO1, b=PM_TMR端口; 时钟域
+//    隐蔽载体的exit流量, 首条+每4096条)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -270,7 +272,7 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.10d"
+#define GNPT_BUILD_TAG "v0.10h"
 //L系列配置二分探针(已完成使命, 保留供复验)。组表:
 //G1=异常拦截(#DB/#GP/#MC)+DR位 G2=MSRPM故事位 G3=SMI/SHUTDOWN/
 //INIT/INVLPGA/SVM族 G4=TSC补偿壳; GNPT_L3_NODEMO=1(任意组合下
@@ -330,6 +332,13 @@ extern volatile LONG g_flLaunchHot;
 //进SMM, 绕开guest态SMM/RSM窗口)。HWCR.SMMLOCK=1时硬件忽略
 //(启动横幅读报go/no-go)
 #define GNPT_SMI_INTERCEPT 1
+
+//时钟域隐蔽(PM_TMR轴): 1=置INTERCEPT_IOIO_PROT+IOPM按FADT
+//枚举的PM_TMR端口置位(IN读exit→代答+虚拟时间轴补偿, 锚点=本
+//exit入口guest TSC虚拟时刻——与TSC补偿壳共虚拟时间线, guest双
+//时钟源互证一致, 检测方测不出exit驻留)。枚举/TSC频率缺席=自动
+//降级不置位(裸机直通, 横幅如实报告)
+#define GNPT_CLK_STEALTH 1
 extern CHAR g_gnptBuildTag[24];      //common.c定义(=GNPT_BUILD_TAG)
 
 #ifdef __cplusplus

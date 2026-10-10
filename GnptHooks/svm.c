@@ -360,6 +360,24 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 		vmcb->Control.InterceptMisc1 |= INTERCEPT_NMI;
 		vmcb->Control.VIntr |= VINTR_V_NMI_ENABLE;
 	}
+#if GNPT_CLK_STEALTH
+	//时钟域隐蔽(PM_TMR IO读拦截, §15.10.1): IOPM bit i对应端口i,
+	//置1=拦(单bit管读写: PM写=硬件忽略语义, 走代答忠实回写)。
+	//仅PM_TMR端口4字节置位, 其余全零=硬件查位图直通零exit零
+	//开销(Windows IO流量=PCI配置CF8/CFC/KB等, 与本域不相交)。
+	//FillVmcb=launch前裸机root上下文, IOPM页直写合法; 每核
+	//一份位图同步置位。端口缺席(枚举失败)=不置位=裸机直通
+	if (g_svmPmTimerPort != 0)
+	{
+		vmcb->Control.InterceptMisc1 |= INTERCEPT_IOIO_PROT;
+		PUCHAR iopm = (PUCHAR)Vcpu->IopmVa;
+		for (ULONG b = 0; b < 4; b++)
+		{
+			ULONG bit = g_svmPmTimerPort + b;
+			iopm[bit >> 3] |= (UCHAR)(1UL << (bit & 7));
+		}
+	}
+#endif
 	//DR0-7读写全拦(DR-TRANSPARENT机件): guest的MOV DR经exit对
 	//影子仿真——硬件DR0-3(跨VMRUN持续)与VMCB.Dr6/7(guest state)
 	//永不受guest触碰; 空闲态零额外exit(Windows运行期几乎无MOV DR
@@ -679,6 +697,12 @@ volatile LONG64 g_svmB8Landed[64] = { 0 };
 //写exit码+1(0=无/探针已清)。自证探针只读此纯全局——自我隐蔽
 //生效后guest读VMCB=零页, 框架状态回读必须走纯全局
 volatile LONG64 g_svmDefHeal[64] = { 0 };
+//时钟域隐蔽状态: PM_TMR端口(0=枚举失败=降级)+计数宽度掩码
+//(FADT FLAGS.TMR_VAL_EXT定宽: 0=24位/1=32位计数)+TSC标称频率
+//(0=探测失败=补偿降级为物理真值)
+volatile ULONG g_svmPmTimerPort = 0;
+static volatile ULONG g_svmPmTimerMask = 0xFFFFFFFF;
+volatile ULONG64 g_svmTscHz = 0;
 
 KAFFINITY SvmPinVirtualizedCpus(VOID)
 {
@@ -778,6 +802,171 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 			g_svmTscDlMode ? "TSC-deadline模式→拦截+换算" : "非deadline模式→直通(裸机等价)",
 			code);
 	}
+#if GNPT_CLK_STEALTH
+	//时钟域隐蔽前置探测(裸机PASSIVE): PM_TMR端口(注册表FADT枚举:
+	//Windows把ACPI表暴露于HKLM\HARDWARE\ACPI\<签名>下的OEM子键链
+	//叶层"00000000"值, REG_BINARY=表本体含表头——层深随表类型
+	//异构, 详见下探循环注释)+TSC标称频率。任一缺席=自动降级不
+	//置位(裸机直通, 阶段码如实报告; PM_TMR为system-memory形态
+	//属MMIO域, 本IO机制不适用)
+	{
+		UNICODE_STRING keyName;
+		OBJECT_ATTRIBUTES oa;
+		HANDLE h = NULL;
+		ULONG enumStage = 4;    //降级诊断码: 1=OEM下探断链 2=叶值/表体不符 3=端口/LEN缺席 4=签名键打开失败
+		RtlInitUnicodeString(&keyName, L"\\Registry\\Machine\\HARDWARE\\ACPI\\FADT");
+		InitializeObjectAttributes(&oa, &keyName,
+			OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+		if (NT_SUCCESS(ZwOpenKey(&h, KEY_READ, &oa)))
+		{
+			enumStage = 0;
+			//OEM子键链=OEMID→表ID→OEM版本多层(9600X实测三层:
+			//ALASKA\A_M_I_\01072009), 表值"00000000"恒挂最深的
+			//叶层; 无表头表(FACS)零层直挂——层深随表类型异构,
+			//故逐层下探首子键直到枚举NO_MORE_ENTRIES的叶再查值
+			//(深度上限8=异常环防御), 三层/零层通吃
+			HANDLE hk = h;
+			UCHAR ki[FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + 256];
+			PKEY_NODE_INFORMATION ni = (PKEY_NODE_INFORMATION)ki;
+			ULONG retLen = 0;
+			for (ULONG depth = 0; depth < 8; depth++)
+			{
+				NTSTATUS es = ZwEnumerateKey(hk, 0, KeyNodeInformation,
+					ni, sizeof(ki), &retLen);
+				if (!NT_SUCCESS(es))
+				{
+					if (es != STATUS_NO_MORE_ENTRIES)
+					{
+						enumStage = 1;
+					}
+					break;      //叶到达/断链: 落点键上照常试查值
+				}
+				UNICODE_STRING subName;
+				OBJECT_ATTRIBUTES subOa;
+				HANDLE hChild = NULL;
+				subName.Buffer = ni->Name;
+				subName.Length = subName.MaximumLength =
+					(USHORT)ni->NameLength;
+				InitializeObjectAttributes(&subOa, &subName,
+					OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, hk, NULL);
+				if (!NT_SUCCESS(ZwOpenKey(&hChild, KEY_READ, &subOa)))
+				{
+					enumStage = 1;
+					break;
+				}
+				if (hk != h)
+				{
+					ZwClose(hk);
+				}
+				hk = hChild;
+			}
+			{
+				UNICODE_STRING valName;
+				UCHAR kv[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + 512];
+				PKEY_VALUE_PARTIAL_INFORMATION kvP =
+					(PKEY_VALUE_PARTIAL_INFORMATION)kv;
+				ULONG vretLen = 0;
+				RtlInitUnicodeString(&valName, L"00000000");
+				//FADT逐偏移(ACPI规范FADT字段表, 全修订稳定区):
+				//+0x00签名"FACP" +0x4C PM_TMR_BLK(u32, IO端口;
+				//X_扩展GAS字段偏移随表修订漂移且IO域端口恒≤16
+				//位——legacy字段为全版本常量, 规范强制与GAS
+				//同值, 只信此字段) +0x5B PM_TMR_LEN(u8, 规范:
+				//定时器在场=4/缺席=0) +0x70 FLAGS(bit8
+				//TMR_VAL_EXT: 1=32位/0=24位计数)
+				if (NT_SUCCESS(ZwQueryValueKey(hk, &valName,
+					KeyValuePartialInformation, kvP, sizeof(kv), &vretLen)) &&
+					kvP->Type == REG_BINARY && kvP->DataLength >= 0x74 &&
+					*(ULONG*)kvP->Data == 0x50434146 /*'FACP'*/)
+				{
+					PUCHAR fadt = kvP->Data;
+					ULONG port = *(ULONG*)(fadt + 0x4C);
+					if (port != 0 && port <= 0xFFFF && fadt[0x5B] == 4)
+					{
+						g_svmPmTimerPort = port;
+						g_svmPmTimerMask = ((*(ULONG*)(fadt + 0x70)
+							& 0x100) != 0) ? 0xFFFFFFFFUL : 0xFFFFFFUL;
+					}
+					else
+					{
+						enumStage = 3;
+					}
+				}
+				else if (enumStage == 0)
+				{
+					enumStage = 2;
+				}
+			}
+			if (hk != h)
+			{
+				ZwClose(hk);
+			}
+			ZwClose(h);
+		}
+		{
+			int c[4] = { 0 };
+			//SVM平台=AMD: 优先CPUID 0x16(处理器基频MHz——Zen系
+			//恒频TSC=P0, 此叶返回整数MHz精确); 回退0x15比率
+			//(ebx/eax×核心晶体频率: ECX在场=直读, 缺席=24MHz
+			//业界惯例)
+			__cpuid(c, 0x16);
+			if (c[0] != 0)
+			{
+				g_svmTscHz = (ULONG64)c[0] * 1000000ULL;
+			}
+			else
+			{
+				__cpuid(c, 0x15);
+				if (c[0] != 0 && c[1] != 0)
+				{
+					ULONG64 base = (c[2] != 0) ? (ULONG64)c[2] : 24000000ULL;
+					g_svmTscHz = base * (ULONG64)c[1] / (ULONG64)c[0];
+				}
+			}
+		}
+		//AMD Zen不实现CPUID 0x15/0x16(双叶归零)——频率缺席时的
+		//自举: PM_TMR自身标定(裸机PASSIVE物理IO直访; 两钟自由
+		//运行, 窗内线程被抢占无碍——增量比不受影响)。抓"PM增量
+		//≥0x8000 ticks(~9.2ms)"或"TSC增量≥4e9(~1s上限, 定时器
+		//停走防御)"先到者, 成窗才换算: TSC_Hz=3.579545MHz×ΔTSC/
+		//ΔPM。窗短+采样抖动~百ppm(补偿量级下的残余, 无感); 计数
+		//宽度掩码减法兜窗内回绕语义(32位周期~20min/24位~4.7s,
+		//窗内均不可能, 掩码为双保险)
+		if (g_svmPmTimerPort != 0 && g_svmTscHz == 0)
+		{
+			ULONG64 p0 = __indword(g_svmPmTimerPort);
+			ULONG64 t0 = __rdtsc();
+			ULONG64 dm = 0;
+			ULONG64 t1 = t0;
+			do
+			{
+				ULONG64 p1 = __indword(g_svmPmTimerPort);
+				t1 = __rdtsc();
+				dm = (p1 - p0) & g_svmPmTimerMask;
+			} while (dm < 0x8000 && (t1 - t0) < 4000000000ULL);
+			if (dm >= 0x8000)
+			{
+				g_svmTscHz = 3579545ULL * (t1 - t0) / dm;
+			}
+		}
+		if (g_svmPmTimerPort != 0)
+		{
+			FlLog("时钟域隐蔽: PM_TMR端口=0x%X %d位计数 TSC=%lldMHz → IO拦截+读代答虚拟轴补偿%s",
+				g_svmPmTimerPort,
+				(g_svmPmTimerMask == 0xFFFFFFFFUL) ? 32 : 24,
+				(LONG64)(g_svmTscHz / 1000000),
+				g_svmTscHz != 0 ? "" : "(频率缺席: 代答=物理真值)");
+		}
+		else
+		{
+			//阶段码图例见enumStage定义行——一次boot定位降级根因
+			FlLog("时钟域隐蔽: PM_TMR枚举失败(阶段%u) → 不置位直通(裸机等价)",
+				enumStage);
+		}
+	}
+#else
+	FlLog("时钟域隐蔽: 关闭(PM_TMR读=物理直通)");
+#endif
 	//INIT重定向: VM_CR.R_INIT(bit1)置1=外部INIT经#SX异常可见化
 	//(§15.21.8)——外部INIT的死法从静默复位变为可观察事件。
 	//发起核一次性写(VM_CR为每核MSR, 其余核不写)。LOCK置位后
@@ -1642,6 +1831,85 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			//NMI交付延迟+1世界开关(罕见事件: WHEA/硬件看门狗类)
 			vmcb->Control.EventInj =
 				EVENTINJ_MAKE(2, EVENTINJ_TYPE_NMI, 0, 0);
+			return 0;
+		}
+		case SVM_EXIT_IOIO:    //0x7B: IOPM端口拦截(时钟域隐蔽载体, §15.10)
+		{
+			//EXITINFO1(Table 15-2): PORT[31:16] TYPE(b0=IN)
+			//STR(b2) SZ8/16/32(b4/5/6); EXITINFO2=next-RIP(§15.10.2
+			//原文——恢复不依赖NRIPS特性)。IOPM单bit管读写(§15.10.1),
+			//生产形态仅PM_TMR端口4字节在位=到达即本域
+			ULONG32 io = (ULONG32)vmcb->Control.ExitInfo1;
+			ULONG port = io >> 16;
+			BOOLEAN isIn = ((io & 1) != 0);
+			BOOLEAN isStr = (((io >> 2) & 1) != 0);
+			ULONG width = (((io >> 6) & 1) != 0) ? 4 :
+				(((io >> 5) & 1) != 0) ? 2 : 1;
+			static volatile LONG s_ioCnt[64] = { 0 };
+			GNPT_CRUMB(s_ioCnt, 0xFFF, cpu,
+				FlRingPush('d', cpu, (ULONG)exitCode, io,
+					(ULONG64)g_svmPmTimerPort, 0));
+			//STR(INS/OUTS): PM_TMR无合法字符串IO用户(检测方读法=
+			//IN单条), 到达=异常形态——剥位直通自愈(default防御同
+			//语义, 不推RIP重入: 原指令重执行)
+			if (isStr)
+			{
+				vmcb->Control.InterceptMisc1 &= ~INTERCEPT_IOIO_PROT;
+				return 0;
+			}
+			ULONG mask = (width == 4) ? 0xFFFFFFFFUL :
+				(width == 2) ? 0xFFFFUL : 0xFFUL;
+			if (isIn)
+			{
+				//root代读(exit handler=GIF=0裸机root, IOPM只约束
+				//guest——物理IO直访)
+				ULONG64 val = (width == 4) ? __indword(port) :
+					(width == 2) ? __inword(port) : __inbyte(port);
+				//PM_TMR域=虚拟时间轴补偿: 锚点=本exit入口的guest
+				//TSC虚拟时刻(ExitTsc+TscOffset=TSC轴在驻留窗冻结
+				//后的时间线, 补偿后PM读值与guest随后读到的TSC同刻
+				//——双时钟源互证一致)。勿用全局水位做锚: 水位只在
+				//exit尾推进, 静默期(秒级无exit)后首读会把静默时长
+				//一并错扣。PM定时器=count-UP计数器(ACPI §4.8.2
+				//free-running, 32/24位@3.579545MHz, 宽度FLAGS.
+				//TMR_VAL_EXT定宽): 虚拟时刻早于物理=计数更少=减法
+				//方向; 模宽度掩码=跨回绕语义忠实。lag=本exit已历时
+				//+本核累计驻留, 会话上界<<2^50×3.6e6<2^63无溢出;
+				//频率缺席=跳补偿=物理真值(横幅降级自洽)
+				if (port >= g_svmPmTimerPort &&
+					port < g_svmPmTimerPort + 4 &&
+					g_svmTscHz != 0)
+				{
+					ULONG64 lag = __rdtsc() - (Vcpu->ExitTsc +
+						vmcb->Control.TscOffset);
+					ULONG64 sub = lag * 3579545ULL / g_svmTscHz;
+					val = (val - sub) & g_svmPmTimerMask;
+				}
+				//x86 IN语义: 目标寄存器低width位写入高位保留
+				ULONG64 rax = (vmcb->State.Rax & ~((ULONG64)mask))
+					| (val & mask);
+				vmcb->State.Rax = rax;
+				Regs->rax = rax;
+			}
+			else
+			{
+				//OUT: root代写忠实直通(PM_TMR硬件写=忽略语义,
+				//与裸机一致); 值源=RAX低位
+				ULONG64 val = vmcb->State.Rax & mask;
+				if (width == 4)
+				{
+					__outdword(port, (ULONG)val);
+				}
+				else if (width == 2)
+				{
+					__outword(port, (USHORT)val);
+				}
+				else
+				{
+					__outbyte(port, (UCHAR)val);
+				}
+			}
+			vmcb->State.Rip = vmcb->Control.ExitInfo2;    //next-RIP
 			return 0;
 		}
 #if GNPT_SMI_INTERCEPT

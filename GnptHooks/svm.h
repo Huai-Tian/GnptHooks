@@ -196,6 +196,8 @@ extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; =实�
 extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(Debug构建HB心跳检停泊)
 extern volatile LONG64 g_svmB8Landed[64];      //各核launch定格的0xB8形态(FillVmcb裸机登记, 阶梯回退更新; 探针读此纯全局勿读VMCB——自我隐蔽下guest读VMCB=零页)
 extern volatile LONG64 g_svmDefHeal[64];       //异常exit防御自愈登记: 各核最后剥位自愈的exit码+1(0=无; exit处置(GIF=0)写, 自证探针只读——同上勿读VMCB)
+extern volatile ULONG g_svmPmTimerPort;        //PM_TMR IO端口(FADT枚举, 0=缺席=时钟域降级直通; demo探针读)
+extern volatile ULONG64 g_svmTscHz;            //TSC标称频率(CPUID 0x15/0x16探测, 0=缺席=补偿降级为物理真值)
 
 //root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——仅虚拟化
 //核合法: 裸机核EFER.SVME=0→vmmcall=#UD→蓝屏(调用线程调度核不可控,

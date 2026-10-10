@@ -526,6 +526,55 @@ static VOID DemoDefenseProbe(VOID)
 		(unsigned long long)t2);
 }
 
+#if GNPT_CLK_STEALTH
+//时钟域自证探针: 以检测方视角双时钟互证——guest读PM_TMR(经
+//0x7B exit→root代答+虚拟时间轴补偿, 'd'环留痕)与RDTSC(直通,
+//硬件TscOffset加法=虚拟TSC)的增量比应≈标称比率(检测方判据
+//即此: 两钟不一致=exit驻留暴露; 一致=测不出驻留)。~10ms纯
+//rdtsc自旋拉开读对间隔(误差相对化); 32位计数10ms增量~3.6e4
+//远小于2^32无回绕。门控: 端口/频率缺席=如实跳过(降级形态
+//自证)。探针线程与处置同核(同[S5]须在钉核域内调用)
+static VOID DemoClockProbe(VOID)
+{
+	ULONG port = g_svmPmTimerPort;
+	ULONG64 hz = g_svmTscHz;
+	if (port == 0)
+	{
+		FlLog("[S6] 时钟域自证: PM_TMR枚举缺席 → 跳过(直通形态)");
+		return;
+	}
+	if (hz == 0)
+	{
+		FlLog("[S6] 时钟域自证: TSC频率缺席 → 跳过(补偿降级形态)");
+		return;
+	}
+	ULONG64 p0 = __indword(port);   //exit 0x7B→代答+补偿('d'环)
+	ULONG64 t0 = __rdtsc();
+	while (__rdtsc() - t0 < hz / 100)   //~10ms自旋(零exit)
+	{
+	}
+	ULONG64 p1 = __indword(port);
+	ULONG64 t1 = __rdtsc();
+	ULONG64 dpm = p1 - p0;
+	ULONG64 dtsc = t1 - t0;
+	//推算PM率=ΔPM(补偿后)×TSC率/ΔTSC(虚拟), 应≈3579545;
+	//容忍±2%(两读对exit驻留差μs级+自旋过冲, 10ms窗相对化后
+	//常态远小于0.1%; 2%=代答/补偿算术级错误的下限筛查门槛)
+	ULONG64 est = dpm * hz / dtsc;
+	ULONG64 devppm = est * 1000000ULL / 3579545ULL;
+	LONG64 off = (LONG64)devppm - 1000000;
+	ULONG64 absOff = (off < 0) ? (ULONG64)(-off) : (ULONG64)off;
+	BOOLEAN pass = (absOff <= 20000);
+	FlLog("[S6] 时钟域自证: ΔPM=%llu ΔTSC=%llu 推算PM率=%lluHz"
+		"(偏差%s%u.%02u%%)——%s",
+		(unsigned long long)dpm, (unsigned long long)dtsc,
+		(unsigned long long)est, (off < 0) ? "-" : "+",
+		(ULONG)(absOff / 10000), (ULONG)((absOff % 10000) / 100),
+		pass ? "双时钟源互证一致, A1补偿功能级在位"
+			: "**失败**(查'd'环: 0=exit未触发; 在=补偿算术/方向)");
+}
+#endif
+
 //======== 调试子系统忠实性自证探针(判据②验收) ========
 //以检测方视角(设TF/设DR断点/回读DR/发int1)验证"调试面=裸机
 //等价"——检测方的标准手法: 设TF观察#DB是否到达/设DR断点观察
@@ -985,6 +1034,9 @@ static VOID DemoStart(VOID)
 		DemoTscDeadlineProbe();
 		DemoPmuProbe();
 		DemoDefenseProbe();      //异常exit防御族自证(钉核0, 须在钉核域内)
+#if GNPT_CLK_STEALTH
+		DemoClockProbe();        //时钟域A1自证(同核契约同[S5])
+#endif
 		DemoDebugFaithProbe();    //调试面忠实性(TF/自断点/回读/INT1)——须先于MultiHook(其阶段B将hook冷靶=②的零干扰前提)
 		KeSetSystemAffinityThread(allAff);
 	}
