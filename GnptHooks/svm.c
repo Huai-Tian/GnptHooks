@@ -744,6 +744,15 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 #else
 	FlLog("CPUID伪装: 关闭(全真值直透传)");
 #endif
+	//CET平台取证(冷横幅一行): CR4.CET=1=shadow stack使能——本状态
+	//下清CR0.WP=Mov CR0架构性#GP(APM Vol1 CR0.WP位规则)。宿主OS
+	//运行期从不写CR0故该位平时无观测面; 引擎任何CR0写入路径的
+	//平台适配判据在此行
+	FlLog("CET: CR4=%llX CET(bit23)=%u%s",
+		(unsigned long long)__readcr4(),
+		(ULONG)((__readcr4() >> 23) & 1),
+		((__readcr4() >> 23) & 1) ?
+		"=shadow stack在位(CR0.WP不可清)" : "=WP瞬清可用");
 	//故事面布防声明(位在各核SvmFillVmcb置; 含#GP处置——SVM指令族
 	//#GP先于拦截位, Table 15-7)
 	FlLog("S1故事: SVM未激活——EFER读伪SVME=0/VM_CR伪0x18(BIOS锁死=第二"

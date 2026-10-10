@@ -259,8 +259,12 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
                                //  __writedr(slot)+VMCB.Dr7合并置位;
                                //  on=0→Dr7撤位('g'环逐核留痕)
 #define GNPT_VMCALL_NXREARM 14 //NX-Fence detour收尾(stub尾经CmVmmCall
-                               //  自发, 处置在hook.c的GnptHookNxRearm):
-                               //  在途旗清+视图回P(fence重武装)→推进RIP
+                               // 自发, 处置在hook.c的GnptHookNxRearm):
+                               // 在途旗清+视图回P(fence重武装)→推进RIP
+//功能码15已退役(WP旁路强制拷贝): CET shadow stack使能平台
+//(CR4.CET=1)上清CR0.WP=Mov CR0架构性#GP(APM Vol1 CR0.WP位
+//规则)——cave槽写入改走hook.c的MDL别名路径(HookCaveAliasCopy,
+//纯PASSIVE API, 零CR0接触), 不再需要root代写原语
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)

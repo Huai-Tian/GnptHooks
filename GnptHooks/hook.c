@@ -89,8 +89,7 @@ typedef struct _GNPT_ENTRY
 
 static GNPT_ENTRY g_hooks[GNPT_MAX_HOOKS];
 static volatile LONG g_hookLive = 0;      //已安装未移除数(引擎快速门)
-static PUCHAR g_slotPool = NULL;           //跳板槽池(1页, 懒分配)
-static volatile LONG g_slotUsed = 0;
+static volatile LONG g_slotUsed = 0;      //已刻槽数(cave+池合计, 上限64)
 
 //每核当前视图(0=Primary 1=Secondary)
 static volatile LONG g_view[64];
@@ -179,88 +178,210 @@ extern ULONG64 GnptCallOrigAsm(GNPT_ORIG_CALL* Call);
 //| [16..23]=GnptStubEntry地址(指针落t+16: jmp的RIP_after=t+16,
 //disp32=0→CPU从t+16读操作数)。回读自检防编码错位(jmp处#GP)
 //
-//槽池选址(LBR被动残余缓解): 池页地址必须落在某模块映像范围内
-//——guest LBR栈记录目标→槽的jmp, 分支目标=池地址; 池地址在
-//裸内存区(ExAllocatePool返回的系统VA区无模块归属)=任何正常
-//系统都不存在的分支目标形态=LBR栈扫描指纹。槽池挂靠模块后
-//分支目标=模块内地址=与正常调用形态不可区分。挂靠失败
-//(无可用洞)=回退池分配(fail-open: 功能保全, LBR残余在)
-static PUCHAR HookSlotPoolAlloc(VOID)
+//槽池cave选址(LBR被动残余缓解): 槽码驻留地址必须落在
+//某模块映像范围内——guest LBR栈记录分支的源/目地址; 池地址在
+//裸内存区(ExAllocatePool系统VA区无模块归属)=任何正常系统都不
+//存在的分支源形态=LBR栈扫描指纹+X池页=内核扫描器经典命中。
+//cave刻槽后槽地址=模块内地址=与正常代码形态不可区分。
+//选址器: **逐节扫描X节页内尾碎片**(节末VirtualSize对齐到下节
+//VA的驻留间隙, ≤4095B/节, 驱动映像.text/.INIT/Debug构建NXF1/
+//.NXF2皆有)——整页洞形态在常规驱动映像不存在, 页内尾碎片为
+//唯一现实来源。按槽粒度序贯刻, 洞尽后逐槽池回退(fail-open:
+//功能保全, 已刻槽保归属)
+//写入路径: X节页运行期只读(节属性RX), guest态直写=写fault——
+//MDL别名拷贝: 对cave页建非分页MDL→MmGetSystemAddressForMdlSafe
+//映射RW系统别名→经别名写24B→MmUnmapLockedPages撤销。全程
+//PASSIVE纯API, 零CR0接触。**不可用CR0.WP瞬清替代**: CET
+//shadow stack使能(CR4.CET=1)的机器上清WP=Mov CR0直接#GP
+//(APM Vol1 CR0.WP位规则; 宿主OS运行期从不写CR0故平台差异
+//只在此路径暴露)。teardown经同别名路径还原源字节保存副本
+//(精确复原, 勿假设填充字节形态)
+#define HOOK_CAVE_MAX 8
+typedef struct _HOOK_CAVE
 {
-	//候选: 本驱动映像(节尾对齐空隙)。映像基=RtlPcToFileHeader
-	//(本函数地址属于映像)——槽池落本驱动映像范围内即达"模块
-	//归属"目的(检测者无法区分是哪个模块的code cave)。驱动
-	//映像大小由SectionAlignment界(4KB), 实际映像尾与PE声明
-	//SizeOfImage间=驻留洞; 运行期以映像头SizeOfImage字段
-	//自证边界, 洞搜索=映像尾页的页内余量
-	PUCHAR base = (PUCHAR)HookImageBaseOf((PVOID)HookSlotPoolAlloc);
-	if (base != NULL)
+	PUCHAR va;      //洞段起始(16对齐)
+	ULONG  len;     //洞段剩余字节
+} HOOK_CAVE;
+static HOOK_CAVE g_caveTab[HOOK_CAVE_MAX];
+static ULONG g_caveCnt = 0;                    //0=未枚举(懒初始化, 单写者契约)
+static PUCHAR g_slotAddr[HOOK_SLOT_PER_PAGE];  //槽地址注册表(idx→va, teardown遍历)
+static UCHAR g_slotSave[HOOK_SLOT_PER_PAGE][24]; //槽24B源字节保存(cave还原)
+
+//映像内X节尾碎片枚举(Install冷路径, PASSIVE): 逐节收集
+//[alignUp(VA+VSize,16), 下一节VA或SizeOfImage钳页)且≥1槽宽的可执行
+//驻留间隙。末节钳alignUp(end,PAGE)——[alignUp(end),SizeOfImage)可能
+//为未提交保留区, 不越界采信
+static ULONG HookCaveEnum(VOID)
+{
+	g_caveCnt = 0;
+	PUCHAR base = (PUCHAR)HookImageBaseOf((PVOID)HookCaveEnum);
+	if (base == NULL)
 	{
-		PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
-		if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+		return 0;
+	}
+	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+	{
+		return 0;
+	}
+	PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE ||
+		nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+	{
+		return 0;
+	}
+	PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+	ULONG n = nt->FileHeader.NumberOfSections;
+	ULONG total = 0;
+	for (ULONG i = 0; i < n && g_caveCnt < HOOK_CAVE_MAX; i++)
+	{
+		//仅X节(槽码需执行; .data/.rsrc/.reloc碎片=不可执行写入即#GP);
+		//VSize=0纯占位节无内容页——碎片落未提交页=root拷贝#PF(灾难),
+		//结构性跳过
+		if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+			sec[i].Misc.VirtualSize == 0)
 		{
-			PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)
-				(base + dos->e_lfanew);
-			if (nt->Signature == IMAGE_NT_SIGNATURE &&
-				nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-			{
-				//末节尾部碎片: 节对齐后通常无整页洞——常态走池
-				//回退; 判据在=形态自适应(链接器布局变化时自动挂靠)
-				PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-				PIMAGE_SECTION_HEADER last =
-					&sec[nt->FileHeader.NumberOfSections - 1];
-				ULONG lastEnd = last->VirtualAddress + last->Misc.VirtualSize;
-				ULONG lastAligned = (lastEnd + nt->OptionalHeader.SectionAlignment - 1) &
-					~(nt->OptionalHeader.SectionAlignment - 1);
-				ULONG tailGap = lastAligned - lastEnd;
-				ULONG imgSize = nt->OptionalHeader.SizeOfImage;
-				//整页洞条件: 尾节页内碎片≥1页且洞全在SizeOfImage内
-				//(理论常态不成立——保底判据, 命中即用)
-				if (tailGap >= PAGE_SIZE && lastAligned <= imgSize)
-				{
-					return base + lastEnd;
-				}
-			}
+			continue;
+		}
+		ULONG end = sec[i].VirtualAddress + sec[i].Misc.VirtualSize;
+		ULONG start = (end + 15) & ~15;    //刻槽16对齐(取指无对齐要求, 卫生)
+		ULONG next = (i + 1 < n) ? sec[i + 1].VirtualAddress
+			: nt->OptionalHeader.SizeOfImage;
+		ULONG lastPg = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+		if (next > lastPg)
+		{
+			next = lastPg;    //末节/异常布局钳到已提交页界
+		}
+		if (next > start && next - start >= HOOK_SLOT_SIZE)
+		{
+			g_caveTab[g_caveCnt].va = base + start;
+			g_caveTab[g_caveCnt].len = next - start;
+			total += next - start;
+			g_caveCnt++;
 		}
 	}
-	return (PUCHAR)ExAllocatePoolWithTag(
-		NonPagedPool, PAGE_SIZE, HOOK_POOL_TAG);
+	return total;
+}
+
+//cave槽读写原语(锁页RW重映射, PASSIVE): 对目标字节所在页建MDL,
+//MmProbeAndLockPages(IoReadAccess——只读锁定, 不对源PTE做写权限
+//检查)→MmMapLockedPagesSpecifyCache建**全新RW映射**(新PTE的RW位
+//由本API决定, 不继承源PTE的RO——绕开RX页写保护的正统原语)→经
+//重映射写nB→解除+解锁。零CR0接触(WP瞬清在CR4.CET=1平台=架构性
+//#GP, 见节头注释)。**不可用MmBuildMdlForNonPagedPool+
+//MmGetSystemAddressForMdlSafe**: 该组合置MDL_SOURCE_IS_NONPAGED_
+//POOL标志后GetSystemAddress直接返回原VA(非分页池快捷路径)——
+//"别名"=原地址=直写RX页(契约外映像页=0xBE实测形态); 驱动
+//映像页非非分页池, 必须走通用锁页。重映射MmCached+物理标记缓存
+//=与原VA共享物理行, 别名写=原VA读/取指即见(回读自检即验证)。
+//n≤页内余量(调用点n=24, 槽16对齐, 恒成立)。返回FALSE=锁定/映射
+//失败(fail-loud由调用方处置)
+static BOOLEAN HookCaveAliasCopy(PUCHAR Dst, const UCHAR* Src, ULONG n)
+{
+	PMDL mdl = (PMDL)ExAllocatePoolWithTag(NonPagedPool,
+		sizeof(MDL) + sizeof(PFN_NUMBER), HOOK_POOL_TAG);
+	if (mdl == NULL)
+	{
+		return FALSE;
+	}
+	MmInitializeMdl(mdl, PAGE_ALIGN(Dst), PAGE_SIZE);
+	__try
+	{
+		MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		ExFreePoolWithTag(mdl, HOOK_POOL_TAG);
+		return FALSE;
+	}
+	PUCHAR alias = (PUCHAR)MmMapLockedPagesSpecifyCache(mdl,
+		KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+	if (alias == NULL)
+	{
+		MmUnlockPages(mdl);
+		ExFreePoolWithTag(mdl, HOOK_POOL_TAG);
+		return FALSE;
+	}
+	RtlCopyMemory(alias + BYTE_OFFSET(Dst), Src, n);
+	MmUnmapLockedPages(alias, mdl);
+	MmUnlockPages(mdl);
+	ExFreePoolWithTag(mdl, HOOK_POOL_TAG);
+	return TRUE;
 }
 
 static PUCHAR HookAllocSlot(PGNPT_ENTRY Entry)
 {
-	if (g_slotPool == NULL)
+	//懒枚举(首槽; 单写者契约: Install串行化, 纪律8)——选址日志
+	//一行: 洞段数/总字节/池回退预期
+	if (g_slotUsed == 0)
 	{
-		g_slotPool = HookSlotPoolAlloc();
-		if (g_slotPool == NULL)
-		{
-			return NULL;
-		}
-		//挂靠形态(映像尾页): 槽码落映像范围内=模块归属达成;
-		//池形态: 首槽清零(池页语义); 挂靠页本为零区不动
-		if (HookImageBaseOf((PVOID)g_slotPool) == NULL)
-		{
-			RtlZeroMemory(g_slotPool, PAGE_SIZE);
-		}
-		FlLog("[Hook] 槽池选址: %p(%s)",
-			g_slotPool,
-			(HookImageBaseOf((PVOID)g_slotPool) != NULL) ?
-			"模块映像code cave=LBR指纹缓解" : "池分配(挂靠失败回退)");
+#if GNPT_SLOT_FORCE_POOL
+		FlLog("[Hook] 槽池: 强制池回退开启(槽全池分配, "
+			"cave刻槽路径停用)");
+#else
+		ULONG caveBytes = HookCaveEnum();
+		FlLog("[Hook] 槽池选址: 映像X节尾碎片%u段共%uB%s",
+			g_caveCnt, caveBytes,
+			(g_caveCnt != 0) ? "(cave刻槽=模块归属)" :
+			"(无洞=槽全池回退, LBR残余在)");
+#endif
 	}
 	if (g_slotUsed >= HOOK_SLOT_PER_PAGE)
 	{
 		return NULL;    //64槽上限
 	}
 	LONG idx = InterlockedIncrement(&g_slotUsed) - 1;
-	PUCHAR t = g_slotPool + (ULONG)idx * HOOK_SLOT_SIZE;
-	t[0] = 0x49;  t[1] = 0xBA;                       //mov r10, imm64
-	*(ULONG64*)(t + 2) = (ULONG64)Entry;
-	t[10] = 0xFF; t[11] = 0x25;                      //jmp [rip+0]
-	*(ULONG32*)(t + 12) = 0;
-	*(ULONG64*)(t + 16) = (ULONG64)&GnptStubEntry;
+	//cave序贯刻槽(纯idx推进, 无并发态): 首个余量足的洞段扣减
+	PUCHAR t = NULL;
+	BOOLEAN inCave = FALSE;
+#if !GNPT_SLOT_FORCE_POOL
+	for (ULONG i = 0; i < g_caveCnt; i++)
+	{
+		if (g_caveTab[i].len >= HOOK_SLOT_SIZE)
+		{
+			t = g_caveTab[i].va;
+			g_caveTab[i].va += HOOK_SLOT_SIZE;
+			g_caveTab[i].len -= HOOK_SLOT_SIZE;
+			inCave = TRUE;
+			break;
+		}
+	}
+#endif
+	if (!inCave)
+	{
+		t = (PUCHAR)ExAllocatePoolWithTag(
+			NonPagedPool, HOOK_SLOT_SIZE, HOOK_POOL_TAG);
+		if (t == NULL)
+		{
+			return NULL;
+		}
+		RtlZeroMemory(t, HOOK_SLOT_SIZE);
+	}
+	g_slotAddr[idx] = t;
+	RtlCopyMemory(g_slotSave[idx], t, 24);    //源字节保存(teardown精确还原)
+	//24B槽码先构于本帧(写入路径分离: cave=RX页MDL别名拷贝; 池=直写)
+	UCHAR tcode[24];
+	tcode[0] = 0x49;  tcode[1] = 0xBA;                       //mov r10, imm64
+	*(ULONG64*)(tcode + 2) = (ULONG64)Entry;
+	tcode[10] = 0xFF; tcode[11] = 0x25;                      //jmp [rip+0]
+	*(ULONG32*)(tcode + 12) = 0;
+	*(ULONG64*)(tcode + 16) = (ULONG64)&GnptStubEntry;
+	if (inCave)
+	{
+		//X节页只读: 经MDL RW别名写入; 映射失败=槽弃用fail-loud
+		if (!HookCaveAliasCopy(t, tcode, 24))
+		{
+			FlLog("[Hook] cave别名映射失败(槽%p弃用)", t);
+			return NULL;
+		}
+	}
+	else
+	{
+		RtlCopyMemory(t, tcode, 24);
+	}
 	if (*(volatile ULONG64*)(t + 16) != (ULONG64)&GnptStubEntry)
 	{
-		return NULL;    //回读自检FAIL(编码回归)
+		return NULL;    //回读自检FAIL(编码回归; cave页可正常读)
 	}
 	return t;
 }
@@ -505,20 +626,25 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen,
 		//普通模式拒装门: 控制转移@补丁覆盖内=函数短于14B补丁,
 		//补丁尾将越函数尾越权写邻码(实测形态: PsGetProcessId 8B
 		//函数mov+ret×14B补丁=+8..+13落邻码, M16.37)——fail-loud
-		//拒绝+指路TRANSPARENT。相对分支族已被上方拒绝, 此处收
-		//ret/iret/int/icebp/hlt/间接call-jmp/sysenter族
+		//拒绝+指路TRANSPARENT。相对转移族(jcc/jmp/call rel/
+		//loop/jcxz——E0-E3经LDasm OP_RELATIVE表)已被上方拒绝,
+		//此处收非相对族: ret/retf近远(C3 C2 CB CA)/iret(CF)/
+		//int族(CD CC)/icebp(F1)/hlt(F4)/sysenter-exit-call-ret
+		//(0F 34/35/05/07)/FF /2-/5(间接call-jmp近远全收——
+		//far形态含段选择子语义, 重放结构性不可行)
 		if (RejectCtrl)
 		{
 			PUCHAR opc = (PUCHAR)src + ld.opcd_offset;
 			UCHAR op1 = opc[0];
 			UCHAR op2 = (ld.opcd_size >= 2) ? opc[1] : 0;
+			ULONG ffReg = (ld.modrm >> 3) & 7;
 			BOOLEAN ctrl =
-				(op1 == 0xC3 || op1 == 0xC2 || op1 == 0xCF ||
-				 op1 == 0xCD || op1 == 0xF1 || op1 == 0xF4) ||
+				(op1 == 0xC3 || op1 == 0xC2 || op1 == 0xCB ||
+				 op1 == 0xCA || op1 == 0xCF || op1 == 0xCD ||
+				 op1 == 0xCC || op1 == 0xF1 || op1 == 0xF4) ||
 				(op1 == 0x0F && (op2 == 0x34 || op2 == 0x35 ||
-					op2 == 0x07)) ||
-				(op1 == 0xFF && ((((ld.modrm >> 3) & 7) == 2) ||
-					(((ld.modrm >> 3) & 7) == 4)));
+					op2 == 0x05 || op2 == 0x07)) ||
+				(op1 == 0xFF && ffReg >= 2 && ffReg <= 5);
 			if (ctrl)
 			{
 				FlLog("[Reloc] 拒绝: 普通模式目标过短——控制转移@+%u"
@@ -2391,6 +2517,47 @@ NTSTATUS GnptHookRemove(PVOID Target)
 
 //DriverUnload在关引擎**之前**调用: 移除全部live hook
 //(在途回调此刻引擎仍开着=安全)
+//槽池teardown: cave槽=RX映像内存不可ExFreePool且不可guest态
+//直写——经MDL RW别名按源字节保存副本精确复原; 纯API无引擎
+//依赖(保留挂RemoveAll尾=时序安全: 逐条全核同步后, 在途回调
+//已排空, 无核可再入槽, jmp半写撕裂不可能)。池槽=清零+释放。
+//槽地址注册表驱动遍历(失败安装的孤儿槽无条目, 也有注册表项)
+static VOID HookSlotsTeardown(VOID)
+{
+	ULONG caveSlots = 0, poolSlots = 0;
+	for (LONG i = 0; i < g_slotUsed && i < HOOK_SLOT_PER_PAGE; i++)
+	{
+		PUCHAR t = g_slotAddr[i];
+		if (t == NULL)
+		{
+			continue;
+		}
+		if (HookImageBaseOf((PVOID)t) != NULL)
+		{
+			if (!HookCaveAliasCopy(t, g_slotSave[i], 24))
+			{
+				FlLog("[Hook] !! cave槽%p别名复原失败(源字节在"
+					"注册表, 卸载后映像遗留24B槽码)", t);
+			}
+			caveSlots++;
+		}
+		else
+		{
+			RtlZeroMemory(t, HOOK_SLOT_SIZE);
+			ExFreePoolWithTag(t, HOOK_POOL_TAG);
+			poolSlots++;
+		}
+		g_slotAddr[i] = NULL;
+	}
+	g_slotUsed = 0;
+	g_caveCnt = 0;    //洞表清空(下次安装重新枚举=映像不变, 等价)
+	if (caveSlots != 0 || poolSlots != 0)
+	{
+		FlLog("[Hook] 槽池teardown: cave槽%u已复原(源字节精确还原)"
+			"+池槽%u已释放", caveSlots, poolSlots);
+	}
+}
+
 VOID GnptHookRemoveAll(VOID)
 {
 	ULONG n = 0;
@@ -2404,6 +2571,9 @@ VOID GnptHookRemoveAll(VOID)
 			}
 		}
 	}
+	//槽池teardown挂此(引擎在线; 驱动卸载序: RemoveAll→关引擎→
+	//FreeMemory——后者纯池释放, vmmcall已死不可再碰cave)
+	HookSlotsTeardown();
 	if (n != 0)
 	{
 		FlLog("[Hook] RemoveAll: 已移除%u个hook", n);
@@ -2452,7 +2622,10 @@ NTSTATUS GnptHookEnumerate(GNPT_HOOK* Buffer, ULONG* InOutCount)
 //DriverUnload在关引擎**之后**调用(纯内存释放, 无引擎依赖):
 //清零后释放(CodePage跳转码/条目指针不残留给PFN新拥有者)。
 //隐蔽生命周期: live条目在Remove已解除; 其余残留条目保持隐蔽到
-//此处——关引擎后NPT已释放, PFN归池时零页翻译不存在, 无复用风险
+//此处——关引擎后NPT已释放, PFN归池时零页翻译不存在, 无复用风险。
+//槽池不在此处触碰: cave槽复原已由RemoveAll尾部的HookSlotsTeardown
+//完成(MDL别名纯API无引擎依赖, 到达此处时g_slotUsed恒0; 顺序契约
+//保持=卸载序稳定)
 VOID GnptHookFreeMemory(VOID)
 {
 	ULONG entries = 0, replays = 0, codepages = 0;
@@ -2478,24 +2651,10 @@ VOID GnptHookFreeMemory(VOID)
 		RtlZeroMemory(e, sizeof(GNPT_ENTRY));
 		entries++;
 	}
-	if (g_slotPool != NULL)
-	{
-		RtlZeroMemory(g_slotPool, PAGE_SIZE);
-		//挂靠形态(映像code cave)=映像内存不可ExFreePool(非法
-		//池指针=池损坏), 只清零(映像随驱动卸载整体回收);
-		//池形态=正常释放
-		if (HookImageBaseOf((PVOID)g_slotPool) == NULL)
-		{
-			ExFreePoolWithTag(g_slotPool, HOOK_POOL_TAG);
-		}
-		g_slotPool = NULL;
-	}
-	g_slotUsed = 0;
-	g_hookLive = 0;
 	if (entries != 0)
 	{
-		FlLog("[Hook] FreeMemory: 条目%u个(重定位跳板%u+CodePage%u)"
-			"+槽池已清零释放",
+		FlLog("[Hook] FreeMemory: 条目%u个(重定位跳板%u+CodePage%u)",
 			entries, replays, codepages);
 	}
+	g_hookLive = 0;
 }
