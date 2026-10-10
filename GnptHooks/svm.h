@@ -194,6 +194,7 @@ typedef struct _GNPT_VCPU_SVM
 extern GNPT_VCPU_SVM g_svmVcpu[64];
 extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; =实际接管数, 诊断旋钮见GNPT_TAKE_CORES)
 extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(Debug构建HB心跳检停泊)
+extern volatile LONG64 g_svmB8Landed[64];      //各核launch定格的0xB8形态(FillVmcb裸机登记, 阶梯回退更新; 探针读此纯全局勿读VMCB——自我隐蔽下guest读VMCB=零页)
 
 //root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——仅虚拟化
 //核合法: 裸机核EFER.SVME=0→vmmcall=#UD→蓝屏(调用线程调度核不可控,

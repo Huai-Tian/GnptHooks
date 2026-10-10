@@ -73,6 +73,11 @@ extern "C" {
 #define INTERCEPT_CR3_WTRAP     (1UL << 19)
 #define INTERCEPT_CR4_WTRAP     (1UL << 20)
 
+//VIntr (+0x060) NMI虚拟化位域(APM Table B-1 §15.21.10):
+#define VINTR_V_NMI          (1ULL << 11)  //vNMI pending(本框架走EVENTINJ注入路径, 不置此位)
+#define VINTR_V_NMI_MASK     (1ULL << 12)  //vNMI掩蔽中(硬件exit时写回)
+#define VINTR_V_NMI_ENABLE   (1ULL << 26)  //NMI virt使能(硬依赖INTERCEPT_NMI, 缺拦截位=VMRUN一致性拒)
+
 //TLB_CONTROL (+0x05C, APM Table B-1): 0=不动 1=全flush(legacy) 3=flush本guest 7=flush本guest非全局
 #define TLB_CTRL_FLUSH_ALL_GUEST 3
 
@@ -112,7 +117,7 @@ typedef struct _VMCB_CONTROL_AREA
 	ULONG  GuestAsid;                //+0x058 (0非法——一致性检查)
 	UCHAR  TlbControl;               //+0x05C 0=不动 1/3/7=flush类(单字节)
 	UCHAR  Reserved2[3];             //+0x05D
-	ULONG64 VIntr;                   //+0x060 V_TPR/V_IRQ/VGIF/V_INTR_PRIO/V_INTR_MASKING位域
+	ULONG64 VIntr;                   //+0x060 V_TPR/V_IRQ/VGIF/V_INTR_PRIO/V_INTR_MASKING/V_NMI族位域
 	ULONG64 InterruptShadow;         //+0x068 bit0=interrupt shadow
 	ULONG64 ExitCode;                //+0x070
 	ULONG64 ExitInfo1;               //+0x078

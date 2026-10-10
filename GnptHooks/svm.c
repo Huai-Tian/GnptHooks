@@ -336,6 +336,20 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 #if GNPT_SMI_INTERCEPT
 	vmcb->Control.InterceptMisc1 |= INTERCEPT_SMI;
 #endif
+	//NMI virt(IBS/PMC virt的中断投递配套, §15.21.10): INTERCEPT_NMI+
+	//V_NMI_ENABLE为硬依赖对(APM原文: 无NMI拦截位而置V_NMI_ENABLE=
+	//VMRUN一致性拒)。门控=VNMI特性在场且IBS或PMC特性在场(两者皆无
+	//时无投递需求, 不增NMI拦截面)。物理NMI→exit(0x61)→EVENTINJ注入
+	//vNMI(dispatch), NMI交付延迟+1世界开关(罕见事件: WHEA/硬件看门
+	//狗类)。IBS virt伴生should条款: host侧IbsFetchEn/IbsOpEn应保持0
+	//(§15.38; 本框架与Windows默认均不做IBS采样)。未知微架构合置
+	//硬门由launch阶梯回退兜底(SvmLaunchThread)
+	if ((g_svmFeatBits & SVM_FEAT_VNMI) != 0 &&
+	    (g_svmFeatBits & (SVM_FEAT_IBSVIRT | SVM_FEAT_PMCVIRT)) != 0)
+	{
+		vmcb->Control.InterceptMisc1 |= INTERCEPT_NMI;
+		vmcb->Control.VIntr |= VINTR_V_NMI_ENABLE;
+	}
 	//DR0-7读写全拦(DR-TRANSPARENT机件): guest的MOV DR经exit对
 	//影子仿真——硬件DR0-3(跨VMRUN持续)与VMCB.Dr6/7(guest state)
 	//永不受guest触碰; 空闲态零额外exit(Windows运行期几乎无MOV DR
@@ -380,27 +394,40 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 		vmcb->Control.InterceptMisc2 |= INTERCEPT_STGI;
 	}
 
-	//VMCB 0xB8指令虚拟化使能族(§15.33/§15.23/§15.38/§15.39): 仅LBR
-	//virt(b0)按Fn8000_000A_EDX bit1特性门控置位——世界开关硬件交换
-	//guest/host LBR寄存器组(含DebugCtl)=root驻留分支不泄漏进guest
-	//LBR栈(LBR探测面: 读LBR栈找非模块分支地址=root/hypervisor指纹),
-	//VMCB位零exit成本, 代价=世界开关多一组寄存器保存/恢复。
-	//IBS virt(b2)/PMC virt(b3)特性在场也不置位: 两者使能依赖AVIC或
-	//NMI虚拟化的中断投递基础设施(§15.38/§15.39, 本框架未实现),
-	//违合置要求=全核VMEXIT_INVALID(Zen5平台实证)——PMC计数root泄漏=
-	//平台边界(PROBE[R]回退=安全网; PMC探针按"在场未使能"如实报告)。
+	//VMCB 0xB8指令虚拟化使能族(§15.33/§15.23/§15.38/§15.39): 世界
+	//开关硬件交换guest/host寄存器组=root驻留分支不泄漏进guest计数
+	//器。LBR(b0): DebugCtl+控制转移组(探测面=读LBR栈找非模块分支
+	//地址); IBS(b2)/PMC(b3): 指令/分支计数(检测方基线对比的root
+	//增量)。VMCB位零exit成本, 代价=世界开关多组寄存器保存/恢复。
+	//置位门控: LBR按特性独立; IBS/PMC须特性在场且NMI virt投递配套
+	//在位(上方组合)——配套缺席=平台边界(DemoPmuProbe状态报告)。
 	//S1横幅的0xB8值=特性叙事面(第二实例故事), 与实际使能解耦。
-	//bit1=VMSAVEvirt不使能(该路径要#UD注入非guest执行)
+	//bit1=VMSAVEvirt不使能(该路径要#UD注入非guest执行)。首试被
+	//未知微架构合置硬门拒(全核VMEXIT_INVALID形态在档)时, launch
+	//阶梯回退兜底(SvmLaunchThread)
 #if GNPT_L3_NOLBR
-	//L系列NOLBR探针(临时): 0xB8强制0——ND死亡配置唯一剥离项
-	//(LBRvirt嫌疑隔离, 见common.h L系列注释); 特性在场不使能
-	//=PROBE[R]按"在场未使能"如实报告
+	//L系列NOLBR探针(已完成使命): 0xB8强制0+NMI virt配套剥离——
+	//位组嫌疑隔离形态(见common.h L系列注释)
 	vmcb->Control.LbrVirtEnable = 0;
+	vmcb->Control.InterceptMisc1 &= ~INTERCEPT_NMI;
+	vmcb->Control.VIntr &=
+		~(VINTR_V_NMI_ENABLE | VINTR_V_NMI | VINTR_V_NMI_MASK);
 #else
-	vmcb->Control.LbrVirtEnable =
-		(g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL;
+	{
+		ULONG64 b8v = (g_svmFeatBits & SVM_FEAT_LBRVIRT) ? 1ULL : 0ULL;
+		if ((vmcb->Control.VIntr & VINTR_V_NMI_ENABLE) != 0)
+		{
+			b8v |= (g_svmFeatBits & SVM_FEAT_IBSVIRT) ? (1ULL << 2) : 0ULL;
+			b8v |= (g_svmFeatBits & SVM_FEAT_PMCVIRT) ? (1ULL << 3) : 0ULL;
+		}
+		vmcb->Control.LbrVirtEnable = b8v;
+	}
 #endif
 #endif
+	//launch定格形态登记(裸机root上下文=真实读写; 阶梯回退时在
+	//SvmLaunchThread裸机侧按级更新)
+	g_svmB8Landed[(ULONG)(UCHAR)Vcpu->CpuIndex & 63] =
+		(LONG64)vmcb->Control.LbrVirtEnable;
 	//MSRPM布防(自我隐蔽生效前=本核发起线程裸机root态, 直写位图
 	//合法, 无需vmmcall root原语):
 	//  三故事MSR(EFER/VM_CR/HSAVE_PA)读写双拦位="SVM未激活"自洽
@@ -490,29 +517,46 @@ static VOID SvmVcpuThread(PVOID Context)
 	FlArmLaunchWatch();      //vmrun观测预热(仅Debug构建有实体; Release空宏)
 	CmSvmEnter(Vcpu);         //世界开关; "返回"=本核已guest化(launch失败除外)
 	g_flLaunchHot = 0;
-	#if DBG
-	//0xB8位组回退重试探针: 首试vmrun一致性被拒且位组含LBR外使能位时,
-	//回退LBR独留重试一次, 判别拒绝源在位组内/外。位组合置语义:
-	//IBS/PMC虚拟化的中断投递依赖AVIC或NMI虚拟化(APM §15.38/§15.39)
+	//NMI virt+0xB8位组阶梯回退(产品级): 首试VMRUN一致性被拒时逐级
+	//降形态重试——未知微架构合置硬门类(全核VMEXIT_INVALID形态在档)
+	//下, 框架自动定格到本机可运行的最强形态而非拒绝虚拟化。
+	//阶梯1: 剥IBS/PMC(b2/b3)与配套NMI virt→LBR独留;
+	//阶梯2: 再剥LBR→位组全零; 仍败=拒绝源在位组外→裸机收尾(回滚)
 	if (!Vcpu->base.bInGuest && Vcpu->base.bLaunchFailed)
 	{
 		PVMCB vmcbP = (PVMCB)Vcpu->VmcbVa;
-		if ((vmcbP->Control.LbrVirtEnable & ~1ULL) != 0)
+		if (((vmcbP->Control.LbrVirtEnable & ~1ULL) != 0) ||
+		    ((vmcbP->Control.VIntr & VINTR_V_NMI_ENABLE) != 0))
 		{
 			vmcbP->Control.LbrVirtEnable &= 1ULL;
+			vmcbP->Control.InterceptMisc1 &= ~INTERCEPT_NMI;
+			vmcbP->Control.VIntr &=
+				~(VINTR_V_NMI_ENABLE | VINTR_V_NMI | VINTR_V_NMI_MASK);
+			g_svmB8Landed[idx & 63] = (LONG64)vmcbP->Control.LbrVirtEnable;
 			Vcpu->base.bLaunchFailed = 0;
-			FlLog("PROBE[R] cpu=%u 0xB8回退重试(重试值=%llX)",
-				idx, vmcbP->Control.LbrVirtEnable);
+			FlLog("SVM: 核%u首试被拒→阶梯1(LBR独留, 剥IBS/PMC+NMI virt)重试", idx);
 			FlArmLaunchWatch();
 			CmSvmEnter(Vcpu);
 			g_flLaunchHot = 0;
-			FlLog("PROBE[R] cpu=%u 重试结果: %s", idx,
-				Vcpu->base.bInGuest ? "接管成功(拒绝源=0xB8位组)" :
-				Vcpu->base.bLaunchFailed ? "仍拒(拒绝源在0xB8外)" :
-				"探针未确认");
+			FlLog("SVM: 核%u阶梯1: %s", idx,
+				Vcpu->base.bInGuest ? "接管成功" :
+				Vcpu->base.bLaunchFailed ? "仍拒→进阶梯2" : "探针未确认");
+			if (!Vcpu->base.bInGuest && Vcpu->base.bLaunchFailed &&
+				((vmcbP->Control.LbrVirtEnable & 1ULL) != 0))
+			{
+				vmcbP->Control.LbrVirtEnable = 0;
+				g_svmB8Landed[idx & 63] = 0;
+				Vcpu->base.bLaunchFailed = 0;
+				FlLog("SVM: 核%u→阶梯2(0xB8全零)重试", idx);
+				FlArmLaunchWatch();
+				CmSvmEnter(Vcpu);
+				g_flLaunchHot = 0;
+				FlLog("SVM: 核%u阶梯2: %s", idx,
+					Vcpu->base.bInGuest ? "接管成功(拒绝源含LBR virt)" :
+					"仍拒(拒绝源在位组外)");
+			}
 		}
 	}
-	#endif
 	if (Vcpu->base.bInGuest)
 	{
 		FlLog("SVM: 核%u已guest化(KEEP确认), 停泊等待", idx);
@@ -617,6 +661,10 @@ volatile ULONG g_svmVcpuCount = 0;
 //停泊哨兵: 各核最后#VMEXIT的TSC——HB心跳检查"核在VMRUN里停泊
 //过久"(idle停泊正常=guest真实hlt; >2s且系统活动=IPI丢失嫌疑现场)
 volatile LONG64 g_svmLastExitTsc[64] = { 0 };
+//各核launch定格的0xB8形态: FillVmcb裸机root登记首试值, launch
+//阶梯回退在裸机root更新终值——探针(DemoPmuProbe)只读此全局。
+//勿从guest上下文读VMCB同名字段: 自我隐蔽已改译, guest读=零页
+volatile LONG64 g_svmB8Landed[64] = { 0 };
 
 KAFFINITY SvmPinVirtualizedCpus(VOID)
 {
@@ -685,6 +733,16 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		(featBits >> 0) & 1, (featBits >> 3) & 1, (featBits >> 5) & 1,
 		(featBits >> 6) & 1, (featBits >> 7) & 1, (featBits >> 16) & 1,
 		(featBits >> 15) & 1);
+	//指令虚拟化首试形态预告(NMI virt+0xB8按特性组合; launch首试被
+	//拒时阶梯逐级回退, 定格形态以阶梯结果为准, 见SvmLaunchThread)
+	{
+		ULONG nmiVirtOn = ((featBits & SVM_FEAT_VNMI) != 0 &&
+			(featBits & (SVM_FEAT_IBSVIRT | SVM_FEAT_PMCVIRT)) != 0) ? 1 : 0;
+		FlLog("指令虚拟化: VNMI=%u IBSVIRT=%u PMCVIRT=%u → 首试形态=%s%s",
+			(featBits >> 25) & 1, (featBits >> 26) & 1, (featBits >> 8) & 1,
+			nmiVirtOn ? "NMI virt+LBR|IBS|PMC(按特性)" : "LBR-only(投递配套门未满足)",
+			nmiVirtOn ? "; 被拒时launch阶梯回退" : "");
+	}
 	FlLog("STGI门控: SKINIT特性=%u → %s", g_svmStgiPass,
 		g_svmStgiPass ? "直通(裸机等价: 硬件静默执行)"
 		              : "拦截+#UD(无SKINIT特性, 保守忠实)");
@@ -1547,6 +1605,17 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			//非窗口=拦截位泄漏: 同0x70——解除窗口位+重执行,
 			//绝不跳过popfq的弹栈/标志效应。#DB拦截常驻不动
 			vmcb->Control.InterceptMisc1 &= ~(INTERCEPT_PUSHF | INTERCEPT_POPF);
+			return 0;
+		}
+		case SVM_EXIT_NMI:    //0x61: 物理NMI拦截(NMI virt配套, §15.21.10)
+		{
+			//EVENTINJ注入NMI(type=NMI/vector=2): VMRUN即投递并硬件
+			//置V_NMI_MASK(§15.21.10原文)——NMI掩蔽语义(handler内嵌套
+			//NMI阻断/IRET解除)由硬件管理。事件型exit不推RIP(异步事件
+			//无faulting指令, 推进=跳过一条guest指令=状态破坏)。
+			//NMI交付延迟+1世界开关(罕见事件: WHEA/硬件看门狗类)
+			vmcb->Control.EventInj =
+				EVENTINJ_MAKE(2, EVENTINJ_TYPE_NMI, 0, 0);
 			return 0;
 		}
 #if GNPT_SMI_INTERCEPT

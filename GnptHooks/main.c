@@ -448,30 +448,50 @@ static VOID DemoTscDeadlineProbe(VOID)
 	}
 }
 
-//PMU旁信道状态报告探针(Demo构建): 本框架恒LBR-only(0xB8 bit0),
-//PMC virt永不使能(合置检查: 需AVIC/NMI virt配套)→PMC面=平台
-//边界(root驻留指令计数可经PMC观测=已知残余信道)。探针按特性
-//在场性如实报告并跳过——无隔离可自证, 不做测量(计数器未计数
-//≠隔离生效, 测量读数无论何值都无判读意义)。
-//未来若实现AVIC/VNMI配套并使能PMC virt, 恢复测量体:
-//guest组使能PMC0(事件0x76, PERFEVNTSEL_0=0xC0010000 EN=bit22,
-//PERF_CTR_0=0xC0010004)→清零→100次EFER读(每次=1 exit+root
-//处置)→采样→恢复。隔离生效=读数≈循环自身(万级); 泄漏=含
-//root路径(数十万级)
+//PMU旁信道状态报告探针(Demo构建): PMC virt的root指令计数隔离按
+//launch定格形态如实报告——完整形态在位=世界开关硬件交换guest/host
+//PERF组(隔离闭合); 阶梯回退剥离或特性缺席=平台边界(root驻留指令
+//计数可经PMC观测=已知残余信道)。不做计数测量(隔离生效的自证=
+//形态位回读而非读数; 需要定量凭证时恢复测量体: guest组使能PMC0
+//(事件0x76, PERFEVNTSEL_0=0xC0010000 EN=bit22, PERF_CTR_0=
+//0xC0010004)→清零→100次EFER读(每次=1 exit+root处置)→采样→恢复。
+//隔离生效=读数≈循环自身(万级); 泄漏=含root路径(数十万级))
 static VOID DemoPmuProbe(VOID)
 {
-	//本框架恒LBR-only: IBS/PMC virt特性在场也不使能(合置检查:
-	//需AVIC/NMI virt配套, 置位=全核VMEXIT_INVALID)→PMC隔离
-	//永不生效, 探针无可自证面, 如实报平台边界跳过
+	//launch定格形态回读=纯全局(g_svmB8Landed: FillVmcb登记+阶梯
+	//更新)。勿从guest上下文读VMCB同名字段——VMCB页在自我隐蔽
+	//清单内, guest经NPT读=零页(恒0=误报"未在位")
+	ULONG64 b8All = ~0ULL;
+	ULONG vcpuN = g_svmVcpuCount;
+	if (vcpuN == 0)
+	{
+		b8All = 0;
+	}
+	if (vcpuN > 64)
+	{
+		vcpuN = 64;
+	}
+	for (ULONG i = 0; i < vcpuN; i++)
+	{
+		b8All &= (ULONG64)g_svmB8Landed[i & 63];
+	}
 	if ((g_svmFeatBits & SVM_FEAT_PMCVIRT) == 0)
 	{
-		FlLog("[S4] PMU自证: PCMVIRT特性缺席(0xB8仅LBR), PMC面=平台边界"
-			"(无硬件隔离), 探针跳过");
+		FlLog("[S4] PMU自证: PCMVIRT特性缺席(launch定格0xB8=%llX不含b3), PMC面="
+			"平台边界(无硬件隔离), 探针跳过", (unsigned long long)b8All);
 		return;
 	}
-	FlLog("[S4] PMU自证: PCMVIRT特性在场但本框架未使能(合置检查:"
-		"需AVIC/NMI virt配套), PMC面=平台边界(root驻留指令计数可经"
-		"PMC观测=已知残余信道), 探针跳过");
+	if ((b8All & (1ULL << 3)) != 0)
+	{
+		FlLog("[S4] PMU自证: PMC virt全核生效(launch定格0xB8=%llX含b3)"
+			"——root驻留指令计数经世界开关硬件隔离, 旁信道闭合",
+			(unsigned long long)b8All);
+		return;
+	}
+	FlLog("[S4] PMU自证: PCMVIRT特性在场但launch定格0xB8=%llX未含b3"
+		"(本机拒完整形态, 阶梯已自动降级), PMC面=平台边界(root驻留"
+		"指令计数可经PMC观测=已知残余信道), 探针跳过",
+		(unsigned long long)b8All);
 }
 
 //======== 调试子系统忠实性自证探针(判据②验收) ========
