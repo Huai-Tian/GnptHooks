@@ -665,6 +665,10 @@ volatile LONG64 g_svmLastExitTsc[64] = { 0 };
 //阶梯回退在裸机root更新终值——探针(DemoPmuProbe)只读此全局。
 //勿从guest上下文读VMCB同名字段: 自我隐蔽已改译, guest读=零页
 volatile LONG64 g_svmB8Landed[64] = { 0 };
+//异常exit防御自愈登记: default防御路径(GIF=0上下文)剥位自愈时
+//写exit码+1(0=无/探针已清)。自证探针只读此纯全局——自我隐蔽
+//生效后guest读VMCB=零页, 框架状态回读必须走纯全局
+volatile LONG64 g_svmDefHeal[64] = { 0 };
 
 KAFFINITY SvmPinVirtualizedCpus(VOID)
 {
@@ -1158,7 +1162,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					func != GNPT_VMCALL_NPTSET && func != GNPT_VMCALL_NPTRES &&
 					func != GNPT_VMCALL_MSRBIT && func != GNPT_VMCALL_MEMCPY &&
 					func != GNPT_VMCALL_CONCEAL && func != GNPT_VMCALL_DRSET &&
-					func != GNPT_VMCALL_NXREARM))
+					func != GNPT_VMCALL_NXREARM && func != GNPT_VMCALL_DEFTEST))
 			{
 				//签名门拒绝采样(防刷爆环; Release构建零开销)
 				static volatile LONG s_sigCnt[64] = { 0 };
@@ -1302,6 +1306,18 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					BOOLEAN set = ((arg2 & 1) != 0);
 					GnptMsrBitmapRootAllCpus(msr, isWrite, set);
 					FlRingPush('b', cpu, GNPT_VMCALL_MSRBIT, arg1, arg2, 0);
+					SvmAdvanceRip(vmcb);
+					return 0;
+				}
+			case GNPT_VMCALL_DEFTEST:    //防御自证原语(demo探针): 制造拦截
+				{                        //向量异常→default剥位自愈全链验证
+					//置位本核RDTSC拦截位(生产形态此位不在位)+自愈登记清零;
+					//guest随后首条rdtsc应exit(0x6E)→default剥位自愈+登记
+					//→不推RIP重入→直通完成(全链语义见default注释)
+					vmcb->Control.InterceptMisc1 |= INTERCEPT_RDTSC;
+					g_svmDefHeal[cpu & 63] = 0;
+					FlRingPush('x', cpu, GNPT_VMCALL_DEFTEST,
+						vmcb->Control.InterceptMisc1, 0, 0);
 					SvmAdvanceRip(vmcb);
 					return 0;
 				}
@@ -1649,12 +1665,66 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				(ULONG_PTR)vmcb->State.Rip,
 				(ULONG_PTR)vmcb->Control.ExitInfo1);
 			return 0;    //不可达(bugcheck不归)
-		default:    //未知exit: 计数留痕(FlRingExit兜底限流)+推进(观察语义)
-			SvmAdvanceRip(vmcb);
-			return 0;
+		default:
+		//异常exit防御族: 生产拦截位下全部可达码已有case——到达=
+		//拦截向量异常在位/EXITCODE高位异变/未定义码。旧形态推RIP
+		//对事件类=跳过一条guest指令、对指令类=吞掉指令裸机语义
+		//(写内存/填寄存器消失), 双破坏方向; 防御=一律不推RIP重入
+		//(事件类本无faulting指令; 指令类=原指令重执行)。
+		//0x00-0xBF已定义码区: exit码=拦截向量位号(App C)——反算
+		//剥除该拦截位=直通自愈: 重入后硬件按裸机语义执行(INTR类
+		//的pending中断重投递=不丢中断; VMCB控制区exit不回写
+		//(§15.6)+clean bits恒0=剥位下次vmrun即生效; 正常形态这些
+		//位不在位, 剥除幂等无害)。高位异变(负值族已被前置拦截,
+		//此处=bit63:32非零正值, 含F000_0000h host保留区)与0xC0-0x407
+		//无case码=语义不可知, 纯留痕重入。'x'环采样(每核首条+每
+		//4096条; Release零开销); 剥位登记g_svmDefHeal(自证探针读)
+		{
+			static volatile LONG s_defCnt[64] = { 0 };
+			GNPT_CRUMB(s_defCnt, 0xFFF, cpu,
+				FlRingPush('x', cpu, (ULONG)exitCode, vmcb->State.Rip,
+					vmcb->Control.ExitInfo1, 0));
+			if (exitCode <= 0xBF)
+			{
+				ULONG code = (ULONG)exitCode;
+				g_svmDefHeal[cpu & 63] = (LONG64)code + 1;
+				if (code < 0x10)
+				{
+					vmcb->Control.InterceptCrRead &= (USHORT)~(1UL << code);
+				}
+				else if (code < 0x20)
+				{
+					vmcb->Control.InterceptCrWrite &= (USHORT)~(1UL << (code - 0x10));
+				}
+				else if (code < 0x30)
+				{
+					vmcb->Control.InterceptDrRead &= (USHORT)~(1UL << (code - 0x20));
+				}
+				else if (code < 0x40)
+				{
+					vmcb->Control.InterceptDrWrite &= (USHORT)~(1UL << (code - 0x30));
+				}
+				else if (code < 0x60)
+				{
+					vmcb->Control.InterceptException &= ~(1UL << (code - 0x40));
+				}
+				else if (code < 0x80)
+				{
+					vmcb->Control.InterceptMisc1 &= ~(1UL << (code - 0x60));
+				}
+				else if (code < 0xA0)
+				{
+					vmcb->Control.InterceptMisc2 &= ~(1UL << (code - 0x80));
+				}
+				else
+				{
+					vmcb->Control.InterceptMisc3 &= ~(1UL << (code - 0xA0));
+				}
+			}
+		}
+		return 0;    //不推RIP: 异常码语义不可知/已定义码剥位后重执行
 	}
-	//内层白名单收窄后不可达; 兜底=推进(保守)
-	SvmAdvanceRip(vmcb);
+	//内层白名单收窄后不可达; 兜底=不推RIP重入(与default防御同向)
 	return 0;
 }
 

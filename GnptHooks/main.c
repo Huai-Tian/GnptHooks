@@ -494,6 +494,38 @@ static VOID DemoPmuProbe(VOID)
 		(unsigned long long)b8All);
 }
 
+//异常exit防御自证探针: 主动制造拦截向量异常→default防御路径全链
+//验证(剥位自愈=生产拦截位下永不可达路径, 无本探针=纸面代码)。
+//流程: ①root原语(DEFTEST)置位本核RDTSC拦截位(生产形态此位
+//不在位)+自愈登记清零 ②guest __rdtsc()=exit 0x6E→default剥位
+//自愈+登记+'x'环→不推RIP重入→直通完成(t1=真值) ③再__rdtsc()
+//=自愈后直通零exit(t2)。判据: 登记g_svmDefHeal==0x6F(0x6E+1,
+//探针线程与处置同核——须在SvmPinVirtualizedCpus钉核域内调用)
+//+t0/t1/t2单调(rdtsc直通含TscOffset硬件补偿, 与正常态同轴)
+static VOID DemoDefenseProbe(VOID)
+{
+	ULONG64 t0 = __rdtsc();
+	(VOID)CmVmmCall(GNPT_VMCALL_DEFTEST, 0, 0, 0);
+	ULONG64 t1 = __rdtsc();    //触发exit(0x6E)→剥位自愈→重入直通
+	ULONG64 t2 = __rdtsc();    //自愈后直通(零exit)
+	ULONG cpu = KeGetCurrentProcessorNumber();
+	LONG64 heal = g_svmDefHeal[cpu & 63];
+	if (heal == (LONG64)SVM_EXIT_RDTSC + 1 && t1 >= t0 && t2 >= t1)
+	{
+		FlLog("[S5] 防御自证: 拦截位异常exit(0x6E)→剥位自愈+直通恢复"
+			"(登记=%llX, rdtsc单调%llX→%llX→%llX)——default防御族在位",
+			(unsigned long long)heal, (unsigned long long)t0,
+			(unsigned long long)t1, (unsigned long long)t2);
+		return;
+	}
+	FlLog("[S5] 防御自证: **失败**(登记=%llX 期望%llX, rdtsc %llX→%llX→%llX)"
+		"——查'x'环(0=exit未触发=原语失效; 0x6F=登记在但单调破=时间轴)",
+		(unsigned long long)heal,
+		(unsigned long long)(SVM_EXIT_RDTSC + 1),
+		(unsigned long long)t0, (unsigned long long)t1,
+		(unsigned long long)t2);
+}
+
 //======== 调试子系统忠实性自证探针(判据②验收) ========
 //以检测方视角(设TF/设DR断点/回读DR/发int1)验证"调试面=裸机
 //等价"——检测方的标准手法: 设TF观察#DB是否到达/设DR断点观察
@@ -952,6 +984,7 @@ static VOID DemoStart(VOID)
 		DemoStoryProbe();
 		DemoTscDeadlineProbe();
 		DemoPmuProbe();
+		DemoDefenseProbe();      //异常exit防御族自证(钉核0, 须在钉核域内)
 		DemoDebugFaithProbe();    //调试面忠实性(TF/自断点/回读/INT1)——须先于MultiHook(其阶段B将hook冷靶=②的零干扰前提)
 		KeSetSystemAffinityThread(allAff);
 	}

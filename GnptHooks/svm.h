@@ -195,6 +195,7 @@ extern GNPT_VCPU_SVM g_svmVcpu[64];
 extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; =实际接管数, 诊断旋钮见GNPT_TAKE_CORES)
 extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(Debug构建HB心跳检停泊)
 extern volatile LONG64 g_svmB8Landed[64];      //各核launch定格的0xB8形态(FillVmcb裸机登记, 阶梯回退更新; 探针读此纯全局勿读VMCB——自我隐蔽下guest读VMCB=零页)
+extern volatile LONG64 g_svmDefHeal[64];       //异常exit防御自愈登记: 各核最后剥位自愈的exit码+1(0=无; exit处置(GIF=0)写, 自证探针只读——同上勿读VMCB)
 
 //root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——仅虚拟化
 //核合法: 裸机核EFER.SVME=0→vmmcall=#UD→蓝屏(调用线程调度核不可控,
@@ -266,6 +267,10 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 //(CR4.CET=1)上清CR0.WP=Mov CR0架构性#GP(APM Vol1 CR0.WP位
 //规则)——cave槽写入改走hook.c的MDL别名路径(HookCaveAliasCopy,
 //纯PASSIVE API, 零CR0接触), 不再需要root代写原语
+#define GNPT_VMCALL_DEFTEST 16 //防御自证原语(demo探针专用): 置位
+                               // 本核RDTSC拦截位=制造拦截向量异常
+                               // +自愈登记清零→guest首条rdtsc exit
+                               // 走default剥位自愈(处置见svm.c)
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)
