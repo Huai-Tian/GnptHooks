@@ -90,10 +90,20 @@ static PVOID SvmAllocContig(SIZE_T bytes, PULONG64 paOut)
 	return va;
 }
 
-static VOID SvmFreeContig(PVOID va)
+//每核资源尺寸契约(分配与零化释放共用; 改动须两侧同源)
+#define SVM_VMCB_BYTES    PAGE_SIZE
+#define SVM_HSAVE_BYTES   PAGE_SIZE
+#define SVM_IOPM_BYTES    0x3000
+#define SVM_MSRPM_BYTES   0x2000
+#define SVM_VSTACK_BYTES  0x4000
+
+//释放前零化: VMCB/HSAVE/MSRPM/exit栈内容=接管痕迹取证面,
+//PFN归池新拥有者不可见(hook侧CodePage/跳板零化同契约)
+static VOID SvmFreeContig(PVOID va, SIZE_T bytes)
 {
 	if (va != NULL)
 	{
+		RtlZeroMemory(va, bytes);
 		MmFreeContiguousMemory(va);
 	}
 }
@@ -635,11 +645,11 @@ static VOID SvmStopAndFree(ULONG n, const char* why)
 			ObDereferenceObject(v->ThreadObj);
 			v->ThreadObj = NULL;
 		}
-		SvmFreeContig(v->VmcbVa);
-		SvmFreeContig(v->HsaveVa);
-		SvmFreeContig(v->IopmVa);
-		SvmFreeContig(v->MsrpmVa);
-		SvmFreeContig(v->VmmStack);
+		SvmFreeContig(v->VmcbVa, SVM_VMCB_BYTES);
+		SvmFreeContig(v->HsaveVa, SVM_HSAVE_BYTES);
+		SvmFreeContig(v->IopmVa, SVM_IOPM_BYTES);
+		SvmFreeContig(v->MsrpmVa, SVM_MSRPM_BYTES);
+		SvmFreeContig(v->VmmStack, SVM_VSTACK_BYTES);
 		RtlZeroMemory(v, sizeof(GNPT_VCPU_SVM));    //资源清零: 观测残留不跨加载
 	}
 	g_svmVcpuCount = 0;    //引擎已关: root原语钉核失效
@@ -855,14 +865,14 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	{
 		PGNPT_VCPU_SVM v = &g_svmVcpu[i];
 		v->CpuIndex = (CHAR)i;
-		v->VmcbVa = SvmAllocContig(PAGE_SIZE, &v->VmcbPa);
-		v->HsaveVa = SvmAllocContig(PAGE_SIZE, &v->HsavePa);
-		v->IopmVa = SvmAllocContig(0x3000, &v->IopmPa);
-		v->MsrpmVa = SvmAllocContig(0x2000, &v->MsrpmPa);
-		v->VmmStack = SvmAllocContig(0x4000, NULL);
+		v->VmcbVa = SvmAllocContig(SVM_VMCB_BYTES, &v->VmcbPa);
+		v->HsaveVa = SvmAllocContig(SVM_HSAVE_BYTES, &v->HsavePa);
+		v->IopmVa = SvmAllocContig(SVM_IOPM_BYTES, &v->IopmPa);
+		v->MsrpmVa = SvmAllocContig(SVM_MSRPM_BYTES, &v->MsrpmPa);
+		v->VmmStack = SvmAllocContig(SVM_VSTACK_BYTES, NULL);
 		if (v->VmmStack != NULL)
 		{
-			v->VmmStackTop = (PVOID)((PUCHAR)v->VmmStack + 0x4000);
+			v->VmmStackTop = (PVOID)((PUCHAR)v->VmmStack + SVM_VSTACK_BYTES);
 		}
 		if (v->VmcbVa == NULL || v->HsaveVa == NULL || v->IopmVa == NULL ||
 			v->MsrpmVa == NULL || v->VmmStack == NULL)
@@ -870,11 +880,11 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 			FlLog("[Entry] 核%u资源分配失败, 回滚", i);
 			for (ULONG j = 0; j <= i; j++)    //含本核半分配
 			{
-				SvmFreeContig(g_svmVcpu[j].VmcbVa);
-				SvmFreeContig(g_svmVcpu[j].HsaveVa);
-				SvmFreeContig(g_svmVcpu[j].IopmVa);
-				SvmFreeContig(g_svmVcpu[j].MsrpmVa);
-				SvmFreeContig(g_svmVcpu[j].VmmStack);
+				SvmFreeContig(g_svmVcpu[j].VmcbVa, SVM_VMCB_BYTES);
+				SvmFreeContig(g_svmVcpu[j].HsaveVa, SVM_HSAVE_BYTES);
+				SvmFreeContig(g_svmVcpu[j].IopmVa, SVM_IOPM_BYTES);
+				SvmFreeContig(g_svmVcpu[j].MsrpmVa, SVM_MSRPM_BYTES);
+				SvmFreeContig(g_svmVcpu[j].VmmStack, SVM_VSTACK_BYTES);
 				RtlZeroMemory(&g_svmVcpu[j], sizeof(GNPT_VCPU_SVM));
 			}
 			return STATUS_INSUFFICIENT_RESOURCES;
@@ -911,11 +921,11 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		for (ULONG j = created; j < cpuCount; j++)    //未建线程核: 纯资源回滚
 		{
 			PGNPT_VCPU_SVM v = &g_svmVcpu[j];
-			SvmFreeContig(v->VmcbVa);
-			SvmFreeContig(v->HsaveVa);
-			SvmFreeContig(v->IopmVa);
-			SvmFreeContig(v->MsrpmVa);
-			SvmFreeContig(v->VmmStack);
+			SvmFreeContig(v->VmcbVa, SVM_VMCB_BYTES);
+			SvmFreeContig(v->HsaveVa, SVM_HSAVE_BYTES);
+			SvmFreeContig(v->IopmVa, SVM_IOPM_BYTES);
+			SvmFreeContig(v->MsrpmVa, SVM_MSRPM_BYTES);
+			SvmFreeContig(v->VmmStack, SVM_VSTACK_BYTES);
 			RtlZeroMemory(v, sizeof(GNPT_VCPU_SVM));
 		}
 		return STATUS_UNSUCCESSFUL;

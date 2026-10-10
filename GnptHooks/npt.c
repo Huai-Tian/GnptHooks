@@ -326,11 +326,14 @@ VOID SvmNptRestoreIdentity(ULONG View, ULONG64 Gpa)
 //释放全部页表页(两棵)+arena块; 构建失败路径与卸载共用(幂等)
 VOID SvmFreeNpt(VOID)
 {
-	//arena块整体释放(页表页全在块内, 无独立释放)
+	//arena块整体释放(页表页全在块内, 无独立释放)。
+	//取证零化: 页表内容(P视图NX/HOOKS映射)=接管痕迹, 不残留
+	//给PFN新拥有者(全核已裸机, 无walker, 零化安全)
 	for (ULONG i = 0; i < NPT_ARENA_BLOCKS; i++)
 	{
 		if (g_nptArena[i] != NULL)
 		{
+			RtlZeroMemory(g_nptArena[i], NPT_ARENA_SLOTS * PAGE_SIZE);
 			MmFreeContiguousMemory(g_nptArena[i]);
 			g_nptArena[i] = NULL;
 		}

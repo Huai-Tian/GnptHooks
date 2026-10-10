@@ -1507,15 +1507,15 @@ static VOID HookStage(ULONG Stage)
 	g_gnptHookStage = (LONG)Stage;
 	FlRingPush('J', (Stage & 0xFF), Stage, 0, 0, 0);
 }
-//阶段表: 10入口 11CodePage就绪 12钉核 13发布(live++) 14布防
-//15隐蔽 16同步 17自证 30移除入口 31布防还原 32同步
+//阶段表: 10入口 11CodePage就绪 12钉核 13发布(live++) 14隐蔽
+//15布防 16排水同步 17自证 30移除入口 31布防还原 32同步
 //33拷贝 34解除 35同步2 36完成 99回滚
 #define HKST_INS_ENTRY    10
 #define HKST_INS_CPALLOC  11
 #define HKST_INS_PIN      12
 #define HKST_INS_LIVE     13
-#define HKST_INS_ARMED    14
-#define HKST_INS_CONCEAL  15
+#define HKST_INS_CONCEAL  14
+#define HKST_INS_ARMED    15
 #define HKST_INS_SYNC1    16
 #define HKST_INS_SELFCHK  17
 #define HKST_RM_ENTRY     30
@@ -2120,9 +2120,10 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 		e->Used = 0;
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
-	//CodePage: 目标页整页副本+目标偏移14B绝对跳转→槽。
-	//Mm连续分配钳NPT覆盖界内——身份PTE改译(工件隐蔽)的前提;
-	//常规池在大物理机可落覆盖界外=改译必然失败, 不如分配时即钳
+	//CodePage: 目标页整页副本(此刻零工件——14B补丁待隐蔽就位后
+	//写入, 补丁字节对guest永不映射可见)。Mm连续分配钳NPT覆盖界内
+	//——身份PTE改译(工件隐蔽)的前提; 常规池在大物理机可落覆盖
+	//界外=改译必然失败, 不如分配时即钳
 	PHYSICAL_ADDRESS cpLow, cpCeil, cpBound;
 	cpLow.QuadPart = 0;
 	cpCeil.QuadPart = (LONGLONG)SvmNptCoverageBytes();
@@ -2141,12 +2142,13 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	RtlCopyMemory(e->CodePageVa, (PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1)), PAGE_SIZE);
 	e->CodePagePa = MmGetPhysicalAddress(e->CodePageVa).QuadPart;
-	{
-		PUCHAR patch = e->CodePageVa + off;
-		patch[0] = 0xFF; patch[1] = 0x25;                  //jmp [rip+0]
-		*(ULONG32*)(patch + 2) = 0;
-		*(ULONG64*)(patch + 6) = (ULONG64)e->Slot;
-	}
+	//14B补丁镜像(栈上构建, μs级驻留): FF25 00000000 + 槽绝对地址。
+	//写入路径在隐蔽段分流: 隐蔽面在=root拷贝原语代写(改译零页后
+	//guest态写=fault); 无隐蔽面=直写(构建失败继续形态)
+	UCHAR stub[14];
+	stub[0] = 0xFF; stub[1] = 0x25;                  //jmp [rip+0]
+	*(ULONG32*)(stub + 2) = 0;
+	*(ULONG64*)(stub + 6) = (ULONG64)e->Slot;
 	e->TargetPa = MmGetPhysicalAddress(
 		(PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1))).QuadPart;
 	//目标物理覆盖预检: 超NPT覆盖(PML4[0]界)=布防PTE无处落, 静默
@@ -2154,6 +2156,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	if (e->TargetPa >= SvmNptCoverageBytes())
 	{
 		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+		RtlZeroMemory(e->CodePageVa, PAGE_SIZE);    //取证零化(页副本不残留)
 		MmFreeContiguousMemory(e->CodePageVa);
 		e->Used = 0;
 		FlLog("[Hook] Install拒绝: 目标%p物理%llX超NPT覆盖%llX",
@@ -2170,6 +2173,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 			o->TargetPa == e->TargetPa)
 		{
 			ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+			RtlZeroMemory(e->CodePageVa, PAGE_SIZE);    //取证零化
 			MmFreeContiguousMemory(e->CodePageVa);
 			e->Used = 0;
 			FlLog("[Hook] Install拒绝: 目标%p与fence hook%p同页"
@@ -2184,6 +2188,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	KAFFINITY oldAff = SvmPinVirtualizedCpus();
 	if (oldAff == 0)
 	{
+		RtlZeroMemory(e->CodePageVa, PAGE_SIZE);    //取证零化
 		MmFreeContiguousMemory(e->CodePageVa);
 		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
 		e->Used = 0;
@@ -2198,71 +2203,96 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	//失败回滚路径以Removed CAS对称递减
 	InterlockedIncrement(&g_hookLive);
 	HookStagePaced(HKST_INS_LIVE);
-	//多视图PTE布防(静态一次写死, 运行时零PTE写; root原语=隐蔽生效):
-	//  P: 原页可读可写不可执行(取指NPF→进detour视图)
-	//  HOOKS树=CodePage只读可执行(写NPF→回P转发)
-	HookNptSetPteRoot(GNPT_VIEW_SECONDARY, e->TargetPa, e->CodePagePa,
-		NPT_PTE_FLAGS_HOOKS);
-	HookNptSetPteRoot(GNPT_VIEW_PRIMARY, e->TargetPa, e->TargetPa,
-		NPT_PTE_FLAGS_HOOKP);
-	//布防即刻全核同步: PTE组写完→IPI全核TLB冲净。把同步推迟(步进轮
-	//窗口)会让系统处于混合翻译态(陈旧TLB核跑原代码/新鲜walk核跑补丁
-	//翻译/P-HOOKS不对称/拆分PDE刚换)——崩溃形态: SECONDARY常留核
-	//在窗口内对新arm页的首次取指-数据读序列收到not-present fault
-	//(软件侧任何可达状态均不可推导)。窗口压缩到IPI广播延迟(~百μs)
-	//后, 混合态不再可观察
-	HookSyncAllCpus();
-	HookStagePaced(HKST_INS_ARMED);
-	//CodePage工件隐蔽(root原语, 挂靠自我隐蔽登记表): 身份PTE两视图
-	//改译零页+登记游标排水(布防拆分新增的页表页一并隐蔽)。自我隐蔽
-	//未启用(构建失败继续形态)时跳过——无零页即无工件隐蔽,
-	//仅布防同步。失败或自证FAIL=统一回滚: 布防还原+解除登记(幂等)
-	//+释放, 无半隐蔽态
-	if (SvmNptHideZeroPa() != 0)
+	//工件隐蔽先行(root原语, 挂靠自我隐蔽登记表): 身份PTE两视图
+	//改译零页+登记游标排水。先蔽后写=14B补丁自写入时刻起对guest
+	//不可读——旧序"先写后蔽"存在补丁直写→conceal间物理扫描可
+	//捕获跳转码的暴露窗。自我隐蔽未启用(构建失败继续形态)时跳过
+	//——无零页即无工件隐蔽, 补丁直写(同旧序)。任一步FAIL=统一
+	//回滚: 布防还原+解除登记(幂等)+零化释放, 无半隐蔽态
+	BOOLEAN hidden = (SvmNptHideZeroPa() != 0);
+	BOOLEAN ok = TRUE;
+	if (hidden)
 	{
-		BOOLEAN ok = (CmVmmCall(GNPT_VMCALL_CONCEAL, e->CodePagePa, 0, 0)
-			!= 0);
-		//隐蔽改译即刻全核生效(同上): 零页改译也是PTE组写,
-		//写完即同步, 不留步进级窗口(原延迟到stage16同步, 300ms暴露)
+		ok = (CmVmmCall(GNPT_VMCALL_CONCEAL, e->CodePagePa, 0, 0) != 0);
+		//隐蔽改译即刻全核生效: 零页改译也是PTE组写, 写完即同步,
+		//不留步进级窗口
 		HookSyncAllCpus();
 		HookStagePaced(HKST_INS_CONCEAL);
 		if (ok)
 		{
-			//全核TLB同步=布防+隐蔽一次覆盖, 而后guest态读自证
-			HookSyncAllCpus();
-			HookStagePaced(HKST_INS_SYNC1);
-			ok = (*(volatile ULONG64*)(e->CodePageVa + off) == 0);
-			HookStagePaced(HKST_INS_SELFCHK);
-			if (ok)
-			{
-				FlLog("[Hook] CodePage隐蔽自证: 读=0(零页翻译, 工件物理不可见)");
-			}
-		}
-		if (!ok)
-		{
-			HookStage(HKST_FAIL);
-			HookNptRestoreRoot(GNPT_VIEW_PRIMARY, e->TargetPa);
-			HookNptRestoreRoot(GNPT_VIEW_SECONDARY, e->TargetPa);
-			//对称回滚发布(发布先行): CAS防双重递减
-			if (InterlockedCompareExchange(&e->Removed, 1, 0) == 0)
-			{
-				InterlockedDecrement(&g_hookLive);
-			}
-			//解除登记(未登记时NPTRES/表移除均幂等无害)+清翻译
-			HookNptRestoreRoot(0xF, e->CodePagePa);
-			SvmNptConcealRemove(e->CodePagePa);
-			HookSyncAllCpus();
-			MmFreeContiguousMemory(e->CodePageVa);
-			ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
-			e->Used = 0;
-			FlLog("[Hook] Install失败: CodePage隐蔽登记/自证FAIL('c'环留痕)");
-			KeSetSystemAffinityThread(oldAff);
-			return STATUS_INSUFFICIENT_RESOURCES;
+			//14B补丁写入=root拷贝原语代写: 隐蔽页guest态写=fault,
+			//root物理直访不经NPT(Remove还原同款路径); 源=栈镜像
+			//(μs级驻留, 无专用页扫描面)
+			ok = (CmVmmCall(GNPT_VMCALL_MEMCPY,
+				(ULONG64)(e->CodePageVa + off), (ULONG64)(ULONG_PTR)stub,
+				sizeof(stub)) != 0);
 		}
 	}
 	else
 	{
-		HookSyncAllCpus();    //布防即刻生效(无隐蔽面形态)
+		//无隐蔽面形态: 直写补丁
+		RtlCopyMemory(e->CodePageVa + off, stub, sizeof(stub));
+	}
+	if (ok)
+	{
+		//多视图PTE布防(静态一次写死, 运行时零PTE写; root原语=
+		//隐蔽生效; 补丁已root写入=布防同步后首fetch即完整
+		//CodePage):
+		//  P: 原页可读可写不可执行(取指NPF→进detour视图)
+		//  HOOKS树=CodePage只读可执行(写NPF→回P转发)
+		HookNptSetPteRoot(GNPT_VIEW_SECONDARY, e->TargetPa, e->CodePagePa,
+			NPT_PTE_FLAGS_HOOKS);
+		HookNptSetPteRoot(GNPT_VIEW_PRIMARY, e->TargetPa, e->TargetPa,
+			NPT_PTE_FLAGS_HOOKP);
+		//布防即刻全核同步: PTE组写完→IPI全核TLB冲净。把同步推迟(步进轮
+		//窗口)会让系统处于混合翻译态(陈旧TLB核跑原代码/新鲜walk核跑补丁
+		//翻译/P-HOOKS不对称/拆分PDE刚换)——崩溃形态: SECONDARY常留核
+		//在窗口内对新arm页的首次取指-数据读序列收到not-present fault
+		//(软件侧任何可达状态均不可推导)。窗口压缩到IPI广播延迟(~百μs)
+		//后, 混合态不再可观察
+		HookSyncAllCpus();
+		HookStagePaced(HKST_INS_ARMED);
+		if (hidden)
+		{
+			//布防拆分新增页表页排水(幂等调用: 已登记→跳过改译,
+			//仅排水登记+改译新增页表页)+全核生效
+			ok = (CmVmmCall(GNPT_VMCALL_CONCEAL, e->CodePagePa, 0, 0) != 0);
+			HookSyncAllCpus();
+			HookStagePaced(HKST_INS_SYNC1);
+			if (ok)
+			{
+				//布防+隐蔽一次同步覆盖, 而后guest态读自证
+				ok = (*(volatile ULONG64*)(e->CodePageVa + off) == 0);
+				HookStagePaced(HKST_INS_SELFCHK);
+				if (ok)
+				{
+					FlLog("[Hook] CodePage隐蔽自证: 读=0(零页翻译, 工件物理不可见)");
+				}
+			}
+		}
+	}
+	if (!ok)
+	{
+		HookStage(HKST_FAIL);
+		HookNptRestoreRoot(GNPT_VIEW_PRIMARY, e->TargetPa);
+		HookNptRestoreRoot(GNPT_VIEW_SECONDARY, e->TargetPa);
+		//对称回滚发布(发布先行): CAS防双重递减
+		if (InterlockedCompareExchange(&e->Removed, 1, 0) == 0)
+		{
+			InterlockedDecrement(&g_hookLive);
+		}
+		//解除登记(未登记时NPTRES/表移除均幂等无害)+清翻译
+		HookNptRestoreRoot(0xF, e->CodePagePa);
+		SvmNptConcealRemove(e->CodePagePa);
+		HookSyncAllCpus();
+		//取证零化: 补丁/页副本不残留给PFN新拥有者(卸载侧同契约)
+		RtlZeroMemory(e->CodePageVa, PAGE_SIZE);
+		MmFreeContiguousMemory(e->CodePageVa);
+		ExFreePoolWithTag(e->ReplayVA, HOOK_POOL_TAG);
+		e->Used = 0;
+		FlLog("[Hook] Install失败: 隐蔽/补丁写入/自证FAIL('c'/'M'环留痕)");
+		KeSetSystemAffinityThread(oldAff);
+		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	FlLog("[Hook] Install OK: 目标=%p 回调=%p 跳板槽=%p 重定位跳板=%p(%uB) CodePage=%p(PA=%llX) 栈参=%u",
 		Hook->Target, Hook->Callback, e->Slot, e->ReplayVA, e->ReplayLen,
