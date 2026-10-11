@@ -122,6 +122,7 @@ static VOID SvmAdvanceRip(PVMCB vmcb)
 //契约: RIP/RSP由CmSvmEnter填(探针入口/探针栈); FS/GS/TR/LDTR隐藏态+KernelGsBase
 //+STAR/LSTAR/CSTAR/SFMASK+SYSENTER三件由__svm_vmsave从当前硬件真值预同步
 //(§15.5.2指令集, 不碰RIP/RSP/RAX/CR)
+static BOOLEAN SvmRootMapRange(ULONG64 Va, ULONG64 Len);   //定义在本文件root CR3树节
 static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 {
 	PVMCB vmcb = (PVMCB)Vcpu->VmcbVa;
@@ -171,6 +172,22 @@ static VOID SvmFillVmcb(PGNPT_VCPU_SVM Vcpu)
 	vmcb->State.Gdtr.Base = CmGetGdtBase();
 	vmcb->State.Idtr.Limit = CmGetIdtLimit();
 	vmcb->State.Idtr.Base = CmGetIdtBase();
+	//本核OS IDTR伪描述符捕获(M17-E): asm CmSvmStop的root IDT
+	//还原源(lidt内存形态u16 limit@0+u64 base@2)——Windows每核
+	//独立IDT, 故随本函数钉核逐核捕; 与VMCB.Idtr同源同时刻
+	*(USHORT*)&Vcpu->RootOsIdtr[0] = (USHORT)CmGetIdtLimit();
+	*(ULONG64*)&Vcpu->RootOsIdtr[2] = CmGetIdtBase();
+	//本核OS轴CR3快照(私有root CR3切出还原源, asm CmSvmStop
+	//偏移+0x98硬契约; 逐核捕与Idtr同窗)+本核KPCR页入root树
+	//(GS基址=本核KPCR逐核VA不同, root窗口GS读的翻译面;
+	//0x8000=KPCR+KPRCB整块上界余量。挂接原子写=与在飞root
+	//窗口并发安全; 失败留痕, 该核exit循环GS读缺翻译=取证
+	//蓝屏一次定位)
+	Vcpu->RootOsCr3 = __readcr3();
+	if (!SvmRootMapRange(__readgsqword(0), 0x8000))
+	{
+		FlLog("SVM: 核%d KPCR页入root树失败(树页耗尽?)", (int)Vcpu->CpuIndex);
+	}
 	//---- FS/GS/TR/LDTR+系统MSR集: 硬件真值预同步 ----
 	__svm_vmsave((void*)(ULONG_PTR)Vcpu->VmcbPa);    //参数=VMCB物理地址(按指针值传递, MSVC契约)
 	//---- 拦截配置 ----
@@ -703,6 +720,478 @@ volatile LONG64 g_svmDefHeal[64] = { 0 };
 volatile ULONG g_svmPmTimerPort = 0;
 static volatile ULONG g_svmPmTimerMask = 0xFFFFFFFF;
 volatile ULONG64 g_svmTscHz = 0;
+//私有root IDT(M17-E): 32门表+lidt伪描述符+取证块。一次lidt于
+//CmSvmEnter(clgi后)→§15.4"VMRUN saves host state: IDTR, GDTR"
+//入HSAVE→每个#VMEXIT硬件恢复=root IDT恒在(零per-exit成本);
+//guest侧IDTR由VMCB独立装载, 两轴互扰为零。STOP桥lidt还原
+//本核OS IDTR(Windows每核独立IDT, FillVmcb钉核预捕)
+UCHAR g_svmRootIdtr[16];
+static __declspec(align(16)) UCHAR g_svmRootIdt[32 * 16];
+volatile ULONG64 g_svmRootXcptF[8] = { 0 };
+
+//私有root CR3树(M17-F同类面): root窗口独立翻译域。构建=把root触集
+//的OS轴当前翻译深拷贝进私有页表页(指针项私有页全链, 大叶项原值);
+//guest侧对该树物理页的隐蔽属NPT零页改译集(同页表页既有形态)
+volatile ULONG64 g_svmRootCr3Pa = 0;          //树PML4物理页(asm引用)
+static PVOID g_svmRootPml4Va = NULL;          //树根(构建期/扩展期访问)
+volatile ULONG64 g_svmOsCr3Global = 0;        //OS轴CR3全局快照(KVA域
+                                               //全核一致, 取证停泊切回+
+                                               //切轴读SvmRootCodeRead共用
+                                               //——root窗口禁调任何ntoskrnl
+                                               //导出函数, 取指缺映射=递归
+                                               //#PF三重故障核死透)
+//树页登记(PML4+全部下层页; PA→VA反查=区间重复注册幂等)
+#define GNPT_ROOTPT_MAX  320
+static PVOID     g_svmRootPtVa[GNPT_ROOTPT_MAX];
+static ULONG64   g_svmRootPtPa[GNPT_ROOTPT_MAX];
+static ULONG     g_svmRootPtCount = 0;
+static ULONG     s_rootPtConcealed = 0;  //树页隐蔽游标(构建期ConcealAll
+                                         //后=树页总数; 运行期新页由
+                                         //ROOTMAP原语处置体排水)
+static ULONG     g_svmRootMissCnt = 0;        //注册区间内not-present洞页数
+static PULONG64  g_svmOsPml4Kva = NULL;       //OS PML4物理映射区别名(拷贝读源, 系统半区项全进程一致)
+static ULONG     g_svmSelfMapIdx = 0;         //OS PML4自引用项号
+
+//物理页框掩码(bits51:12, MAXPHYADDR=52全宽): 页框比较须剥低12
+//位(PCID/flags)与bit63(NX)及保留高位——PTE self-map项带NX
+//(PTE区不可执行), ~0xFFF掩码保留bit63=比较恒假, self-map
+//发现必失败(上机首战实证)
+#define GNPT_ROOT_PA_MASK  0x000FFFFFFFFFF000ULL
+
+//OS self-map发现(构建期一次): 临时映射OS PML4物理页扫自引用项
+//(PML4E[i]页框==CR3页框)——全版本稳定, 不硬编码版本常量。
+//递归基址=0xFFFF000000000000|idx<<39(自引用项在系统半区)
+static BOOLEAN SvmRootFindSelfMap(VOID)
+{
+	ULONG64 cr3 = __readcr3();
+	PHYSICAL_ADDRESS pa;
+	pa.QuadPart = cr3 & GNPT_ROOT_PA_MASK;
+	//RAM物理→KVA标准API=x64全RAM在系统物理映射区恒有KVA别名,
+	//页表页=active PFN恒有别名, 零分配零映射开销(无unmap)。勿用
+	//MmMapIoSpace: 该平台对本机普通RAM页拒绝映射(返回NULL,
+	//MmCached/MmNonCached两形态同拒, 仅固件/ACPI/MMIO页可映)
+	PULONG64 pml4 = (PULONG64)MmGetVirtualForPhysical(pa);
+	if (pml4 == NULL)
+	{
+		FlLog("root CR3树: PML4物理映射区别名缺席(cr3=%llX pa=%llX)",
+			(unsigned long long)cr3, (unsigned long long)pa.QuadPart);
+		return FALSE;
+	}
+	ULONG idx = 0x200;
+	for (ULONG i = 0; i < 512; i++)
+	{
+		if ((pml4[i] & GNPT_ROOT_PA_MASK) == pa.QuadPart && (pml4[i] & 1))
+		{
+			idx = i;
+			break;
+		}
+	}
+	if (idx == 0x200)
+	{
+		FlLog("root CR3树: PML4自引用项未发现(cr3=%llX)",
+			(unsigned long long)cr3);
+		return FALSE;    //理论不可达(Windows恒有self-map)
+	}
+	g_svmSelfMapIdx = idx;
+	g_svmOsPml4Kva = pml4;    //拷贝读源缓存(别名的物理映射区=系统半区, 全进程一致)
+	return TRUE;
+}
+
+//树页分配(私有页表页; 登记PA供反查与释放)
+static PULONG64 SvmRootAllocPtPage(VOID)
+{
+	if (g_svmRootPtCount >= GNPT_ROOTPT_MAX)
+	{
+		return NULL;
+	}
+	PVOID va = SvmAllocContig(PAGE_SIZE, NULL);
+	if (va == NULL)
+	{
+		return NULL;
+	}
+	g_svmRootPtVa[g_svmRootPtCount] = va;
+	g_svmRootPtPa[g_svmRootPtCount] = MmGetPhysicalAddress(va).QuadPart;
+	g_svmRootPtCount++;
+	return (PULONG64)va;
+}
+
+//PA→VA反查(树内指针项幂等复用: 重复/重叠注册时child页不重建)
+static PULONG64 SvmRootFindPt(ULONG64 Pa)
+{
+	for (ULONG i = 0; i < g_svmRootPtCount; i++)
+	{
+		if (g_svmRootPtPa[i] == Pa)
+		{
+			return (PULONG64)g_svmRootPtVa[i];
+		}
+	}
+	return NULL;
+}
+
+//层级拷贝(区间交集递归, 读源=OS页表页的物理映射区别名): 拷入
+//root树同层页。Level: 3=PML4 2=PDPT 1=PD 0=PT; 项跨度=1<<(12+9*
+//Level)。交集按48位索引空间比较(VA规范化剥符号扩展位63:48——
+//系统半区VA带符号扩展, 无符号lo=i*span可达上限2^48永达不到原值,
+//不剥=系统半区恒不相交=空树)。
+//叶/大叶项原值拷(属性+NX全保); 指针项child已存在则复用(幂等),
+//否则新页递归(child读源KVA=物理映射区别名——self-map递归算术
+//在项号>=自引用项号时进位破坏索引, KVA别名无此缺陷);
+//self-map项清零(root树无递归入口=OS页表经root轴不可达, 最小
+//暴露面); not-present=洞计数跳过。挂接均为原子64位写: 与在飞
+//root窗口并发安全(首核launch后其他核FillVmcb扩展)
+static BOOLEAN SvmRootCopyLevel(PULONG64 RootPage, PULONG64 OsPageKva,
+	ULONG Level, ULONG64 Base, ULONG64 Va, ULONG64 VaEnd)
+{
+	ULONG64 span = 1ULL << (12 + 9 * Level);
+	for (ULONG i = 0; i < 512; i++)
+	{
+		ULONG64 lo = Base + (ULONG64)i * span;
+		if (lo >= VaEnd || lo + span <= Va)
+		{
+			continue;    //项VA域与注册区间不相交
+		}
+		ULONG64 e = OsPageKva[i];
+		if ((e & 1) == 0)
+		{
+			g_svmRootMissCnt++;    //区间内OS轴未映射洞(KPCR保留
+			continue;              //区/块尾等, root不可达=不可碰)
+		}
+		if (Level == 3 && i == g_svmSelfMapIdx)
+		{
+			RootPage[i] = 0;       //self-map不进root树
+			continue;
+		}
+		if (Level == 0 || (e & (1ULL << 7)) != 0)
+		{
+			RootPage[i] = e;       //PTE/2MB/1GB大叶: 原值拷
+			continue;
+		}
+		PULONG64 child = SvmRootFindPt(RootPage[i] & GNPT_ROOT_PA_MASK);
+		if (child == NULL)
+		{
+			child = SvmRootAllocPtPage();
+			if (child == NULL)
+			{
+				return FALSE;
+			}
+			//OS指针项flags(低12)+NX原样承载; 页框=root私有页
+			RootPage[i] = g_svmRootPtPa[g_svmRootPtCount - 1]
+				| (e & 0xFFFULL) | (e & (1ULL << 63));
+		}
+		//child读源=OS下层页表页的物理映射区别名(RAM页恒有)
+		PHYSICAL_ADDRESS cpa;
+		cpa.QuadPart = e & GNPT_ROOT_PA_MASK;
+		PULONG64 childOs = (PULONG64)MmGetVirtualForPhysical(cpa);
+		if (childOs == NULL)
+		{
+			g_svmRootMissCnt++;    //理论不可达(active PFN恒有别名)
+			continue;
+		}
+		if (!SvmRootCopyLevel(child, childOs, Level - 1, lo, Va, VaEnd))
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+//注册器: [Va,Va+Len)的OS轴当前翻译拷入root树(页对齐扩边)。
+//VA规范化到48位索引空间(剥符号扩展位63:48——见SvmRootCopyLevel
+//头注释; 注册区间为系统半区活跃分配, 结构上不触48位顶界)
+static BOOLEAN SvmRootMapRange(ULONG64 Va, ULONG64 Len)
+{
+	if (g_svmRootPml4Va == NULL || g_svmOsPml4Kva == NULL)
+	{
+		return FALSE;    //树未构建(调用序契约: 构建先于FillVmcb扩展)
+	}
+	ULONG64 va = (Va & 0x0000FFFFFFFFFFFFULL) & ~(ULONG64)0xFFFULL;
+	ULONG64 end = ((Va + Len + 0xFFFULL) & ~(ULONG64)0xFFFULL)
+		& 0x0000FFFFFFFFFFFFULL;
+	return SvmRootCopyLevel((PULONG64)g_svmRootPml4Va,
+		g_svmOsPml4Kva, 3, 0, va, end);
+}
+
+//安装流注册面(hook.c调用): 接管后新分配且root窗口会触碰的VA入
+//root树(CodePage=root补丁代写目标; 跳板/重定位缓冲=保守面)。
+//幂等(重叠注册复用child页); 树未建(零接管对照形态)=FALSE无害。
+//F-c-1: 树页隐蔽后guest态直写树页=NPT零页写fault
+//('O'兜底恢复恒等=隐蔽被安装流击穿), 注册全走ROOTMAP原语
+//(root处置体切轴壳内OS轴执行: 填树PTE+可Mm分配新树页+新页
+//隐蔽排水); 引擎在位但树未建(诊断形态)=旧直写(裸机OS轴合法)
+BOOLEAN SvmRootMapVa(PVOID Va, ULONG64 Len)
+{
+	if (g_svmVcpuCount == 0 || g_svmRootCr3Pa == 0)
+	{
+		return SvmRootMapRange((ULONG64)Va, Len);
+	}
+	return CmVmmCall(GNPT_VMCALL_ROOTMAP,
+		(ULONG64)(ULONG_PTR)Va, Len, 0) != 0;
+}
+
+//树构建(PASSIVE, 全部每核资源分配后+全部launch前; 每核KPCR页
+//由FillVmcb钉核逐核补注册——GS基址=本核KPCR, 逐核VA不同)。
+//触集=root窗口静态面: 驱动映像+NPT页表arena块+每核资源五件;
+//根触集全为活跃分配(OS不重映射), 树快照无陈旧性危害。失败=
+//拒绝接管(fail-loud: launch后缺翻译=exit循环即死)
+static BOOLEAN SvmRootCr3Build(PDRIVER_OBJECT DriverObject, ULONG CpuCount)
+{
+	if (!SvmRootFindSelfMap())
+	{
+		FlLog("[Entry] root CR3树: self-map发现失败, 拒绝接管");
+		return FALSE;
+	}
+	g_svmOsCr3Global = __readcr3();    //OS轴CR3全局快照(取证停泊切回
+	                                    //用; KVA域全核一致)
+	g_svmRootPml4Va = SvmAllocContig(PAGE_SIZE, NULL);
+	if (g_svmRootPml4Va == NULL)
+	{
+		return FALSE;
+	}
+	g_svmRootPtVa[0] = g_svmRootPml4Va;
+	g_svmRootPtPa[0] = MmGetPhysicalAddress(g_svmRootPml4Va).QuadPart;
+	g_svmRootPtCount = 1;
+	//驱动映像(全节: text/data/bss含事件环与全部全局)
+	if (!SvmRootMapRange((ULONG64)DriverObject->DriverStart,
+		DriverObject->DriverSize))
+	{
+		return FALSE;
+	}
+	//NPT页表arena块(两视图全部页表页VA面)
+	for (ULONG i = 0; ; i++)
+	{
+		PVOID va = NULL;
+		ULONG64 len = 0;
+		if (!SvmNptArenaEnum(i, &va, &len))
+		{
+			break;
+		}
+		if (!SvmRootMapRange((ULONG64)va, len))
+		{
+			return FALSE;
+		}
+	}
+	//每核资源五件(VMCB/HSAVE/IOPM/MSRPM/VMM栈)
+	for (ULONG i = 0; i < CpuCount; i++)
+	{
+		PGNPT_VCPU_SVM v = &g_svmVcpu[i];
+		if (!SvmRootMapRange((ULONG64)v->VmcbVa, SVM_VMCB_BYTES) ||
+			!SvmRootMapRange((ULONG64)v->HsaveVa, SVM_HSAVE_BYTES) ||
+			!SvmRootMapRange((ULONG64)v->IopmVa, SVM_IOPM_BYTES) ||
+			!SvmRootMapRange((ULONG64)v->MsrpmVa, SVM_MSRPM_BYTES) ||
+			!SvmRootMapRange((ULONG64)v->VmmStack, SVM_VSTACK_BYTES))
+		{
+			return FALSE;
+		}
+	}
+	//树自检(fail-loud): 驱动映像注册后其PML4E必非零+树页数下限
+	//(映像至少PML4+PDPT+PD+PT四级链)。拷贝器缺陷(注册区间恒不
+	//相交/读源错页)的形态=空树——launch后mov cr3首条取指即缺页,
+	//root IDT门自身也在空树=门读取再缺页→三重故障瞬时复位(黑屏
+	//无取证)。自检把该形态转化为构建期干净拒绝
+	{
+		PULONG64 rp = (PULONG64)g_svmRootPml4Va;
+		ULONG p4 = (ULONG)(((ULONG64)DriverObject->DriverStart >> 39) & 0x1FF);
+		if (g_svmRootPtCount < 5 || (rp[p4] & 1) == 0)
+		{
+			FlLog("[Entry] root CR3树自检失败(树%u页/PML4E[%u]=%llX), 拒绝接管",
+				g_svmRootPtCount, p4, (unsigned long long)rp[p4]);
+			return FALSE;
+		}
+	}
+	g_svmRootCr3Pa = g_svmRootPtPa[0];
+	FlLog("root CR3: 私有翻译域(%u页)在位——root窗口脱离OS翻译域"
+		"(页表项劫持通道闭合), self-map=项%u 未映射项%u",
+		g_svmRootPtCount, g_svmSelfMapIdx, g_svmRootMissCnt);
+	return TRUE;
+}
+
+//树页物理地址枚举(F-c-1: npt.c ConcealAll构建期登记用; i越界
+//返回FALSE, 同SvmNptArenaEnum接口形态)
+BOOLEAN SvmRootPtEnum(ULONG Index, ULONG64* Pa)
+{
+	if (Index >= g_svmRootPtCount || Pa == NULL)
+	{
+		return FALSE;
+	}
+	*Pa = g_svmRootPtPa[Index];
+	return TRUE;
+}
+
+//树页隐蔽游标标记(F-c-1: ConcealAll构建期登记后调用=当前全部
+//树页视为已隐蔽; 运行期新页由ROOTMAP原语处置体排水)
+VOID SvmRootPtConcealMark(VOID)
+{
+	s_rootPtConcealed = g_svmRootPtCount;
+}
+
+//树释放(全核裸机后=无人在root轴, 与NPT释放同窗; 幂等)
+static VOID SvmRootCr3Free(VOID)
+{
+	for (ULONG i = 0; i < g_svmRootPtCount; i++)
+	{
+		SvmFreeContig(g_svmRootPtVa[i], PAGE_SIZE);
+	}
+	RtlZeroMemory(g_svmRootPtVa, sizeof(g_svmRootPtVa));
+	RtlZeroMemory(g_svmRootPtPa, sizeof(g_svmRootPtPa));
+	s_rootPtConcealed = 0;
+	g_svmRootPtCount = 0;
+	g_svmRootPml4Va = NULL;
+	g_svmRootCr3Pa = 0;
+	g_svmRootMissCnt = 0;
+	g_svmOsCr3Global = 0;
+	g_svmOsPml4Kva = NULL;
+	g_svmSelfMapIdx = 0;
+}
+
+//root原语切轴对: vmmcall原语处置体切OS轴执行——原语链
+//可调ntoskrnl函数(MEMCPY的memcpy/Rtl族)或触碰树外页(池页),
+//root轴直调=取指/数据缺映射#PF(err=0x10 ID位
+//=取指, RIP=CR2=ntoskrnl函数页)。OS轴=全映射任意访问安全;
+//GIF=0窗口mov cr3无中断; 处置毕切回root轴(VMRUN的HSAVE存
+//当前CR3, 不切回=下轮exit恢复OS轴=纪律破)。root域缺席=
+//诊断形态当前即OS轴, 幂等直通
+static VOID SvmRootAxisToOs(VOID)
+{
+	if (g_svmRootCr3Pa != 0)
+	{
+		__writecr3(g_svmOsCr3Global);
+	}
+}
+
+static VOID SvmRootAxisToRoot(VOID)
+{
+	if (g_svmRootCr3Pa != 0)
+	{
+		__writecr3(g_svmRootCr3Pa);
+	}
+}
+
+//root窗口内读guest内核VA(切轴读): OS轴拷贝字节→切回
+//root轴。存在理由: root树只注册驱动+系统半区——guest内核代码
+//页(如ntoskrnl的mov dr指令)不在树内, root窗口直读=缺映射#PF
+//(CR2=exit RIP自身)。调用契约: 仅exit处置
+//上下文(GIF=0, mov cr3不受GIF门控=无中断窗口); Va须OS轴映射
+//(调用方保证=CPL0代码地址, 规范性调用方自判)。函数体=驱动页
+//(两轴皆映射, 切轴取指无缝); Dst=调用方缓冲(栈=VMM栈两轴皆
+//映射)。root域缺席(g_svmRootCr3Pa=0, 诊断形态)=当前即OS轴
+//直读。切轴期间NMI再入→SvmRootXcpt停泊(不归点, 既有安全形态)
+BOOLEAN SvmRootCodeRead(ULONG64 Va, PUCHAR Dst, ULONG Len)
+{
+	PUCHAR src = (PUCHAR)(ULONG_PTR)Va;
+	if (g_svmRootCr3Pa != 0)
+	{
+		__writecr3(g_svmOsCr3Global);
+	}
+	for (ULONG i = 0; i < Len; i++)
+	{
+		Dst[i] = src[i];
+	}
+	if (g_svmRootCr3Pa != 0)
+	{
+		__writecr3(g_svmRootCr3Pa);
+	}
+	return TRUE;
+}
+
+//root异常取证器(asm 32门终点, 不归点): 取证块落证+取证入事件
+//环+本核安全停泊。**零外部依赖纪律**(仅限root CR3窗口=至切OS
+//轴为止): 窗口内禁调任何ntoskrnl导出函数——root CR3上ntoskrnl
+//页缺映射, 调用即取指#PF→重入→再调→#DF→
+//三重故障核死透。窗口内仅允许: intrinsic+驱动内函数+全局。
+//切OS轴(__writecr3)后纪律解除: ntoskrnl页重新可用=停泊序列
+//(SvmRootParkOs)的KeSetEvent/lidt/stgi全合法。
+//停泊保活形态: OS可中断休眠核——旧cli;hlt死核形态
+//GIF=0+IF=0=时钟中断永久悬挂→100ms后
+//他核CLOCK_WATCHDOG(0x101)/蓝屏流IPI→INIT exit→0xDEADDEAD,
+//而T1排水靠250ms轮询=[F]落盘永远竞争不过100ms蓝屏窗(日志同
+//帧断于s=71, [F]全困事件环)。新形态: 唤醒T1+还原OS IDT+stgi
+//+asm尾sti;hlt(STI;HLT标准idle对)=时钟tick照常推进, 看门狗
+//不叫, 他核+T1续跑=[F]落盘窗口∞。中断帧驻VMM栈(ring0同特权
+//无栈切换, 16KB容量充足); TSS=host态(HSAVE)=中断语义完整。
+//单飞门: 首核独占落证(其余核直接停泊)。
+//[F]行1=rsn:vec a:rip b:cr2 c:err(行2省略: exit上下文须
+//VCPU索引=ntoskrnl函数, 弃——CR2/RIP已足定位)
+static VOID SvmRootParkOs(VOID)
+{
+	//① [F]排水提速: 立刻唤醒T1(已切OS轴+非exit热路径=KeSetEvent
+	//合法; FlRingPush自身的#VMEXIT死锁纪律不适用于本上下文)
+	FlWakeT1();
+	//② 本核OS IDTR还原: Windows每核独立IDT, 核号=GS:[0x184]
+	//KPCR.Prcb.Number(x64稳定偏移; 切轴后读=KPCR页OS域必映射,
+	//且建树时KPCR首页已显式注册=双保险); 越界钳制=只跳lidt
+	//(中断走root IDT超限向量→#GP→单飞门已占分支→再停泊, 稳定)
+	UCHAR c = __readgsbyte(0x184);
+	if (c < 64)
+	{
+		CmLidt(g_svmVcpu[c].RootOsIdtr);
+	}
+	//③ GIF=1(asm尾sti开IF): 停泊核可被中断唤醒——OS可中断休眠
+	__svm_stgi();
+}
+
+VOID SvmRootXcpt(ULONG Vec, ULONG64 Rip, ULONG64 Err, ULONG64 Frame)
+{
+	//单飞门: 已有核在取证=本核直接安全停泊(切OS轴+停泊序列后
+	//返asm尾sti;hlt永眠; NMI/中断再入→本分支或OS IDT, 稳定)
+	if (InterlockedCompareExchange(
+		(volatile LONG*)&g_svmRootXcptF[0], (LONG)0x10000 | (LONG)Vec, 0) != 0)
+	{
+		if (g_svmOsCr3Global != 0)
+		{
+			__writecr3(g_svmOsCr3Global);
+		}
+		SvmRootParkOs();
+		return;
+	}
+	ULONG64 cr2 = __readcr2();
+	//真实核号: GS:[0x184]=KPCR.Prcb.Number——__readgs*=
+	//intrinsic(取指驱动内), KPCR+PRCB区建树时已注册(svm.c Build
+	//SvmRootMapRange(GS基,0x8000))=root轴可读
+	UCHAR fcpu = __readgsbyte(0x184);
+	if (fcpu > 63)
+	{
+		fcpu = 0;    //防御: 越界(理论不可达)回落0
+	}
+	g_svmRootXcptF[0] = 0x10000 | Vec;    //锁值(低16=vec 高位=taken)
+	g_svmRootXcptF[1] = Rip;
+	g_svmRootXcptF[2] = Err;
+	g_svmRootXcptF[3] = cr2;
+	g_svmRootXcptF[4] = 0;
+	g_svmRootXcptF[5] = 0;
+	g_svmRootXcptF[6] = __rdtsc();
+	g_svmRootXcptF[7] = Frame;
+	//取证入环(root CR3窗口内唯一许可通道; 事件环缓冲=驱动.bss
+	//在root树内, FlRingPush=驱动内函数, 每exit[E]行实证可用)
+	FlRingPush('F', fcpu, Vec, Rip, cr2, Err);
+	//切OS轴(纪律解除)→停泊序列(唤醒T1+OS IDT+stgi)→返asm尾
+	//sti;hlt=OS可中断休眠
+	if (g_svmOsCr3Global != 0)
+	{
+		__writecr3(g_svmOsCr3Global);
+	}
+	SvmRootParkOs();
+}
+
+//root IDT建门(PASSIVE一次性, 首核launch前): 32门全指asm存根
+//(门格式: u16 offset_lo/u16 sel/u16 attr/u16 offset_mid/
+//u32 offset_hi/u32 rsvd; attr=0x8E00=P1/DPL0/中断门type14/IST0)
+static VOID SvmRootIdtInit(VOID)
+{
+	USHORT cs = CmGetSegCs();
+	for (ULONG vec = 0; vec < 32; vec++)
+	{
+		ULONG64 off = g_svmRootStubTab[vec];
+		PUCHAR g = g_svmRootIdt + vec * 16;
+		*(USHORT*)(g + 0) = (USHORT)off;
+		*(USHORT*)(g + 2) = cs;
+		*(USHORT*)(g + 4) = 0x8E00;
+		*(USHORT*)(g + 6) = (USHORT)(off >> 16);
+		*(ULONG*)(g + 8) = (ULONG)(off >> 32);
+		*(ULONG*)(g + 12) = 0;
+	}
+	*(USHORT*)&g_svmRootIdtr[0] = 32 * 16 - 1;    //limit=0x1FF(仅0-31域)
+	*(ULONG64*)&g_svmRootIdtr[2] = (ULONG64)g_svmRootIdt;
+}
 
 KAFFINITY SvmPinVirtualizedCpus(VOID)
 {
@@ -934,13 +1423,13 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		//窗内均不可能, 掩码为双保险)
 		if (g_svmPmTimerPort != 0 && g_svmTscHz == 0)
 		{
-			ULONG64 p0 = __indword(g_svmPmTimerPort);
+			ULONG64 p0 = __indword((USHORT)g_svmPmTimerPort);
 			ULONG64 t0 = __rdtsc();
 			ULONG64 dm = 0;
 			ULONG64 t1 = t0;
 			do
 			{
-				ULONG64 p1 = __indword(g_svmPmTimerPort);
+				ULONG64 p1 = __indword((USHORT)g_svmPmTimerPort);
 				t1 = __rdtsc();
 				dm = (p1 - p0) & g_svmPmTimerMask;
 			} while (dm < 0x8000 && (t1 - t0) < 4000000000ULL);
@@ -1080,6 +1569,29 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 		}
 	}
 	KeInitializeEvent(&g_svmShutdownEvent, NotificationEvent, FALSE);
+	//私有root IDT建门(M17-E): 一次性, 须先于全部launch(CmSvmEnter
+	//的lidt引用本表; 门限=0x1FF仅0-31域=外部中断不在此IDT, 若
+	//root IDT下中断意外可达=limit违规#GP→gate13取证, 自洽)
+	SvmRootIdtInit();
+	FlLog("root IDT: 私有异常向量(32门)在位——root异常改道取证bugcheck(0xE17), 不再经OS IDT");
+	//私有root CR3树构建(须先于全部launch——CmSvmEnter的mov cr3
+	//引用树根; 每核资源已全分配=五件全注册; 每核KPCR页由后续
+	//FillVmcb钉核逐核补注册)。失败=拒绝接管(fail-loud)
+	if (!SvmRootCr3Build(DriverObject, cpuCount))
+	{
+		FlLog("[Entry] root CR3树构建失败, 拒绝接管");
+		for (ULONG j = 0; j < cpuCount; j++)
+		{
+			SvmFreeContig(g_svmVcpu[j].VmcbVa, SVM_VMCB_BYTES);
+			SvmFreeContig(g_svmVcpu[j].HsaveVa, SVM_HSAVE_BYTES);
+			SvmFreeContig(g_svmVcpu[j].IopmVa, SVM_IOPM_BYTES);
+			SvmFreeContig(g_svmVcpu[j].MsrpmVa, SVM_MSRPM_BYTES);
+			SvmFreeContig(g_svmVcpu[j].VmmStack, SVM_VSTACK_BYTES);
+			RtlZeroMemory(&g_svmVcpu[j], sizeof(GNPT_VCPU_SVM));
+		}
+		SvmRootCr3Free();
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
 	//NPT自我隐蔽: 全部核资源已分配+零核launch(此刻本线程纯裸机
 	//root态=写NPT页直访物理自免疫); 首核launch后guest态动态写须走
 	//vmmcall root原语(见svm.h功能码注释)。失败=无隐蔽(非致命, 记日志)
@@ -1152,6 +1664,15 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	}
 	g_gnptVcpuCpu = (cpuCount != 0) ? 0 : -1;    //观测锚点核(HB行vcpu字段)
 	FlLog("SVM: 接管完成(%u/%u核in-guest)", cpuCount, totalCpu);
+	//F-c-1: KPCR补注册树页排水隐蔽——FillVmcb的MapRange(裸机直写
+	//合法)在ConcealAll登记后新增的树页(KPCR区首核拆链), 经空区间
+	//ROOTMAP原语纯排水(此刻全核in-guest, DriverEntry线程所在核
+	//可发vmmcall; MapRange(0,0)=幂等空注册)。零接管诊断形态
+	//(cpuCount=0=无虚拟化核)跳过(vmmcall=裸机#UD)
+	if (cpuCount != 0)
+	{
+		CmVmmCall(GNPT_VMCALL_ROOTMAP, 0, 0, 0);
+	}
 	return STATUS_SUCCESS;
 }
 
@@ -1177,6 +1698,7 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 			g_svmNcr3 = 0;
 			FlLog("[Unload] 零接管对照: NPT释放(%u页)", nptPages);
 		}
+		SvmRootCr3Free();    //root树同窗(可能已构建后launch失败回滚)
 		FlLog("[Unload] 引擎未在位, 空卸载");
 		return TRUE;
 	}
@@ -1185,6 +1707,7 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 	FlLog("NPT: 释放(%u页, 曾覆盖%lluGB)",
 		SvmNptPageCount(), SvmNptCoverageBytes() >> 30);
 	SvmFreeNpt();
+	SvmRootCr3Free();    //root树释放(全核STOP桥已切回OS轴, 无人在root翻译域)
 	g_svmNcr3 = 0;
 	g_gnptVcpuCpu = -1;
 	return TRUE;
@@ -1361,7 +1884,8 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					func != GNPT_VMCALL_NPTSET && func != GNPT_VMCALL_NPTRES &&
 					func != GNPT_VMCALL_MSRBIT && func != GNPT_VMCALL_MEMCPY &&
 					func != GNPT_VMCALL_CONCEAL && func != GNPT_VMCALL_DRSET &&
-					func != GNPT_VMCALL_NXREARM && func != GNPT_VMCALL_DEFTEST))
+					func != GNPT_VMCALL_NXREARM && func != GNPT_VMCALL_DEFTEST &&
+					func != GNPT_VMCALL_ROOTMAP))
 			{
 				//签名门拒绝采样(防刷爆环; Release构建零开销)
 				static volatile LONG s_sigCnt[64] = { 0 };
@@ -1422,16 +1946,19 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				}
 				case GNPT_VMCALL_NPTSET:    //root写原语: 视图PTE(隐蔽后动态写唯一正道)
 				{
+					SvmRootAxisToOs();    //切轴壳: 处置体OS轴(链内Rtl族/池页访问安全)
 					SvmNptRootCtxMark(TRUE);    //现场拆分只许arena槽切取
 					SvmNptSetPte((ULONG)(arg2 >> 48) & 0xF, arg1,
 						arg2 & 0x0000FFFFFFFFFFFFULL, arg3);
 					SvmNptRootCtxMark(FALSE);
+					SvmRootAxisToRoot();
 					FlRingPush('n', cpu, GNPT_VMCALL_NPTSET, arg1, arg2, arg3);
 					SvmAdvanceRip(vmcb);
 					return 0;
 				}
 				case GNPT_VMCALL_NPTRES:    //root恢复原语: 单树(0/1)/全树(0xF)恒等
 				{
+					SvmRootAxisToOs();    //切轴壳: 处置体OS轴
 					ULONG vw = (ULONG)arg2 & 0xF;
 					SvmNptRootCtxMark(TRUE);    //未拆分区恢复=现场拆分, 同上限
 					if (vw == 0xF)
@@ -1446,6 +1973,7 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 						SvmNptRestoreIdentity(vw, arg1);
 					}
 					SvmNptRootCtxMark(FALSE);
+					SvmRootAxisToRoot();
 					FlRingPush('n', cpu, GNPT_VMCALL_NPTRES, arg1, arg2, 0);
 					SvmAdvanceRip(vmcb);
 					return 0;
@@ -1455,7 +1983,10 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					BOOLEAN ok = (arg3 != 0 && arg3 <= PAGE_SIZE);
 					if (ok)
 					{
+						SvmRootAxisToOs();    //切轴壳: RtlCopyMemory=memcpy
+						                       //ntoskrnl导出, root轴取指#PF
 						RtlCopyMemory((PVOID)arg1, (PVOID)arg2, (SIZE_T)arg3);
+						SvmRootAxisToRoot();
 					}
 					FlRingPush('M', cpu, GNPT_VMCALL_MEMCPY, arg1, arg2, arg3);
 					vmcb->State.Rax = ok ? 1 : 0;
@@ -1465,9 +1996,11 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				}
 				case GNPT_VMCALL_CONCEAL:    //运行期工件隐蔽: 身份PTE两视图零页
 				{
+					SvmRootAxisToOs();    //切轴壳: 处置体OS轴
 					SvmNptRootCtxMark(TRUE);
 					BOOLEAN ok = SvmNptConcealPageRuntime(arg1);
 					SvmNptRootCtxMark(FALSE);
+					SvmRootAxisToRoot();
 					FlRingPush('c', cpu, GNPT_VMCALL_CONCEAL, arg1,
 						ok ? 1 : 0, (ULONG64)SvmNptConcealCount());
 					vmcb->State.Rax = ok ? 1 : 0;
@@ -1483,8 +2016,10 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					//guest优先租用制: 被guest占用(影子DR7启用)的槽
 					//让位(该核fail-open), guest释放时经MOV DR7合并
 					//路径自动重武装(hook.c)
+					SvmRootAxisToOs();    //切轴壳: 处置体OS轴(链内访问安全)
 					GnptHookDrArmCore(vmcb, cpu, (ULONG)(arg1 & 3),
 						(arg1 & 0x100) != 0, arg2);
+					SvmRootAxisToRoot();
 					FlRingPush('g', cpu, (ULONG)arg1, arg2,
 						vmcb->State.Dr7, 0);
 					SvmAdvanceRip(vmcb);
@@ -1503,8 +2038,42 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 					ULONG32 msr = (ULONG32)arg1;
 					BOOLEAN isWrite = ((arg2 & 2) != 0);
 					BOOLEAN set = ((arg2 & 1) != 0);
+					SvmRootAxisToOs();    //切轴壳: 处置体OS轴(链内访问安全)
 					GnptMsrBitmapRootAllCpus(msr, isWrite, set);
+					SvmRootAxisToRoot();
 					FlRingPush('b', cpu, GNPT_VMCALL_MSRBIT, arg1, arg2, 0);
+					SvmAdvanceRip(vmcb);
+					return 0;
+				}
+				case GNPT_VMCALL_ROOTMAP:    //root树VA注册(F-c-1: 安装流)
+				{
+					//切轴壳内全OS轴执行(自举安全: 写树页/分配新树页/
+					//隐蔽改译全经OS轴全映射; 树页自身永不需在root树内)
+					//——root轴下树页VA缺映射(root树不含树页自身),
+					//guest轴下树页NPT已隐蔽=写fault, 唯OS轴合法
+					SvmRootAxisToOs();
+					BOOLEAN ok = SvmRootMapRange(arg1, arg2);
+					if (ok)
+					{
+						//新树页隐蔽排水: 游标后的全部新页(区间注册
+						//可级联新增中间页), 单页失败=注册成功但暴露
+						//窗残留(游标停留, 下次原语重试排水)
+						for (ULONG i = s_rootPtConcealed;
+							i < g_svmRootPtCount; i++)
+						{
+							if (!SvmNptConcealPageRuntime(
+								g_svmRootPtPa[i]))
+							{
+								break;
+							}
+							s_rootPtConcealed = i + 1;
+						}
+					}
+					SvmRootAxisToRoot();
+					FlRingPush('r', cpu, GNPT_VMCALL_ROOTMAP, arg1,
+						arg2, ok ? 1 : 0);
+					vmcb->State.Rax = ok ? 1 : 0;
+					Regs->rax = vmcb->State.Rax;
 					SvmAdvanceRip(vmcb);
 					return 0;
 				}
@@ -1554,17 +2123,21 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			//手术: fault指令字节∈SVM族(0F 01 D8-DF)→改注入#UD(裸机
 			//等价); 否则忠实回注#GP(§15.12: 错误码载体=EXITINFO1, 向量=
 			//EXITCODE)。§15.8.4: 指令字节仅#PF填充(GuestInstructionBytes
-			//其余exit清零)→必直读RIP。字节读安全: #GP由指令执行raise→该
-			//指令已fetch→RIP页驻留; 非规范RIP(理论不可达)守卫=不读回注。
-			//前置事件链(EXITINTINFO.V=1双错级路径)不组合——该路径本就
-			//致死, 回注本#GP=忠实方向(边界已文档化)
+			//其余exit清零)→须读RIP字节; root CR3纪律: 直读
+			//guest RIP=缺映射#PF→切轴读
+			//(SvmRootCodeRead: OS轴拷贝→切回)。字节读安全: #GP由
+			//指令执行raise→该指令已fetch→RIP页在OS轴驻留; 非规范RIP
+			//(理论不可达)守卫=不读回注。前置事件链(EXITINTINFO.V=1
+			//双错级路径)不组合——该路径本就致死, 回注本#GP=忠实方向
+			//(边界已文档化)
 			ULONG64 rip = vmcb->State.Rip;
 			BOOLEAN family = FALSE;
 			//x64规范地址判据: bits63:47全0或全1
 			if ((rip >> 47) == 0 || (rip >> 47) == 0x1FFFF)
 			{
-				PUCHAR p = (PUCHAR)rip;
-				if (p[0] == 0x0F && p[1] == 0x01 && (p[2] & 0xF8) == 0xD8)
+				UCHAR ib[3];
+				SvmRootCodeRead(rip, ib, sizeof(ib));
+				if (ib[0] == 0x0F && ib[1] == 0x01 && (ib[2] & 0xF8) == 0xD8)
 				{
 					family = TRUE;    //0F 01 D8-DF全族(8条)
 				}
@@ -1632,9 +2205,26 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 		{
 			//EXITINFO1 bit0=0读/1写(位义见msr.h); MSR号在ECX。
 			//hook命中→回调(读=伪造值/写=放行或静默丢弃); 未hook
-			//(位图竞态/范围外MSR自动exit)→真值回放=裸机等价
+			//范围内号(位图竞态)→真值回放=裸机等价
 			ULONG32 msr = (ULONG32)Regs->rcx;
 			BOOLEAN isWrite = ((vmcb->Control.ExitInfo1 & 1) != 0);
+			//范围外MSR号(先于'm'采样, 两流量分列): MSRPM只覆盖
+			//三区(APM §15.11 Table 15-8), MSR_PROT在场时范围外号
+			//"automatically cause an intercept"且先于unimplemented
+			//#GP检查——裸机该访问=guest自身#GP(0); 若未hook直通
+			//__readmsr=root轴非法号#GP→root IDT停泊(guest可触发
+			//的灭活开关)→注入#GP(0)回guest=裸机等价(§15.20注入
+			//不经拦截检查, 直接进guest IDT不再exit)
+			ULONG msrOff;
+			UCHAR msrBit;
+			if (!GnptMsrLocate(msr, &msrOff, &msrBit))
+			{
+				vmcb->Control.EventInj = EVENTINJ_MAKE(13,
+					EVENTINJ_TYPE_EXCP, 1, 0);
+				FlRingPush('m', cpu, SVM_EXIT_MSR, msr,
+					2 | (ULONG64)(ULONG)isWrite, 0);
+				return 0;    //fault语义不推RIP
+			}
 			//'m'环采样(首条+每4096条; Release构建零开销)
 			static volatile LONG s_msrCnt[64] = { 0 };
 			GNPT_CRUMB(s_msrCnt, 0xFFF, cpu,
@@ -1863,8 +2453,8 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 			{
 				//root代读(exit handler=GIF=0裸机root, IOPM只约束
 				//guest——物理IO直访)
-				ULONG64 val = (width == 4) ? __indword(port) :
-					(width == 2) ? __inword(port) : __inbyte(port);
+				ULONG64 val = (width == 4) ? __indword((USHORT)port) :
+					(width == 2) ? __inword((USHORT)port) : __inbyte((USHORT)port);
 				//PM_TMR域=虚拟时间轴补偿: 锚点=本exit入口的guest
 				//TSC虚拟时刻(ExitTsc+TscOffset=TSC轴在驻留窗冻结
 				//后的时间线, 补偿后PM读值与guest随后读到的TSC同刻
@@ -1898,15 +2488,15 @@ static ULONG SvmExitDispatch(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs)
 				ULONG64 val = vmcb->State.Rax & mask;
 				if (width == 4)
 				{
-					__outdword(port, (ULONG)val);
+					__outdword((USHORT)port, (ULONG)val);
 				}
 				else if (width == 2)
 				{
-					__outword(port, (USHORT)val);
+					__outword((USHORT)port, (USHORT)val);
 				}
 				else
 				{
-					__outbyte(port, (UCHAR)val);
+					__outbyte((USHORT)port, (UCHAR)val);
 				}
 			}
 			vmcb->State.Rip = vmcb->Control.ExitInfo2;    //next-RIP

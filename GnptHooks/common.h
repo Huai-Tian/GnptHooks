@@ -80,8 +80,8 @@ extern volatile LONG g_gnptParkedMask;
 #define GNPT_VMMCALL_SIG1 0x3A7C5E1F9B2D8467ULL
 
 //内部vmmcall功能码总表见svm.h(已实现: STOP/KEEP/NPTSYNC/NPTSET/
-//NPTRES/MSRBIT/MEMCPY/CONCEAL/DRSET); 后续功能预留未接线:
-//  10=TSC校准探针(空handler)  11=时钟布防
+//NPTRES/MSRBIT/MEMCPY/CONCEAL/DRSET/NXREARM/ROOTMAP); 后续功能
+//预留未接线:  10=TSC校准探针(空handler)  11=时钟布防
 
 //当前虚拟化目标核(-1=未启动), 启动循环置位, 日志心跳读它
 extern volatile LONG g_gnptVcpuCpu;
@@ -127,7 +127,8 @@ typedef struct _GNPT_RING_ENTRY
 //  e=单步#DB收尾(rsn=用途, a=0(BS=1 TF引发)/1(BS=0 Dr断点抢入), b=计数; 链终点)
 //  b=MSRBIT root位图原语(rsn=0x81, a=msr, b=op)
 //  n=NPT root原语(rsn=功能码5/6, a=gpa, b=pa|view或view, c=flags)
-//  m=MSR exit采样(rsn=0x7C, a=msr, b=读写1位, c=计数; 首条+每4096条)
+//  m=MSR exit采样(rsn=0x7C, a=msr, b=读写1位, c=计数; 首条+每4096条;
+//    b>=2=范围外MSR号注入#GP形态: 2|读写位, c=0)
 //  Z=自我隐蔽完成(rsn=0, a=零页pa, b=登记页数, c=页表页数; 一次)
 //  o=隐蔽页兜底恢复(rsn=0x400, a=隐蔽页pa, b=faulting gpa, c=累计次数)
 //  F=NPF风暴五档转储(rsn=1-5档位: 1=RIP/错误码/gpa 2-3=易失GPR
@@ -166,7 +167,8 @@ typedef struct _GNPT_RING_ENTRY
 //  k=NX-Fence入口陷阱(rsn=0x400, a=改道后跳板槽RIP, b=fault gpa;
 //    fence触发链起点)
 //  r=NX-Fence rearm完成(rsn=0x81, a=vmmcall处RIP; stub尾收尾=
-//    在途旗清+视图回P, fence触发链终点)
+//    在途旗清+视图回P, fence触发链终点)/ROOTMAP树注册(rsn=17,
+//    a=va, b=len, c=1成功0拒绝; 安装流树页隐蔽排水流量)
 //  A=NX-Fence信标回P(rsn=0, a=当前RIP; fence页邻函数驻留旗被
 //    任意exit消费=fence重武装)
 //  d=IOIO代答采样(rsn=0x7B, a=EXITINFO1, b=PM_TMR端口; 时钟域
@@ -224,6 +226,8 @@ VOID FlRingPush(CHAR tag, ULONG cpu, ULONG reason, ULONG64 a, ULONG64 b, ULONG64
                                        //任意IRQL(含#VMEXIT): 无锁写二进制事件环
 VOID FlRingExit(ULONG cpu, ULONG reason, ULONG64 rip, ULONG64 qual);
                                        //#VMEXIT统一采样入口(内部含reason计数)
+VOID FlWakeT1(VOID);                   //T1立即唤醒(停泊序列专用: 已切OS轴
+                                       //的root异常处置路径, [F]排水提速)
 //vmrun观测预热: 置hot+踢T1+睡5ms(仅PASSIVE_LEVEL, vmrun前调用),
 //vmrun窗口毫秒级落盘
 VOID FlArmLaunchWatch(VOID);
@@ -248,6 +252,7 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 #define FlMarkEntryDone()
 #define FlRingPush(tag, cpu, reason, a, b, c)
 #define FlRingExit(cpu, reason, rip, qual)
+#define FlWakeT1()
 #define FlArmLaunchWatch()
 #define FlWdArm()
 #define FlWdDisarm()
@@ -272,7 +277,7 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.10h"
+#define GNPT_BUILD_TAG "v0.10w"
 //L系列配置二分探针(已完成使命, 保留供复验)。组表:
 //G1=异常拦截(#DB/#GP/#MC)+DR位 G2=MSRPM故事位 G3=SMI/SHUTDOWN/
 //INIT/INVLPGA/SVM族 G4=TSC补偿壳; GNPT_L3_NODEMO=1(任意组合下

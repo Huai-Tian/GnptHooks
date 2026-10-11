@@ -174,6 +174,20 @@ static VOID DemoMsrTriggerThread(PVOID Context)
 		iv.QuadPart = -10000000LL;    //1s
 		KeDelayExecutionThread(KernelMode, FALSE, &iv);
 	}
+	//范围外MSR号注入自证(0x2000=MSRPM三区外): 裸机语义=
+	//rdmsr→#GP(0)。引擎下范围外必exit→0x7C注入#GP回guest
+	//(SEH可捕)=裸机等价; 未修形态=root轴直读→root IDT停泊
+	//(探针线程死+卸载拒绝=灭活开关暴露面)
+	__try
+	{
+		ULONG64 bad = __readmsr(0x2000);
+		FlLog("[Demo] 范围外MSR读探针: 未#GP(返回%llX)=异常",
+			(unsigned long long)bad);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		FlLog("[Demo] 范围外MSR读#GP: 注入回guest=裸机等价(活)");
+	}
 	KeSetEvent(&g_demoMsrDone, IO_NO_INCREMENT, FALSE);
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -548,12 +562,12 @@ static VOID DemoClockProbe(VOID)
 		FlLog("[S6] 时钟域自证: TSC频率缺席 → 跳过(补偿降级形态)");
 		return;
 	}
-	ULONG64 p0 = __indword(port);   //exit 0x7B→代答+补偿('d'环)
+	ULONG64 p0 = __indword((USHORT)port);   //exit 0x7B→代答+补偿('d'环)
 	ULONG64 t0 = __rdtsc();
 	while (__rdtsc() - t0 < hz / 100)   //~10ms自旋(零exit)
 	{
 	}
-	ULONG64 p1 = __indword(port);
+	ULONG64 p1 = __indword((USHORT)port);
 	ULONG64 t1 = __rdtsc();
 	ULONG64 dpm = p1 - p0;
 	ULONG64 dtsc = t1 - t0;

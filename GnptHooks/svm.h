@@ -189,6 +189,15 @@ typedef struct _GNPT_VCPU_SVM
 	                               //TSC样本(时间轴补偿T0, SvmExitHandler壳)
 	ULONG64 WdTsc;                 //+0x80 看门狗T0(asm写, C判定:
 	                               //exit窗口rdtsc入, handler尾比差)
+	UCHAR RootOsIdtr[16];          //+0x88 OS IDTR伪描述符(lidt内存
+	                               //形态: u16 limit@0+u64 base@2,
+	                               //FillVmcb钉核逐核捕获——Windows
+	                               //每核独立IDT; asm CmSvmStop的
+	                               //root IDT还原源, 偏移硬契约)
+	ULONG64 RootOsCr3;             //+0x98 本核OS轴CR3快照(FillVmcb
+	                               //钉核逐核捕获): asm CmSvmStop切出
+	                               //root CR3的还原值+取证器bugcheck
+	                               //前OS轴切换值, 偏移硬契约
 } GNPT_VCPU_SVM, *PGNPT_VCPU_SVM;
 
 extern GNPT_VCPU_SVM g_svmVcpu[64];
@@ -198,6 +207,24 @@ extern volatile LONG64 g_svmB8Landed[64];      //各核launch定格的0xB8形态
 extern volatile LONG64 g_svmDefHeal[64];       //异常exit防御自愈登记: 各核最后剥位自愈的exit码+1(0=无; exit处置(GIF=0)写, 自证探针只读——同上勿读VMCB)
 extern volatile ULONG g_svmPmTimerPort;        //PM_TMR IO端口(FADT枚举, 0=缺席=时钟域降级直通; demo探针读)
 extern volatile ULONG64 g_svmTscHz;            //TSC标称频率(CPUID 0x15/0x16探测, 0=缺席=补偿降级为物理真值)
+
+//私有root IDT(M17-E): 32门异常向量表, root窗口异常不再经OS IDT
+//(内核可观测路由+VMM栈上的内核异常分发=0x139类fail-fast)——
+//全部改道取证bugcheck(0xDEADC0DE+0xE17参数)
+extern UCHAR g_svmRootIdtr[16];   //lidt内存形态伪描述符(asm CmSvmEnter引用)
+extern ULONG64 g_svmRootStubTab[32];  //asm导出: 32个root异常门目标存根表(建门引用)
+extern volatile ULONG64 g_svmRootXcptF[8];  //root异常取证块(dump直读): vec/rip/err/cr2/exitCode/exitRip/tsc/frame
+
+//私有root CR3: root窗口独立翻译域——root代码不再走OS页表(内核可改
+//OS页表项重指VMM页=劫持通道, 私有树物理页对guest经NPT隐蔽后不可达)。
+//机制同root IDT: CmSvmEnter一次mov cr3→VMRUN保存host CR3入HSAVE
+//→每#VMEXIT硬件恢复(§15.25.4: CR3是#VMEXIT必重载项)=零per-exit成本
+extern volatile ULONG64 g_svmRootCr3Pa;  //root树PML4物理页(asm CmSvmEnter引用; 0=未构建=拒绝launch)
+BOOLEAN SvmRootMapVa(PVOID Va, ULONG64 Len);  //root树VA注册(安装流: 接管后新分配且root窗口触碰的页入树; 失败留痕=缺翻译页触碰时取证蓝屏一次定位)
+BOOLEAN SvmRootPtEnum(ULONG Index, ULONG64* Pa);  //root树页物理地址枚举(F-c-1: npt.c构建期隐蔽登记; 越界FALSE)
+VOID SvmRootPtConcealMark(VOID);        //树页隐蔽游标标记(ConcealAll登记后调用; 运行期新页由ROOTMAP原语排水)
+BOOLEAN SvmRootCodeRead(ULONG64 Va, PUCHAR Dst, ULONG Len);  //root窗口读guest内核VA(切轴读: OS轴拷贝→切回; exit处置GIF=0上下文专用; 直读=缺映射#PF)
+extern volatile ULONG64 g_svmOsCr3Global; //OS轴CR3全局快照(Build期__readcr3, KVA域全核一致; 取证器/切轴读共用)
 
 //root原语(vmmcall族=NPTSET/NPTRES/MSRBIT/NPTSYNC)前置条件——仅虚拟化
 //核合法: 裸机核EFER.SVME=0→vmmcall=#UD→蓝屏(调用线程调度核不可控,
@@ -226,6 +253,7 @@ ULONG CmGetIdtLimit(VOID);
 ULONG64 CmGetRflags(VOID);     //pushfq全宽读取(VMCB.Rflags源; MSVC无x64对应intrinsics)
 VOID CmSetTF(VOID);            //置RFLAGS.TF(调试忠实性探针用; 单步陷阱自动清TF)
 VOID CmInt1(VOID);             //INT1软件陷阱(调试忠实性探针用; DR6零位=#DB残余路径甄别载体)
+VOID CmLidt(PVOID Idtr);       //IDTR装载(停泊序列: 本核OS IDT还原; x64无MSVC intrinsic)
 //段attrib(12位=描述符55:52|47:40拼接, APM §15.5.1)由C侧直读GDT描述符
 //(svm.c: SvmGetSegAttrib)
 
@@ -269,6 +297,13 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 //(CR4.CET=1)上清CR0.WP=Mov CR0架构性#GP(APM Vol1 CR0.WP位
 //规则)——cave槽写入改走hook.c的MDL别名路径(HookCaveAliasCopy,
 //纯PASSIVE API, 零CR0接触), 不再需要root代写原语
+#define GNPT_VMCALL_ROOTMAP 17 //root树VA注册(F-c-1): rdx=va r8=len→
+                               // 切轴壳内SvmRootMapRange(填树PTE,
+                               // 可Mm分配新树页)+新树页隐蔽排水
+                               // (SvmNptConcealPageRuntime逐页,
+                               // rax=1成功/0拒绝)。树页隐蔽后guest态
+                               // 直写树页=NPT零页写fault('O'兜底恢复
+                               // 恒等=隐蔽被击穿), 故注册全走本原语
 #define GNPT_VMCALL_DEFTEST 16 //防御自证原语(demo探针专用): 置位
                                // 本核RDTSC拦截位=制造拦截向量异常
                                // +自愈登记清零→guest首条rdtsc exit

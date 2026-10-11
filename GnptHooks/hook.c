@@ -354,6 +354,12 @@ static PUCHAR HookAllocSlot(PGNPT_ENTRY Entry)
 			return NULL;
 		}
 		RtlZeroMemory(t, HOOK_SLOT_SIZE);
+		//root树VA注册(池槽: root窗口触碰面; cave槽=映像内天然在树)
+		//F-c-1: MapVa内走ROOTMAP原语(树PTE填写+新树页隐蔽排水)
+		if (!SvmRootMapVa(t, HOOK_SLOT_SIZE))
+		{
+			FlLog("[Hook] 槽%p入root树失败(树未建/树页耗尽)", t);
+		}
 	}
 	g_slotAddr[idx] = t;
 	RtlCopyMemory(g_slotSave[idx], t, 24);    //源字节保存(teardown精确还原)
@@ -595,6 +601,12 @@ static PUCHAR HookBuildRelocTrampoline(ULONG64 Target, ULONG MinLen,
 		return NULL;
 	}
 	RtlZeroMemory(buf, HOOK_REPLAY_BUF);
+	//root树VA注册(重定位跳板: root窗口触碰面, 保守注册; MapVa内
+	//走ROOTMAP原语)
+	if (!SvmRootMapVa(buf, HOOK_REPLAY_BUF))
+	{
+		FlLog("[Reloc] 跳板%p入root树失败(树未建/树页耗尽)", buf);
+	}
 	ULONG total = 0;
 	ULONG64 src = Target;
 	BOOLEAN bad = FALSE;
@@ -848,14 +860,26 @@ static VOID HookStepArm(PVMCB Vmcb, ULONG Cpu, LONG Use, ULONG HookIdx)
 	g_stepTfShadow[Cpu] = (LONG64)((Vmcb->State.Rflags & RFLAGS_TF) >> 8);
 	//步进指令INTn探测: int压栈的是活RFLAGS=含注入TF→
 	//handler iret复活=guest自发#DB(0x1E级)。#DB收尾清帧内TF
-	//(见GnptHookStepDbExit)。读原页真字节(host直译=原页恒在)
+	//(见GnptHookStepDbExit)。指令字节=VMCB的DecodeAssists缓冲
+	//(§15.8.4: NPF数据页fault填充——本函数调用点全为数据fault,
+	//VMCB页在root树内; root CR3纪律禁直读guest RIP=缺映射
+	//形态)。缓冲无效(<2字节: 取指fault/特性缺席)
+	//=探测降级失败, INTn按无处理
 	{
 		ldasm_data la = { 0 };
-		ULONG al = ldasm((PVOID)(ULONG_PTR)Vmcb->State.Rip, &la, TRUE);
-		g_stepArmIntn[Cpu] = (al != 0 && !(la.flags & F_INVALID) &&
-			la.opcd_size == 1 &&
-			((PUCHAR)(ULONG_PTR)Vmcb->State.Rip)[la.opcd_offset] == 0xCD)
-			? 1 : 0;
+		PUCHAR ib = Vmcb->Control.GuestInstructionBytes;
+		if (Vmcb->Control.NumOfBytesFetched >= 2)
+		{
+			ULONG al = ldasm(ib, &la, TRUE);
+			g_stepArmIntn[Cpu] = (al != 0 && !(la.flags & F_INVALID) &&
+				la.opcd_size == 1 &&
+				ib[la.opcd_offset] == 0xCD)
+				? 1 : 0;
+		}
+		else
+		{
+			g_stepArmIntn[Cpu] = 0;
+		}
 	}
 	if (Use == STEP_TEMP_RW)
 	{
@@ -1261,52 +1285,56 @@ BOOLEAN GnptHookDrBpDbExit(PVMCB Vmcb, ULONG Cpu)
 	return TRUE;
 }
 
-//MOV DR手工译码(0F 21读/0F 23写, mod=11; DR=reg域, GPR=rm域):
-//DecodeAssists的EXITINFO1[3:0]位亦载GPR号(Table 15-3), 但译码
-//自足=不依赖特性, ExitInfo1仅作交叉采样。返回FALSE=非MOV DR
-//形态(防御#UD)
-static BOOLEAN HookDrDecodeMov(PVMCB Vmcb, ULONG* DrOut,
-	ULONG* GprOut, BOOLEAN* WriteOut)
+//MOV DR的GPR号提取(0F 21读/0F 23写, mod=11; DR=reg域, GPR=rm域)。
+//root CR3纪律: 禁直读guest RIP取指令字节——root树只注册
+//驱动+系统半区, ntoskrnl页缺映射, 直读=#PF
+//(CR2=exit RIP自身)。两路:
+//  主路=EXITINFO1[3:0]硬件直载GPR号(APM §15.8.1 Table 15-3,
+//  DecodeAssists特性在场; 4位全编码含R8-15)——零译码零解引用;
+//  兜路=特性缺席时切轴读指令字节手工译码(SvmRootCodeRead:
+//  OS轴拷贝→切回, MOV DR exit罕见流量成本无所谓)。
+//返回FALSE=兜路译码失败(防御#UD; 理论不可达——拦截位只对
+//MOV DR指令触发, 指令形态由硬件保证)
+static BOOLEAN HookDrGprNum(PVMCB Vmcb, ULONG* GprOut)
 {
-	PUCHAR p = (PUCHAR)(ULONG_PTR)Vmcb->State.Rip;
+	if (g_svmFeatBits & SVM_FEAT_DECODEASSIST)
+	{
+		*GprOut = (ULONG)(Vmcb->Control.ExitInfo1 & 0xF);
+		return TRUE;
+	}
+	UCHAR ib[8];
+	SvmRootCodeRead(Vmcb->State.Rip, ib, sizeof(ib));
 	ULONG i = 0;
 	UCHAR rex = 0;
 	for (i = 0; i < 4; i++)
 	{
-		if ((p[i] & 0xF0) == 0x40)
+		if ((ib[i] & 0xF0) == 0x40)
 		{
-			rex = p[i];    //REX(最后一个生效)
+			rex = ib[i];    //REX(最后一个生效)
 			continue;
 		}
 		break;
 	}
-	if (p[i] != 0x0F)
+	if (ib[i] != 0x0F)
 	{
 		return FALSE;
 	}
-	UCHAR op = p[i + 1];
+	UCHAR op = ib[i + 1];
 	if (op != 0x21 && op != 0x23)
 	{
 		return FALSE;
 	}
-	UCHAR modrm = p[i + 2];
+	UCHAR modrm = ib[i + 2];
 	if ((modrm >> 6) != 3)
 	{
 		return FALSE;    //MOV DR恒寄存器-寄存器(mod=11)
 	}
-	ULONG dr = (modrm >> 3) & 7;
 	ULONG gpr = modrm & 7;
-	if (rex & 0x04)
-	{
-		dr |= 8;         //REX.R→DR8-15
-	}
 	if (rex & 0x01)
 	{
 		gpr |= 8;        //REX.B→R8-15
 	}
-	*DrOut = dr;
 	*GprOut = gpr;
-	*WriteOut = (op == 0x23);
 	return TRUE;
 }
 
@@ -1344,10 +1372,10 @@ BOOLEAN GnptHookDrMovExit(PVMCB Vmcb, ULONG Cpu, PGUEST_REGS Regs,
 		Vmcb->Control.EventInj = EVENTINJ_MAKE(1, EVENTINJ_TYPE_EXCP, 0, 0);
 		return TRUE;    //fault语义: 不推RIP(指令未执行)
 	}
-	ULONG dr = ExitCode & 0xF;
-	BOOLEAN isWrite = (ExitCode & 0x10) != 0;
+	ULONG dr = ExitCode & 0xF;               //DR号=exit编码[3:0](Table C-1)
+	BOOLEAN isWrite = (ExitCode & 0x10) != 0;   //方向=exit编码bit4
 	ULONG gpr = 0;
-	BOOLEAN ok = HookDrDecodeMov(Vmcb, &dr, &gpr, &isWrite);
+	BOOLEAN ok = HookDrGprNum(Vmcb, &gpr);  //GPR号=EXITINFO1/切轴译码
 	if (!ok || dr > 7)
 	{
 		//DR8-15/非法形态: x86无此寄存器——#UD(裸机等价)
@@ -2142,6 +2170,12 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	}
 	RtlCopyMemory(e->CodePageVa, (PVOID)((ULONG_PTR)Hook->Target & ~(ULONG_PTR)(PAGE_SIZE - 1)), PAGE_SIZE);
 	e->CodePagePa = MmGetPhysicalAddress(e->CodePageVa).QuadPart;
+	//root树VA注册(CodePage=root补丁代写目标: 隐蔽面在位时
+	//guest态写改译零页, 14B补丁与还原全走root轴代写)
+	if (!SvmRootMapVa(e->CodePageVa, PAGE_SIZE))
+	{
+		FlLog("[Hook] CodePage%p入root树失败(树未建/树页耗尽)", e->CodePageVa);
+	}
 	//14B补丁镜像(栈上构建, μs级驻留): FF25 00000000 + 槽绝对地址。
 	//写入路径在隐蔽段分流: 隐蔽面在=root拷贝原语代写(改译零页后
 	//guest态写=fault); 无隐蔽面=直写(构建失败继续形态)

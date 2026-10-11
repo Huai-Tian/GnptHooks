@@ -1,4 +1,7 @@
 EXTERN	SvmExitHandler:PROC		;exit handler实体(svm.c)
+EXTERN	SvmRootXcpt:PROC		;root异常取证器(svm.c, 不归点)
+EXTERN	g_svmRootIdtr:QWORD		;root IDT伪描述符(svm.c建)
+EXTERN	g_svmRootCr3Pa:QWORD		;root树PML4物理页(svm.c建)
 .CODE
 ;=====================================================================
 ; GnptHooks SVM世界开关
@@ -94,6 +97,13 @@ CmInt1 PROC
     ret
 CmInt1 ENDP
 
+;----- IDTR装载(停泊序列用; x64无MSVC intrinsic) -----
+; rcx=伪描述符地址(u16 limit+u64 base, VCPU.RootOsIdtr内存形态)
+CmLidt PROC
+    lidt fword ptr [rcx]
+    ret
+CmLidt ENDP
+
 ;----- GDTR/IDTR读取(10字节伪描述符: u16 limit + u64 base) -----
 CmGetGdtBase PROC
     sub rsp, 10h
@@ -160,6 +170,19 @@ CmSvmEnter PROC
     lea rsp, [rcx-10h]              ;rsp = Top-16
     ;--- GIF纪律: vmrun前clgi(原子状态切换, §15.5) ---
     clgi
+    ;--- 私有root IDT接管(M17-E): 一次lidt=恒在——§15.4"VMRUN
+    ;    saves host state: IDTR, GDTR"入HSAVE, 每个后续#VMEXIT硬件
+    ;    恢复该值=root IDT自动生效, 零per-exit成本; guest侧IDTR由
+    ;    VMCB独立装载(两轴互扰为零)。clgi后做=GIF=0窗口无中断,
+    ;    存根前无故障指令(lidt→vmrun间纯mov) ---
+    lidt	fword ptr [g_svmRootIdtr]
+    ;--- 私有root CR3接管: 一次切换→VMRUN保存host CR3入HSAVE
+    ;    (§15.25.4)→每#VMEXIT硬件恢复=root窗口恒走私有翻译域
+    ;    (零per-exit软件成本, 与上方lidt同窗同型: GIF=0无中断,
+    ;    mov cr3后取指走root树; guest侧CR3由VMCB独立装载两轴
+    ;    互扰为零)
+    mov rcx, [g_svmRootCr3Pa]
+    mov cr3, rcx
 CmSvmLoop:
     mov rax, [rsp+8]                ;rax = VmcbPa ([Top-8])
     ;vmload/vmsave剥除: 本对指令在type-2(host=guest同OS)下为纯自反
@@ -242,6 +265,17 @@ CmSvmLoop:
     pop r15
     jmp CmSvmLoop
 CmSvmStop:
+    ;--- root IDT还原: 本核OS IDTR(FillVmcb钉核预捕,
+    ;    Windows每核独立IDT)。须先于GPR pop(rcx为暂存)与stgi
+    ;    (stgi后中断可达, 此刻必须已是OS IDT) ---
+    mov rcx, [rsp+80h]              ;rcx = VCPU(栈帧代数契约: 此刻
+                                    ;rsp=Top-0x90, VCPU槽[Top-0x10]=
+                                    ;+0x80; +0x100是handler调用点
+                                    ;rsp=Top-0x110的位移, 两处rsp差
+                                    ;0x80——此处若沿用+0x100即读
+                                    ;[Top+0x70]栈顶外野页(未映射
+                                    ;系统VA)=STOP桥必#PF)
+    lidt	fword ptr [rcx+88h]        ;+0x88 RootOsIdtr伪描述符(硬契约)
     ;--- 卸载: handler已填桥(r10=VMCB.RSP, r11=VMCB.RIP推进值,
     ;    rax=VMCB.RAX)。恢复全部GPR后切guest栈跳guest RIP——
     ;    此刻物理CPU=裸机模式(不再vmrun), T_i从vmmcall(1)下一条继续 ---
@@ -260,7 +294,13 @@ CmSvmStop:
     pop r12
     pop r13
     pop r14
-    pop r15
+    pop r15                         ;16槽耗尽: rsp=Top-0x10
+    ;--- root CR3还原: VCPU槽[Top-0x10]在16 pops后幸存
+    ;    (栈底预备槽从未被pop)。先切CR3后切栈——此后VMM栈等
+    ;    root树内VA不可再访问, mov rsp/stgi/jmp取指全走OS树 ---
+    mov rcx, [rsp]                  ;rcx = VCPU
+    mov rcx, [rcx+98h]              ;rcx = 本核OS轴CR3(+0x98硬契约)
+    mov cr3, rcx
     mov rsp, r10                    ;切guest栈(桥: r10=VMCB.RSP)
     stgi                            ;GIF=1: #VMEXIT清了GIF, 裸机续跑必须
                                     ;先开中断(线程IF=1随HSAVE回读, 只欠GIF)
@@ -314,5 +354,121 @@ CmGuestResume PROC
     pop r15
     ret
 CmGuestResume ENDP
+
+;=====================================================================
+; 私有root IDT异常存根(M17-E): 32门向量0-31(门本体svm.c建)
+; 检测/鲁棒双面: root窗口异常不再经OS IDT(内核可观测路由+VMM栈
+; 上的内核异常分发=0x139类fail-fast)——全部改道SvmRootXcpt取证
+; bugcheck。GIF=0只蔽中断不蔽异常(§15.6
+; "Disables interrupts by clearing the GIF"), 异常照常向量化=
+; 本IDT到达面。门=中断门type14/DPL0/P=1/IST=0(异常时刻RSP=VMM
+; 栈=已知良栈, 无需IST切换)。
+; CPU帧两族: 无错误码向量[存根push vec]后=RIP; 有错误码向量
+; (8/10/11/12/13/14/17)后=错误码, 再=RIP——两族归一入口换算后
+; 调C取证器(四寄存器参: vec/rip/err/frame, 不归点)
+;=====================================================================
+RootXcpt0:  push 0
+            jmp RootXcptCommon
+RootXcpt1:  push 1
+            jmp RootXcptCommon
+RootXcpt2:  push 2
+            jmp RootXcptCommon
+RootXcpt3:  push 3
+            jmp RootXcptCommon
+RootXcpt4:  push 4
+            jmp RootXcptCommon
+RootXcpt5:  push 5
+            jmp RootXcptCommon
+RootXcpt6:  push 6
+            jmp RootXcptCommon
+RootXcpt7:  push 7
+            jmp RootXcptCommon
+RootXcpt8:  push 8                       ;#DF(有错误码族)
+            jmp RootXcptCommonErr
+RootXcpt9:  push 9
+            jmp RootXcptCommon
+RootXcpt10: push 10                      ;#TS(有错误码族)
+            jmp RootXcptCommonErr
+RootXcpt11: push 11                      ;#NP(有错误码族)
+            jmp RootXcptCommonErr
+RootXcpt12: push 12                      ;#SS(有错误码族)
+            jmp RootXcptCommonErr
+RootXcpt13: push 13                      ;#GP(有错误码族; M16.44主形态)
+            jmp RootXcptCommonErr
+RootXcpt14: push 14                      ;#PF(有错误码族; CR2由取证器读)
+            jmp RootXcptCommonErr
+RootXcpt15: push 15
+            jmp RootXcptCommon
+RootXcpt16: push 16
+            jmp RootXcptCommon
+RootXcpt17: push 17                      ;#AC(有错误码族)
+            jmp RootXcptCommonErr
+RootXcpt18: push 18                      ;#MC(尽力取证; 双错环境不保证)
+            jmp RootXcptCommon
+RootXcpt19: push 19
+            jmp RootXcptCommon
+RootXcpt20: push 20
+            jmp RootXcptCommon
+RootXcpt21: push 21
+            jmp RootXcptCommon
+RootXcpt22: push 22
+            jmp RootXcptCommon
+RootXcpt23: push 23
+            jmp RootXcptCommon
+RootXcpt24: push 24
+            jmp RootXcptCommon
+RootXcpt25: push 25
+            jmp RootXcptCommon
+RootXcpt26: push 26
+            jmp RootXcptCommon
+RootXcpt27: push 27
+            jmp RootXcptCommon
+RootXcpt28: push 28
+            jmp RootXcptCommon
+RootXcpt29: push 29
+            jmp RootXcptCommon
+RootXcpt30: push 30
+            jmp RootXcptCommon
+RootXcpt31: push 31
+            jmp RootXcptCommon
+
+RootXcptCommon:                          ;无错误码帧: [rsp]=RIP
+    pop rcx                              ;rcx = 向量号
+    mov rdx, [rsp]                       ;rdx = 故障RIP
+    xor r8d, r8d                         ;r8 = 错误码=0
+    jmp RootXcptGo
+RootXcptCommonErr:                       ;有错误码帧: [rsp]=错误码
+    pop rcx                              ;rcx = 向量号
+    mov r8, [rsp]                        ;r8 = CPU错误码
+    mov rdx, [rsp+8]                     ;rdx = 故障RIP
+RootXcptGo:
+    mov r9, rsp                          ;r9 = 异常帧基(取证第4参)
+    and rsp, -10h                       ;16对齐(帧指针已存r9, 下移无损)
+    sub rsp, 20h                         ;影子区(call后callee入栈%16=8)
+    call SvmRootXcpt                     ;不归点: 取证([F]入环)+停泊序列
+                                         ;(切OS轴+唤醒T1+OS IDT还原+stgi)
+    sti                                  ;OS可中断休眠(v0.10s停泊保活形态:
+                                         ;STI;HLT=标准idle对——中断唤醒→
+                                         ;OS IDT→IRET→回hlt, 时钟tick照常
+                                         ;推进=看门狗不叫, T1排水落盘窗口
+                                         ;从<100ms扩展到∞。旧cli形态=GIF=0
+                                         ;+IF=0时钟永久悬挂→100ms后他核
+                                         ;CLOCK_WATCHDOG(0x101)/IPI→INIT
+                                         ;exit→0xDEADDEAD, [F]全灭)
+RootXcptHalt:
+    hlt
+    jmp RootXcptHalt
+
+; 门目标表(svm.c建门引用; dq=存根地址, 与向量号同序)
+PUBLIC	g_svmRootStubTab
+g_svmRootStubTab LABEL QWORD
+    dq RootXcpt0, RootXcpt1, RootXcpt2, RootXcpt3
+    dq RootXcpt4, RootXcpt5, RootXcpt6, RootXcpt7
+    dq RootXcpt8, RootXcpt9, RootXcpt10, RootXcpt11
+    dq RootXcpt12, RootXcpt13, RootXcpt14, RootXcpt15
+    dq RootXcpt16, RootXcpt17, RootXcpt18, RootXcpt19
+    dq RootXcpt20, RootXcpt21, RootXcpt22, RootXcpt23
+    dq RootXcpt24, RootXcpt25, RootXcpt26, RootXcpt27
+    dq RootXcpt28, RootXcpt29, RootXcpt30, RootXcpt31
 
 END

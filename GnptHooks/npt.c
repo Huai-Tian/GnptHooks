@@ -69,6 +69,26 @@ ULONG64 SvmNptViewNcr3(ULONG View) { return g_nptTree[View & 3].Ncr3; }
 ULONG64 SvmNptCoverageBytes(VOID) { return g_nptCoverage; }
 ULONG SvmNptPageCount(VOID) { return g_nptPageCount; }
 
+//arena块枚举(root CR3树注册面): 块数=已用槽数向上取整; 块尾
+//未切槽部分OS轴未映射——注册区间含not-present洞=拷贝器跳过, 无害
+ULONG SvmNptArenaEnum(ULONG Index, PVOID* VaOut, ULONG64* LenOut)
+{
+	ULONG blocks = (g_nptArenaUsed + NPT_ARENA_SLOTS - 1) / NPT_ARENA_SLOTS;
+	if (Index >= blocks)
+	{
+		return 0;
+	}
+	if (VaOut != NULL)
+	{
+		*VaOut = g_nptArena[Index];
+	}
+	if (LenOut != NULL)
+	{
+		*LenOut = (ULONG64)NPT_ARENA_SLOTS * PAGE_SIZE;
+	}
+	return 1;
+}
+
 //覆盖范围=min(MAXPHYADDR地址空间, 512GB), 2MB对齐
 //MAXPHYADDR=CPUID Fn8000_0008 EAX[7:0]
 static ULONG64 SvmNptComputeCoverage(VOID)
@@ -485,6 +505,25 @@ BOOLEAN SvmNptConcealAll(VOID)
 			FlLog("NPT: 隐蔽登记溢出(页表页%u)", i);
 			return FALSE;
 		}
+	}
+	//登记: root CR3树页(F-c-1, M17-F私有翻译域的页表页——独立
+	//于NPT arena分配, 物理扫描可见=无归属页表页指纹)。隐蔽对
+	//root窗口零影响: root=host模式NPT不生效(树页行走器物理
+	//直访), guest模式访问其gpa才经NPT=读静默零/写执行fault→
+	//'O'兜底(与每核资源页同型同边界)。时序契约: Build先于本
+	//函数(svm.c 1549→1567)。运行期新树页由ROOTMAP原语处置体
+	//排水(svm.c), 构建期游标在此标记
+	{
+		ULONG64 rp = 0;
+		for (ULONG i = 0; SvmRootPtEnum(i, &rp); i++)
+		{
+			if (!SvmNptConcealAdd(rp))
+			{
+				FlLog("NPT: 隐蔽登记溢出(root树页%u)", i);
+				return FALSE;
+			}
+		}
+		SvmRootPtConcealMark();
 	}
 	//两树统一改译零页(P|US|A; RW=0=写fault, X=0=执行fault——
 	//两路都进'O'兜底; 读=静默零)。改译的PTE写自身会拆分出新PT页

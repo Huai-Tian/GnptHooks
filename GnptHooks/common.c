@@ -227,6 +227,20 @@ VOID FlRingPush(CHAR tag, ULONG cpu, ULONG reason, ULONG64 a, ULONG64 b, ULONG64
 	//T1的超时轮询兜底(<=250ms)
 }
 
+//T1立即唤醒(SvmRootXcpt停泊序列专用): FlRingPush自身禁KeSetEvent
+//(#VMEXIT上下文死锁纪律, 见其行尾注释)——本函数=停泊取证路径的
+//合法唤醒通道: 调用点已切OS轴(root异常处置, 非exit热路径),
+//IRQL=发起线程级(<=DISPATCH_LEVEL)合法。使命: [F]入环后立刻
+//唤醒T1排水, [F]落盘不等250ms轮询周期(停泊核看门狗窗=100ms,
+//轮询等待=取证必然竞争失败)
+VOID FlWakeT1(VOID)
+{
+	if (g_flEnabled)
+	{
+		KeSetEvent(&g_flKickT1, IO_NO_INCREMENT, FALSE);
+	}
+}
+
 //#VMEXIT统一采样: 所有exit code计数; 高频exit只采样前N条入环
 //(计数器仍精确——HB行显示全部流量)。无上限采样在风暴场景
 //=观测体系自身成为放大器

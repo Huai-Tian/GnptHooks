@@ -80,6 +80,10 @@ VOID SvmNptRestoreIdentity(ULONG View, ULONG64 Gpa);
 //零页翻译flags=P|US|A(RW=0,X=0): guest读=静默零(理想隐蔽);
 //写/执行该gpa→NPF→'O'兜底恢复该页(自愈优先)。
 BOOLEAN SvmNptConcealAll(VOID);    //登记+两树改译零页(PASSIVE)
+
+//arena块枚举(块=物理连续2MB, 页表页从中切槽): Index从0起,
+//返回0=越界, 1=该块参数已出(整块VA区间, root CR3树注册面)
+ULONG SvmNptArenaEnum(ULONG Index, PVOID* VaOut, ULONG64* LenOut);
 //诊断: 零页PA(0=未隐蔽)/登记页数/'O'恢复计数/登记页访问
 ULONG64 SvmNptHideZeroPa(VOID);
 ULONG SvmNptConcealCount(VOID);
