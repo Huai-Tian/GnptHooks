@@ -44,7 +44,7 @@ param(
     [int]$Togglers = 12,
     [ValidateSet('A','C','Full')]
     [string]$Mode = 'A',
-    [string]$ExpectTag = 'v0.9y',
+    [string]$ExpectTag = 'v0.10w',
     [string]$SvcName = 'Test'
 )
 
