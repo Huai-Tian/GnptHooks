@@ -81,7 +81,7 @@ extern volatile LONG g_gnptParkedMask;
 
 //内部vmmcall功能码总表见svm.h(已实现: STOP/KEEP/NPTSYNC/NPTSET/
 //NPTRES/MSRBIT/MEMCPY/CONCEAL/DRSET/NXREARM/ROOTMAP); 后续功能
-//预留未接线:  10=TSC校准探针(空handler)  11=时钟布防
+//预留未接线:  10=TSC校准  11=时钟布防
 
 //当前虚拟化目标核(-1=未启动), 启动循环置位, 日志心跳读它
 extern volatile LONG g_gnptVcpuCpu;
@@ -173,6 +173,8 @@ typedef struct _GNPT_RING_ENTRY
 //    任意exit消费=fence重武装)
 //  d=IOIO代答采样(rsn=0x7B, a=EXITINFO1, b=PM_TMR端口; 时钟域
 //    隐蔽载体的exit流量, 首条+每4096条)
+//  x=default防御剥位自愈采样(rsn=exit码, a=RIP, b=EXITINFO1;
+//    首条+每4096条——生产拦截位下不可达, 到达即异常态留痕)
 typedef struct _GNPT_LINE_ENTRY
 {
 	ULONG  seq;       //提交标记(=入环序号, 即最终行号-1)
@@ -276,35 +278,9 @@ extern volatile LONG64 g_flExitCounts[GNPT_EXIT_REASON_MAX];
 //结果行落盘后清0(T1热模式毫秒级落盘)
 extern volatile LONG g_flLaunchHot;
 
-//构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改
-#define GNPT_BUILD_TAG "v0.10w"
-//L系列配置二分探针(已完成使命, 保留供复验)。组表:
-//G1=异常拦截(#DB/#GP/#MC)+DR位 G2=MSRPM故事位 G3=SMI/SHUTDOWN/
-//INIT/INVLPGA/SVM族 G4=TSC补偿壳; GNPT_L3_NODEMO=1(任意组合下
-//禁demo=纯引擎纪律)
-//毕业链要点: 冻结族杀手=DR+#DB+#GP三位组合(生产已剥#GP/#MC,
-//见svm.c填充注释); 三位以下组合与电源/剂量因素均已排除归因
-//当前形态(=GNPT_BUILD_TAG): cave写入原语——锁页RW重映射
-// (MmProbeAndLockPages(IoReadAccess)只读锁定+MmMapLockedPages
-// SpecifyCache建全新RW映射, 新PTE权限由映射API决定不继承源
-// RO)。禁用组合: MmBuildMdlForNonPagedPool+MmGetSystemAddress
-// ForMdlSafe——置MDL_SOURCE_IS_NONPAGED_POOL后GetSystemAddress
-// 直接返回原VA="别名"=原地址=直写RX页(映像页非非分页池, 契约
-// 外)。CET在场平台(CR4.CET=1)WP瞬清=死路, 重映射为唯一正道。
-// 验收: 选址行段数>0+无蓝屏+demo全绿+卸载cave复原行。
-// accel -ExpectTag与GNPT_BUILD_TAG同步
-#define GNPT_L3_MINIMAL 0
-#define GNPT_L3_G2      0
-#define GNPT_L3_G4      0
-#define GNPT_L3_NODEMO  0
-#define GNPT_L3_NOLBR   0
-#define GNPT_L3_NOG1    0
-#define GNPT_L3_G1DR    0
-#define GNPT_L3_G1EXC   0
-#define GNPT_L3_G1DDB   0
-#define GNPT_L3_G1DGP   0
-#define GNPT_L3_G1DMC   0
-#define GNPT_L3_G1DDBGP 0
+//构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改;
+//accel -ExpectTag与GNPT_BUILD_TAG同步
+#define GNPT_BUILD_TAG "v0.10x"
 
 //==================== 引擎配置开关(功能语义; 历史演进见开发文档) ====================
 //TRANSPARENT模式=DR机件(DR0-3线性地址执行断点作入口陷阱, 原页恒等
@@ -316,10 +292,10 @@ extern volatile LONG g_flLaunchHot;
 //每核DPC哨兵(崩溃取证, Debug构建): 1=挂死核检测+黑匣子蓝屏留证
 #define GNPT_DPC_SENTINEL 1
 
-//接管核数: 64=全核(正式值)。部分接管仅限纯引擎诊断形态(hook布防/
-//root原语落裸核=蓝屏, 低剂量轮须零hook零MSR面); 剂量敏感平台
-//可用低剂量构建做日常观测(死亡率∝接管核数, 低剂量+高负载
-//触发器存活——平台SMI×VMRUN碰撞模型, 详见开发文档)
+//接管核数: 64=全核(正式值)。部分接管=诊断剂量形态——出货树内
+//hook安装者仅main.c的demo, 其安装带运行期全核守卫(非全核自动
+//跳过=部分接管形态自动纯引擎); 二次开发者在部分接管下安装hook
+//=裸核蓝屏风险自担(全核接管是硬约束)
 #define GNPT_TAKE_CORES 64
 
 //槽池cave刻槽强制池回退: 1=跳过cave选址, 槽一律池分配

@@ -1,4 +1,4 @@
-# README_AGENT.md — AI 协作者契约文档 (v0.10 现状)
+# README_AGENT.md — AI 协作者契约文档 (v0.10x 现状)
 
 > **本文档的读者是大语言模型 / 编码 Agent，不是人类。** 人类请阅读 [README.md](README.md) / [README_ZH.md](README_ZH.md)。
 >
@@ -56,6 +56,8 @@
 
 **当前版本 v0.10 = M17 暴露面战役毕业（root 域三件套 + 时钟域封堵）**：M0-M9 同前（引擎/双 NPT/单步/TRANSPARENT/TSC 补偿/MSR 面/自我隐蔽/三体竞态修复，v0.9y）；M10 CPUID 拦截裁决 + SSDT 终裁（425a2e8-5e1d2ae）；M11 自洽故事面 + 工件隐蔽 + API 收口 + 平台风险定案（v0.9ar, f50a881）+ 新平台双根因修复（v0.9au, ffd92b2）；M12 第二平台杀手刻画（剂量模型，v0.9az, eeadb66）；M13 CPUID 伪装转正（GNPT_CPUID_STEALTH=1 正式默认，v0.9ba）；M14 死亡四实体法证闭环（WBINVD 收口双绿，v0.9bx）；M15 DR-TRANSPARENT 转正（两视图收缩+检测面甄别+调试面四探针真机全绿，v0.9ce）；M16 暴露面收口（NX-FENCE 第三模式+DWM 崩溃族终案+cave 槽池架构毕业，v0.9cf→cq, commits 8df8003/e1cf0d7）；**M17 暴露面战役**：B=NmiVirt/PMC/IBS 侧信道硬件闭合+Zen5 合置硬门（3500227, v0.10b）；D=SVM exit 空间审计+default 剥位自愈+防御自证探针（ef109bd, v0.10c）；G+H=CodePage 安装暴露窗闭合（先蔽后写+root 代写）+全资源取证零化（2689a0f, v0.10d）；A1=时钟域封堵（PM_TMR IO 拦截+读代答虚拟时间轴补偿，guest 双时钟源互证一致，1bd6a59, v0.10h）；E=**私有 root IDT**（32 门异常向量改道取证 bugcheck，root 异常不再经 OS IDT——0x139 fail-fast 闭合，HSAVE host-IDTR 零 per-exit 成本，625f8bd, v0.10j）；F=**私有 root CR3**（root 窗口独立翻译域：OS 系统半区深拷贝快照树+CmSvmEnter 一次 mov cr3→HSAVE 每 exit 硬件恢复+STOP 桥还原+树页 PFN 入 NPT 零页隐蔽集，十三轮上机链 k→w 毕业，v0.10k→w）。**root 窗口三纪律（F 项判例结晶）见 RL-34——改 root 态代码前必背。MSR API 竞态纪律见 msr.h 使用纪律第 5 条——隐蔽在场时置读拦截的 MSR 禁止写直通，违例 = 已定罪的 0x101 三体竞态。**
 
+**v0.10x 清理轮（当前形态）**：开发期验证探针全数移除——main.c 验证矩阵（故事面/[S1]-[S6]/DbgFaith/多hook验证轮/范围外 MSR 探针/自触发线程/酷刑开关）、DEFTEST 原语（vmcall 16 全链）、CmSetTF/CmInt1/CmSvmVmmCallRaw 三 asm 助手、两个探针数据数组、GNPT_L3_\* 12 个实验配置宏（svm.c 配置矩阵塌缩回生产分支）、300ms Debug 安装步进、`#error` 部分接管编译门（改 main.c 运行期全核守卫）。main.c 重写为双构建通用简洁 demo（热靶 TRANSPARENT+本地冷靶普通模式+LSTAR MSR hook 读写双拦，非全核接管自动让路）。观测体系/引擎功能件一行未动。
+
 ---
 
 ## 2. 红线铁律（RED LINES — 绝对禁止清单）
@@ -107,7 +109,7 @@
 
 ### G. VMCALL 签名门与白名单
 
-- **RL-26** 内部 vmmcall 在 r10/r11 携带 128 位签名（`GNPT_VMMCALL_SIG0/SIG1`，common.h）。exit handler 的 VMCALL case 先校验 CPL=0 + 签名 + 功能码白名单（0x6BEE 探针 / 1 STOP / 3 KEEP / 4 NPTSYNC / 5 NPTSET / 6 NPTRES / 7 MSRBIT / 9 MEMCPY / 12 CONCEAL / 13 DRSET / 14 NXREARM / 16 DEFTEST / 17 ROOTMAP），不符 = 'u' 环留痕 + 注入 #UD（= 裸机 vmmcall 语义）。**改动签名值必须同步 common-asm.asm 的 mov 立即数**；新增功能码必须同时进白名单——静默放行未知码 = hypervisor 泄漏面。（功能码 15 MEMCPYW 已退役——CET×WP 判例，见 RL-32。）
+- **RL-26** 内部 vmmcall 在 r10/r11 携带 128 位签名（`GNPT_VMMCALL_SIG0/SIG1`，common.h）。exit handler 的 VMCALL case 先校验 CPL=0 + 签名 + 功能码白名单（0x6BEE 探针 / 1 STOP / 3 KEEP / 4 NPTSYNC / 5 NPTSET / 6 NPTRES / 7 MSRBIT / 9 MEMCPY / 12 CONCEAL / 13 DRSET / 14 NXREARM / 17 ROOTMAP），不符 = 'u' 环留痕 + 注入 #UD（= 裸机 vmmcall 语义）。**改动签名值必须同步 common-asm.asm 的 mov 立即数**；新增功能码必须同时进白名单——静默放行未知码 = hypervisor 泄漏面。（功能码 15 MEMCPYW 已退役——CET×WP 判例，见 RL-32。）
 - **RL-27** `GNPT_PROBE_MAGIC`(0x6BEE) 改动必须同步 svm-asm.asm 的 `mov rcx, 6BEEh`。
 
 ### H. 编码与构建（编译期就会咬人的）
@@ -175,8 +177,9 @@
 │                                accel_test.ps1 加速测试自动化（A/C/Full 三模式）
 │                                comment_audit.py 注释纪律审计（commit 门禁）
 └── GnptHooks/                    源码（VS 工程）
-    ├── main.c                   使用示例：DriverEntry→SvmStartAllCpus→(Debug: demo验证轮)→DriverUnload
-    │                            demo层整体 #if DBG; Release=纯引擎生命周期
+    ├── main.c                   使用示例：DriverEntry→SvmStartAllCpus→demo hook安装→DriverUnload
+    │                            demo双构建通用（热靶TRANSPARENT+本地冷靶普通模式+
+    │                            LSTAR MSR hook读写双拦; 非全核接管=运行期守卫自动让路）
     ├── svm.c/.h                 SVM 核心：三态检测/资源分配/VMCB 填充(含故事面MSRPM布防)/
     │                            exit 分发(0x20-3F MOV DR影子/0x7C含范围外MSR注入#GP/0x400/0x41/
     │                            0x4D/0x62/0x63/0x72/0x7B PM_TMR代答/0x80-86)/生命周期
@@ -214,8 +217,8 @@ DriverEntry(main.c)
     →逐核发起线程→CmSvmEnter(mov cr3切root轴)→vmrun
     →CmGuestProbe自证('W')→KEEP('Q')→停泊(中断直通)
     →接管完成后空区间ROOTMAP纯排水(KPCR补注册树页隐蔽'r')
-  → (Debug demo) GnptHookInstall: TRANSPARENT→DR路径(DR槽+全核武装'g'×N)
-    /普通模式→LDE重定位跳板(回扫自检)→跳板槽→CodePage
+  → DemoHookInstall(main.c): 全核守卫→热靶TRANSPARENT→DR路径(DR槽+全核武装'g'×N)
+    /本地冷靶→LDE重定位跳板(回扫自检)→跳板槽→CodePage
     →两视图PTE布防(P=Nx/HOOKS=CodePage)→HookSyncAllCpus('i'×N)
     →新页注册经SvmRootMapVa=ROOTMAP原语('r'×N: 树PTE填写+新树页隐蔽排水)
 
@@ -243,7 +246,7 @@ hook 命中（NX-FENCE: 每调用2 exit, 两视图零工件）:
   (Install日志"cave槽"行; 池回退=GNPT_SLOT_FORCE_POOL=1时才出现)
   卸载teardown: cave槽源字节精确复原+池槽释放(账目行核对)
 
-卸载(DriverUnload): (Debug: demo收尾)→GnptHookRemoveAll(Remove OK+'i'×N)
+卸载(DriverUnload): DemoHookShutdown(显式移除)→GnptHookRemoveAll(Remove OK+'i'×N)
   →SvmShutdownAllCpus(STOP桥'S'×N, SVME回读=0)→TRUE→GnptHookFreeMemory
 ```
 
@@ -341,9 +344,9 @@ GnptHookRemove(hook.Target);            // PASSIVE_LEVEL
 | 12 | CONCEAL（运行期工件隐蔽） | 身份 PTE 两视图改译零页+登记表 |
 | 13 | DRSET（DR-TRANSPARENT 武装/解除） | 'g' 环逐核留痕, guest 优先租用制 |
 | 14 | NXREARM（NX-Fence detour 收尾） | stub 尾自发, 在途旗清+视图回 P('r' 留痕) |
-| 16 | DEFTEST（防御自证探针） | 置 RDTSC 拦截位制造向量异常→default 剥位自愈全链验证('x' 留痕) |
 | 17 | ROOTMAP（root 树 VA 注册） | rdx=va r8=len→切轴壳内 SvmRootMapRange(填树PTE+可分配新树页)+新树页隐蔽排水('r' rsn=17 留痕); rax=1/0 |
 | ~~15~~ | ~~MEMCPYW（WP 瞬清写入）~~ **已退役** | CET×WP 互锁判例（RL-32）；替代=锁页 RW 重映射（RL-33） |
+| ~~16~~ | ~~DEFTEST（防御自证探针）~~ **已退役** | 开发期验证探针已随清理轮移除；default 剥位自愈本体在位（'x' 留痕），需复验时从 git 历史取回 |
 
 **新增功能码时**：白名单 + 签名门 + 'u' 拒绝语义三处同步（RL-26）。
 
@@ -403,7 +406,8 @@ f=DR hook探测期让位(rsn=1 guest单步中BP命中fail-open/2槽被guest占�
   3 guest断点同场冲突; 让位审计面)
 J=安装/移除阶段面包屑(cpu=阶段号, rsn=阶段号) j=全核同步DPC跳过(非in-guest核留痕)
 d=IOIO代答采样(rsn=0x7B, a=EXITINFO1, b=PM_TMR端口; 时钟域隐蔽载体流量)
-x=防御自证原语(rsn=DEFTEST, a=InterceptMisc1; 'F'档位x=风暴转储)
+x=default防御剥位自愈采样(rsn=exit码, a=RIP, b=EXITINFO1; 生产拦截位下
+  不可达, 到达即异常态留痕)
 ```
 
 触发链面包屑顺序：`i`(布防)→`V`(首切)→`H`(分发)→`h`(回调)→`O`(CallOriginal)；NX-FENCE 链：`k`(入口改道)→`H`→`h`→`r`(rearm)/`A`(信标)。
@@ -438,16 +442,16 @@ Debug 构建双自旋看门狗线程（纯 rdtsc 计时）：行环游标 30s �
 
 - VS2022 + WDK，x64，工程在 `GnptHooks/`（.sln/.vcxproj）。
 - **Debug 构建（DBG=1）= 完整观测**：T1 写 `C:\Windows\Temp\gnpt_log.txt`（权威）+ T2 Desktop 镜像（`C:\Users\Public\Desktop\gnpt_log.txt`——通用路径，与登录用户名无关）+ 二进制环 + 看门狗黑匣子。开发/排障一律用它。
-- **Release 构建（DBG=0）= 零日志代码进产物**（Fl\* 全部空操作宏）。交付形态。
+- **Release 构建（DBG=0）= 零日志代码进产物**（Fl\* 全部空操作宏）。交付形态。demo 不区分构建形态：两种构建都安装同样的演示 hook（Release 下日志行为空操作，hook 行为完全一致）。
 - inf2cat 已在 Debug/Release 双配置关闭（EnableInf2cat=false）。
 
 ### 10.2 上机判据序列（Debug 构建，每次改动后全过一遍）
 
 1. **横幅**：日志第一行 `vXXX` 与源码 GNPT_BUILD_TAG 一致（防旧二进制）；CET 行 `CR4=... CET(bit23)=...` 如实报告（CET=1 = shadow stack 在位 = CR0.WP 不可清，RL-32 平台判据）。
 2. **接管**：每核 `接管(vmrun循环就绪)` → `已guest化(KEEP确认)` × 全核 → `全核接管完成`；'W'/'Q' 每核齐。
-3. **hook 安装**：`[Hook] Install OK`（目标/回调/槽/重定位跳板/CodePage 全要素）+ cave 选址行（段数/字节数；"cave槽N"=映像内选址命中, "池回退"仅 GNPT_SLOT_FORCE_POOL=1 时合法）→ 'i' × 核数（布防同步确认）。
-4. **触发**：开关任意程序 → 'V'（首切）→ 'H'/'h'/'O' 推进；HB 行 r400 = 核数且**恒定**；r81 账目精确。TRANSPARENT 目标另查：'s'(rsn=3)/'e' 推进正常；泄漏面包屑 'L'/'D' 允许少量（每秒成百 = 异常须报告）；r70/r41 ≈ 0.1（0.8 = 泄漏风暴形态）。NX-FENCE 目标另查：'k'→'r' 链闭合、'A' 信标偶发（每秒成百 = fence 页过热/邻函数密集）。**root 域判据（v0.10+）**：`root CR3: 私有翻译域(N页)在位` 横幅 + 'r'(rsn=17) ROOTMAP 注册流量全 c=1（KPCR 排水+跳板+CodePage）+ 'o'=0（树页/隐蔽页零击穿）+ 范围外 MSR 探针行 `[Demo] 范围外MSR读#GP: 注入回guest=裸机等价(活)`（demo 层，Debug 构建）+ 'm' 环 b>=2 形态恰一条。
-5. **卸载**：计数留痕 → Remove OK + 'i'×N → Remove 后新 'h' 即刻停止 → 'S'×N（SVME 回读=0）→ 泄漏掩码 0 → NPT 释放页数账目 → 槽池 teardown 行（cave槽N已复原+池槽M已释放, N+M=安装槽总数）→ FreeMemory → 完成。
+3. **hook 安装**：`[Demo]` 三行安装 OK（热靶 TRANSPARENT / 本地冷靶普通模式 / LSTAR MSR）+ 冷靶自调行（返回值=直算值）+ `[Hook] Install OK` 全要素 + cave 选址行（段数/字节数；"cave槽N"=映像内选址命中, "池回退"仅 GNPT_SLOT_FORCE_POOL=1 时合法）→ 'i' × 核数（布防同步确认）→ 'g' 环（DR 全核武装）。
+4. **触发**：开关任意程序 → 'V'（首切）→ 'H'/'h'/'O' 推进；HB 行 r400 = 核数且**恒定**；r81 账目精确。TRANSPARENT 目标另查：'y'（DR 断点改道）推进正常、r41 随自然流量增长；泄漏面包屑 'L'/'D' 允许少量（每秒成百 = 异常须报告）。NX-FENCE 目标另查：'k'→'r' 链闭合、'A' 信标偶发（每秒成百 = fence 页过热/邻函数密集）。**root 域判据（v0.10+）**：`root CR3: 私有翻译域(N页)在位` 横幅 + 'r'(rsn=17) ROOTMAP 注册流量全 c=1（KPCR 排水+跳板+CodePage）+ 'o'=0（树页/隐蔽页零击穿）。
+5. **卸载**：`[Demo]` 显式移除（MSR/冷靶/热靶）→ Remove OK + 'i'×N → Remove 后新 'h' 即刻停止 → 'S'×N（SVME 回读=0）→ 泄漏掩码 0 → NPT 释放页数账目 → 槽池 teardown 行（cave槽N已复原+池槽M已释放, N+M=安装槽总数）→ FreeMemory → 完成。
 6. **Release 崩溃无环**：任何 Release 构建的崩溃，先换 Debug 构建复现再判读。
 
 ### 10.3 崩溃取证
@@ -482,7 +486,7 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | **加载窗单发 dwm.exe 0x8898009b（Application Error 1000, 黑屏<1s 自愈），轮内零事件** | **M12 衰减态第三形态·轻度（M16.47 定谳）**：平台冷却不足（≤~1h）时全核接管的瞬态负载令 DWM（最敏感常驻 GPU 客户端）单发自愈；冷却 ≥103min = 零事件（七数据点冷却模型） | 与软件全无关（v0.9ck 时代已现；崩点零 hook）；操作纪律：短间隔复测的加载窗单发黑屏=预期信号，记录时刻即可不中止判读；完整冷却（≥2h/隔夜）冷启首测=模型正预测验证 |
 | **0xE17 自定义 bugcheck（STOP 桥帧代数错误形态）** | root IDT 取证 bugcheck 首战自捕：CmSvmStop 帧内 `mov rcx,[rsp+100h]` 应为 `[rsp+80h]`（两个 rsp 陷阱：vmmcall 帧与 exit 帧基不同）→ 卸载 STOP 桥确定性蓝屏 0xE17 | root IDT 的 32 门取证把"无声死"变成"带 dump 可分析崩溃"——自研缺陷照样自捕，这正是它的使命（M17-E 判例） |
 | **黑屏无蓝屏无 dump、事件查看器零事件、日志戛然而止（[F] 行缺席或滞后）** | **root 窗口缺映射三重故障**：root CR3 树外页取指 #PF → 递归 #PF → #DF → 三重故障核死透（取证器自身在 root 轴上调 ntoskrnl 函数/直读 guest VA 均可触发） | root 窗口三纪律（RL-34）；停泊保活（OS 可中断休眠）把 [F] 落盘窗口从 <100ms 扩到 ∞——先保取证通道，再按 [F] 的 CR2/err 定罪缺映射点（M17-F 判例链） |
-| **guest 探测器读非法 MSR 号（如 0x2000）→ 整核停泊 + 卸载拒绝** | 范围外 MSR 直通雷：MSRPM 三区外号必 exit（APM §15.11），未 hook 直通 `__readmsr` = root 轴非法号 #GP → root IDT 停泊 = guest 可触发的引擎灭活开关 | RL-35：GnptMsrLocate 判定失败 → 注入 #GP(0) 回 guest（裸机等价）；判据='m' 环 b>=2 形态 + demo 探针 `__except` 捕获行（v0.10w 判例） |
+| **guest 探测器读非法 MSR 号（如 0x2000）→ 整核停泊 + 卸载拒绝** | 范围外 MSR 直通雷：MSRPM 三区外号必 exit（APM §15.11），未 hook 直通 `__readmsr` = root 轴非法号 #GP → root IDT 停泊 = guest 可触发的引擎灭活开关 | RL-35：GnptMsrLocate 判定失败 → 注入 #GP(0) 回 guest（裸机等价）；判据='m' 环 b>=2 形态（范围外号注入 #GP 的留痕形态） |
 
 ---
 

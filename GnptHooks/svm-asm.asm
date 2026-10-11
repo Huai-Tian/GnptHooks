@@ -80,23 +80,6 @@ CmGetRflags PROC
     ret
 CmGetRflags ENDP
 
-;----- RFLAGS.TF置位(调试忠实性探针用; x64无MSVC intrinsic) -----
-;陷阱自动清TF=单步恰一条指令(架构语义), 无递归风险
-CmSetTF PROC
-    pushfq
-    or byte ptr [rsp+1], 1           ;RFLAGS bit8(TF)=第2字节bit0
-    popfq
-    ret
-CmSetTF ENDP
-
-;----- INT1软件陷阱(调试忠实性探针用; x64无MSVC intrinsic) -----
-;vector 1软件中断: DR6零位设置(trap类, RIP=指令后)——#DB路由
-;残余路径的int1甄别/忠实投递的验证载体(SEH捕获STATUS_SINGLE_STEP)
-CmInt1 PROC
-    int 1
-    ret
-CmInt1 ENDP
-
 ;----- IDTR装载(停泊序列用; x64无MSVC intrinsic) -----
 ; rcx=伪描述符地址(u16 limit+u64 base, VCPU.RootOsIdtr内存形态)
 CmLidt PROC
@@ -306,14 +289,6 @@ CmSvmStop:
                                     ;先开中断(线程IF=1随HSAVE回读, 只欠GIF)
     jmp r11                         ;裸机模式继续guest代码(桥: r11=推进后RIP)
 CmSvmEnter ENDP
-
-;----- 裸vmmcall探针: r10/r11不置签名→exit handler签名门判外来
-; →'u'留痕+#UD注入=裸机#UD语义的执行级自证。
-; x64无MSVC intrinsic(0F 01 D9), asm实现; 破坏性零(拦截位/签名门双保险)
-CmSvmVmmCallRaw PROC
-    vmmcall
-    ret
-CmSvmVmmCallRaw ENDP
 
 ;----- 落地探针: VMCB.RIP首指处。vmrun后guest执行的第一段代码。
 ;全程不碰RSP(探针栈=CmSvmEnter保存的T_i现场), 不依赖GPR语义

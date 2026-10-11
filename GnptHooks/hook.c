@@ -1555,21 +1555,6 @@ static VOID HookStage(ULONG Stage)
 #define HKST_RM_DONE      36
 #define HKST_FAIL         99
 
-//安装阶段步进(诊断, 仅Debug构建驻留一拍): 每阶段的[HB]st=行落盘
-//——若再冻结, 冻结前的最后心跳行即冻结阶段(证据在盘不在内存)。
-//发布先行(见Install)使步进窗口内fault皆有进展, 步进本身安全。
-//Release构建仅记阶段号不睡(安装全速)
-#define GNPT_HOOK_STEP_MS  300
-static VOID HookStagePaced(ULONG Stage)
-{
-	HookStage(Stage);
-#if DBG
-	LARGE_INTEGER w;
-	w.QuadPart = -(LONGLONG)GNPT_HOOK_STEP_MS * 10000LL;
-	KeDelayExecutionThread(KernelMode, FALSE, &w);
-#endif
-}
-
 //TRANSPARENT安装的DR路径(GnptHookInstall早期分流): 无CodePage/
 //无NPT布防/无工件隐蔽/无热探测——仅DR槽+重定位跳板+跳板槽+全核
 //武装。原页零接触=读/写透明结构性成立
@@ -2068,7 +2053,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 	{
 		return HookNxFenceInstall(Hook);
 	}
-	HookStagePaced(HKST_INS_ENTRY);
+	HookStage(HKST_INS_ENTRY);
 	if (Hook->StackArgs > GNPT_MAX_STACK_ARGS)
 	{
 		FlLog("[Hook] Install拒绝: StackArgs=%u超上限%u(目标%p)",
@@ -2216,7 +2201,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 			return STATUS_UNSUCCESSFUL;
 		}
 	}
-	HookStagePaced(HKST_INS_CPALLOC);
+	HookStage(HKST_INS_CPALLOC);
 	//root原语前置: 钉到虚拟化核集(SMT隔离下裸机兄弟核
 	//vmmcall=#UD→0x7E); 完事还原亲和
 	KAFFINITY oldAff = SvmPinVirtualizedCpus();
@@ -2229,14 +2214,14 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 		FlLog("[Hook] Install失败: 引擎未起(无虚拟化核)");
 		return STATUS_NOT_SUPPORTED;
 	}
-	HookStagePaced(HKST_INS_PIN);
+	HookStage(HKST_INS_PIN);
 	//发布先行: live++置于首个树写之前。引擎不变量"树内NX=>
 	//live>0"——live==0时P态取指fault走零进展分支(冲净不切视图
 	//不推RIP), 布防后热页fault即核级陷阱(热Ke*页千次/秒, 窗口
 	//毫秒级必中); 发布后窗口内一切fault走正常引擎路径(有进展)。
 	//失败回滚路径以Removed CAS对称递减
 	InterlockedIncrement(&g_hookLive);
-	HookStagePaced(HKST_INS_LIVE);
+	HookStage(HKST_INS_LIVE);
 	//工件隐蔽先行(root原语, 挂靠自我隐蔽登记表): 身份PTE两视图
 	//改译零页+登记游标排水。先蔽后写=14B补丁自写入时刻起对guest
 	//不可读——旧序"先写后蔽"存在补丁直写→conceal间物理扫描可
@@ -2251,7 +2236,7 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 		//隐蔽改译即刻全核生效: 零页改译也是PTE组写, 写完即同步,
 		//不留步进级窗口
 		HookSyncAllCpus();
-		HookStagePaced(HKST_INS_CONCEAL);
+		HookStage(HKST_INS_CONCEAL);
 		if (ok)
 		{
 			//14B补丁写入=root拷贝原语代写: 隐蔽页guest态写=fault,
@@ -2285,19 +2270,19 @@ NTSTATUS GnptHookInstall(const GNPT_HOOK* Hook)
 		//(软件侧任何可达状态均不可推导)。窗口压缩到IPI广播延迟(~百μs)
 		//后, 混合态不再可观察
 		HookSyncAllCpus();
-		HookStagePaced(HKST_INS_ARMED);
+		HookStage(HKST_INS_ARMED);
 		if (hidden)
 		{
 			//布防拆分新增页表页排水(幂等调用: 已登记→跳过改译,
 			//仅排水登记+改译新增页表页)+全核生效
 			ok = (CmVmmCall(GNPT_VMCALL_CONCEAL, e->CodePagePa, 0, 0) != 0);
 			HookSyncAllCpus();
-			HookStagePaced(HKST_INS_SYNC1);
+			HookStage(HKST_INS_SYNC1);
 			if (ok)
 			{
 				//布防+隐蔽一次同步覆盖, 而后guest态读自证
 				ok = (*(volatile ULONG64*)(e->CodePageVa + off) == 0);
-				HookStagePaced(HKST_INS_SELFCHK);
+				HookStage(HKST_INS_SELFCHK);
 				if (ok)
 				{
 					FlLog("[Hook] CodePage隐蔽自证: 读=0(零页翻译, 工件物理不可见)");

@@ -203,9 +203,7 @@ typedef struct _GNPT_VCPU_SVM
 extern GNPT_VCPU_SVM g_svmVcpu[64];
 extern volatile ULONG g_svmVcpuCount;   //虚拟化核数(0=引擎未起; =实际接管数, 诊断旋钮见GNPT_TAKE_CORES)
 extern volatile LONG64 g_svmLastExitTsc[64];   //停泊哨兵: 各核最后#VMEXIT的TSC(Debug构建HB心跳检停泊)
-extern volatile LONG64 g_svmB8Landed[64];      //各核launch定格的0xB8形态(FillVmcb裸机登记, 阶梯回退更新; 探针读此纯全局勿读VMCB——自我隐蔽下guest读VMCB=零页)
-extern volatile LONG64 g_svmDefHeal[64];       //异常exit防御自愈登记: 各核最后剥位自愈的exit码+1(0=无; exit处置(GIF=0)写, 自证探针只读——同上勿读VMCB)
-extern volatile ULONG g_svmPmTimerPort;        //PM_TMR IO端口(FADT枚举, 0=缺席=时钟域降级直通; demo探针读)
+extern volatile ULONG g_svmPmTimerPort;        //PM_TMR IO端口(FADT枚举, 0=缺席=时钟域降级直通)
 extern volatile ULONG64 g_svmTscHz;            //TSC标称频率(CPUID 0x15/0x16探测, 0=缺席=补偿降级为物理真值)
 
 //私有root IDT(M17-E): 32门异常向量表, root窗口异常不再经OS IDT
@@ -251,18 +249,12 @@ ULONG CmGetGdtLimit(VOID);
 ULONG64 CmGetIdtBase(VOID);     //sidt
 ULONG CmGetIdtLimit(VOID);
 ULONG64 CmGetRflags(VOID);     //pushfq全宽读取(VMCB.Rflags源; MSVC无x64对应intrinsics)
-VOID CmSetTF(VOID);            //置RFLAGS.TF(调试忠实性探针用; 单步陷阱自动清TF)
-VOID CmInt1(VOID);             //INT1软件陷阱(调试忠实性探针用; DR6零位=#DB残余路径甄别载体)
 VOID CmLidt(PVOID Idtr);       //IDTR装载(停泊序列: 本核OS IDT还原; x64无MSVC intrinsic)
 //段attrib(12位=描述符55:52|47:40拼接, APM §15.5.1)由C侧直读GDT描述符
 //(svm.c: SvmGetSegAttrib)
 
 //世界开关(svm-asm.asm): 见文件头注释
 VOID CmSvmEnter(PGNPT_VCPU_SVM Vcpu);   //发起接管; 返回=本核已guest化
-//裸vmmcall探针(svm-asm.asm): r10/r11无签名→签名门'u'+#UD=裸机#UD
-//语义的执行级自证(故事面探针专用; x64无MSVC intrinsic 0F 01 D9,
-//故asm实现)
-VOID CmSvmVmmCallRaw(VOID);
 ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
 //返回0=重入guest; 非0=STOP(卸载: 桥值已填GUEST_REGS)
 
@@ -304,10 +296,6 @@ ULONG SvmExitHandler(PGNPT_VCPU_SVM Vcpu, PGUEST_REGS Regs);
                                // rax=1成功/0拒绝)。树页隐蔽后guest态
                                // 直写树页=NPT零页写fault('O'兜底恢复
                                // 恒等=隐蔽被击穿), 故注册全走本原语
-#define GNPT_VMCALL_DEFTEST 16 //防御自证原语(demo探针专用): 置位
-                               // 本核RDTSC拦截位=制造拦截向量异常
-                               // +自愈登记清零→guest首条rdtsc exit
-                               // 走default剥位自愈(处置见svm.c)
 
 //SVM可用性三态判定(APM §15.4):
 //  0=SVM可用  1=CPU不支持  2=BIOS禁用且不可解锁(SVMDIS=1且SVML=0)
