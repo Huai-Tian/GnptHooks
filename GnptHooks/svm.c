@@ -13,6 +13,10 @@ volatile ULONG g_svmStgiPass = 0;      //STGI直通门控(启动时按CPUID定, 
 volatile ULONG g_svmTscDlMode = 0;     //0x6E0轴换算门控(启动时裸机探测LAPIC模式定, 见SvmStartAllCpus)
 KEVENT g_svmShutdownEvent;             //卸载广播(通知事件: 一次唤醒全部发起线程)
 static ULONG64 g_svmNcr3 = 0;          //P视图NCR3(SvmBuildNptViews返回; 其余视图经SvmNptViewNcr3)
+//泄漏核累计掩码(SvmStopAndFree置位, 跨Start回滚/Unload两路径累积):
+//非零=任一核仍guest化引用NPT/root翻译域——任何共享页表释放路径
+//(含零接管对照分支)必须先查此位, 非零即整体保留(蓝屏防线)
+static volatile ULONG g_svmLeakedMask = 0;
 //NPF风暴探针(仅Debug构建读写): 引擎不可恢复NPF的取证面
 //(单发全档转储后静音)
 static volatile ULONG64 g_nStormGpa[64];  //各核最后不可恢复NPF的gpa
@@ -457,7 +461,11 @@ static VOID SvmVcpuThread(PVOID Context)
 //==================== 停机+释放(start回滚与卸载共用) ====================
 //顺序: 广播事件->逐核有界等待(5s/核)->全核裸机后释放->清零。
 //超时核: 资源保留(该核可能仍guest化, 释放=蓝屏; 泄漏是安全降级)
-static VOID SvmStopAndFree(ULONG n, const char* why)
+//返回: 泄漏核掩码(位i=核i线程超时未退出, 资源已隔离但核仍guest化
+//且仍引用NPT/root翻译域)——调用方据此决定是否释放共享页表。
+//Start回滚路径: NPT由失败返回后的整体回滚处理, 掩码仅日志;
+//Unload路径: 掩码非零=NPT/root树一并保留(泄漏是安全降级)。
+static ULONG SvmStopAndFree(ULONG n, const char* why)
 {
 	ULONG leaked = 0;
 	KeSetEvent(&g_svmShutdownEvent, IO_NO_INCREMENT, FALSE);
@@ -520,6 +528,8 @@ static VOID SvmStopAndFree(ULONG n, const char* why)
 	FlLog("%s: S1#GP手术: 族转换#UD=%lld 忠实回注=%lld(0x4D exit总账见r4D)",
 		why, g_svmGpUdConv, g_svmGpReinj);
 	FlLog("%s: 完成(泄漏核掩码=%X)", why, leaked);
+	g_svmLeakedMask |= leaked;    //跨路径累积: 零接管对照分支的释放门
+	return leaked;
 }
 
 //==================== 生命周期 ====================
@@ -1497,8 +1507,17 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 	}
 	//从未启动(或已回滚): 无线程可退; 零接管对照轮(TAKE_CORES=0)
 	//仍有NPT树在位, 单独释放(零核曾VMRUN, 无引用=安全)
+	//——例外: Start回滚若留下泄漏核(线程5s超时, 核仍guest化),
+	//ThreadObj已被置NULL走进本分支, 但NPT/root树仍被该核引用
+	//→释放=同Unload路径的IPI死等蓝屏。g_svmLeakedMask门控。
 	if (g_svmVcpu[0].ThreadObj == NULL)
 	{
+		if (g_svmLeakedMask != 0)
+		{
+			g_gnptVcpuCpu = -1;
+			FlLog("[Unload] 泄漏核掩码=%X(Start回滚遗留): NPT/root树保留", g_svmLeakedMask);
+			return FALSE;
+		}
 		if (g_svmNcr3 != 0)
 		{
 			ULONG nptPages = SvmNptPageCount();
@@ -1510,7 +1529,22 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 		FlLog("[Unload] 引擎未在位, 空卸载");
 		return TRUE;
 	}
-	SvmStopAndFree(n, "[Unload]");
+	ULONG leakedMask = SvmStopAndFree(n, "[Unload]");
+	if (leakedMask != 0)
+	{
+		//泄漏核仍在guest模式引用NPT翻译域(以及可能的HOOKS视图/
+		//CodePage)——共享页表释放=泄漏核脚下大陆被抽走+全局
+		//TLB-flush IPI死等该核应答(实测: 单核挂死升级为整机
+		//0x101 CLOCK_WATCHDOG_TIMEOUT的路径)。
+		//正确降级(对齐park守卫形态): NPT/root树/全部单核资源
+		//一并永久保留——泄漏是安全降级, 蓝屏不是。
+		//代价: 下次重新加载=新的NPT树, 本轮树成死页(池内
+		//无主, 无人再引用外的路径); sc stop正常返回, 其余核
+		//健康, 黑匣子可正常取走, 系统可继续运行/正常关机。
+		g_gnptVcpuCpu = -1;
+		FlLog("[Unload] 泄漏核掩码=%X: NPT/root树保留(单核挂死不升级为整机失效)", leakedMask);
+		return FALSE;    //main.c: if(SvmShutdownAllCpus()) GnptHookFreeMemory() 自动跳过
+	}
 	//NPT页表释放(全核已裸机, 页表无人引用)
 	FlLog("NPT: 释放(%u页, 曾覆盖%lluGB)",
 		SvmNptPageCount(), SvmNptCoverageBytes() >> 30);
