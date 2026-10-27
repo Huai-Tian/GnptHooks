@@ -1,4 +1,4 @@
-# README_AGENT.md — AI 协作者契约文档 (v0.10x 现状)
+# README_AGENT.md — AI 协作者契约文档 (v0.10x 现状, 含缺陷终修轮 fe94f3c→29fd331)
 
 > **本文档的读者是大语言模型 / 编码 Agent，不是人类。** 人类请阅读 [README.md](README.md) / [README_ZH.md](README_ZH.md)。
 >
@@ -57,6 +57,15 @@
 **当前版本 v0.10 = M17 暴露面战役毕业（root 域三件套 + 时钟域封堵）**：M0-M9 同前（引擎/双 NPT/单步/TRANSPARENT/TSC 补偿/MSR 面/自我隐蔽/三体竞态修复，v0.9y）；M10 CPUID 拦截裁决 + SSDT 终裁（425a2e8-5e1d2ae）；M11 自洽故事面 + 工件隐蔽 + API 收口 + 平台风险定案（v0.9ar, f50a881）+ 新平台双根因修复（v0.9au, ffd92b2）；M12 第二平台杀手刻画（剂量模型，v0.9az, eeadb66）；M13 CPUID 伪装转正（GNPT_CPUID_STEALTH=1 正式默认，v0.9ba）；M14 死亡四实体法证闭环（WBINVD 收口双绿，v0.9bx）；M15 DR-TRANSPARENT 转正（两视图收缩+检测面甄别+调试面四探针真机全绿，v0.9ce）；M16 暴露面收口（NX-FENCE 第三模式+DWM 崩溃族终案+cave 槽池架构毕业，v0.9cf→cq, commits 8df8003/e1cf0d7）；**M17 暴露面战役**：B=NmiVirt/PMC/IBS 侧信道硬件闭合+Zen5 合置硬门（3500227, v0.10b）；D=SVM exit 空间审计+default 剥位自愈+防御自证探针（ef109bd, v0.10c）；G+H=CodePage 安装暴露窗闭合（先蔽后写+root 代写）+全资源取证零化（2689a0f, v0.10d）；A1=时钟域封堵（PM_TMR IO 拦截+读代答虚拟时间轴补偿，guest 双时钟源互证一致，1bd6a59, v0.10h）；E=**私有 root IDT**（32 门异常向量改道取证 bugcheck，root 异常不再经 OS IDT——0x139 fail-fast 闭合，HSAVE host-IDTR 零 per-exit 成本，625f8bd, v0.10j）；F=**私有 root CR3**（root 窗口独立翻译域：OS 系统半区深拷贝快照树+CmSvmEnter 一次 mov cr3→HSAVE 每 exit 硬件恢复+STOP 桥还原+树页 PFN 入 NPT 零页隐蔽集，十三轮上机链 k→w 毕业，v0.10k→w）。**root 窗口三纪律（F 项判例结晶）见 RL-34——改 root 态代码前必背。MSR API 竞态纪律见 msr.h 使用纪律第 5 条——隐蔽在场时置读拦截的 MSR 禁止写直通，违例 = 已定罪的 0x101 三体竞态。**
 
 **v0.10x 清理轮（当前形态）**：开发期验证探针全数移除——main.c 验证矩阵（故事面/[S1]-[S6]/DbgFaith/多hook验证轮/范围外 MSR 探针/自触发线程/酷刑开关）、DEFTEST 原语（vmcall 16 全链）、CmSetTF/CmInt1/CmSvmVmmCallRaw 三 asm 助手、两个探针数据数组、GNPT_L3_\* 12 个实验配置宏（svm.c 配置矩阵塌缩回生产分支）、300ms Debug 安装步进、`#error` 部分接管编译门（改 main.c 运行期全核守卫）。main.c 重写为双构建通用简洁 demo（热靶 TRANSPARENT+本地冷靶普通模式+LSTAR MSR hook 读写双拦，非全核接管自动让路）。观测体系/引擎功能件一行未动。
+
+**缺陷终修轮（2026-10-26/28, 提交 fe94f3c→29fd331, 论文实验期定案）**：
+- **缺陷 A（fe94f3c）**：泄漏核门控——VMRUN 失败核进入泄漏路径的掩码缺陷，已修复验证。
+- **缺陷 B 终修（29fd331）**：HOOK_TRANSPARENT 改道后**补置 RFLAGS.RF**——改道为 fault 语义（RIP=入口未执行，无 IRET 置 RF 机会），重执行将再触发 DR0 执行断点 = exit 死循环（判例: 单核 6.8 万轮舞步，[o] 尾跳/槽位账目全对而循环不止 = 唯一残留解释）。RF 只压制指令断点一条指令，改道落点=槽码首指令（槽区无断点）= 压制无副作用；槽码尾 jmp 后的正常取指恢复断点监视。
+- **fence 邻函数乒乓误报修复（29fd331）**：页级 NX 连坐切 HOOKS 时邻函数驻留 = 合法稳态（同 gpa 高频 fault），'X' 簿记复位对齐 fence 入口路径防误触（判例 2026-10-27: 12 核各 64 连环全是邻函数乒乓，无一真环路）。
+- **B/C/D 判例归档**：NX-FENCE 冷靶布驱动自身 .text 页（与热靶回调同页）时 beacon 乒乓以全系统流量卷入，12s/31s/612s 三轮随机 bugcheck（3/3 复现），对照基线小时级稳定 = fence 页含高频代码为禁区，恢复审计基线（普通模式）。使用纪律 9 安装门（fence-fence 同页校验）未覆盖此形态——**fence 页与任何高频代码（含本驱动回调）同页 = 安装即应拒绝**。
+- 定案插桩（[Z]/[o]/[z]/[R]/CONCEAL 面包屑族）全数移除，均 Debug-only 已完成使命。
+
+**论文实验配套状态（2026-10-28 采集收官）**：读差分 12/12 PASS（被钩热靶逐字节==磁盘）、id/dbg 全 PASS、同机三态开销（bare/fw/vm）、Release fresh 3h 满驻+干净卸载、ctxsw 剂量阈值边界（三形态对照）。已知运行时边界：M12.3 家族（IPI/DPC 断流，多会话判例链，Debug 哨兵可定位/Release 哑死）——修复方向 = svm.c 中断/事件注入路径（V_IRQ/VINTR/GIF 语义）审计，单独立项。
 
 ---
 
@@ -133,6 +142,8 @@
   切轴对是幂等直通（root 域缺席=诊断形态当前即 OS 轴）；**不切回 = 下轮 exit 恢复 OS 轴 = 纪律破**。
 - **RL-35** **0x7C 的范围外 MSR 号必须注入 #GP(0)，绝不直通 `__readmsr`/`__writemsr`**。MSRPM 只覆盖三区（0000_0000-1FFF / C000_0000-1FFF / C001_0000-1FFF，APM §15.11 Table 15-8），MSR_PROT 在场时范围外号 "automatically cause an intercept" 且**先于** unimplemented MSR #GP 检查——裸机该访问 = guest 自身 #GP；引擎下若直通 = root 轴非法号 #GP → root IDT 停泊 = **guest 可触发的引擎灭活开关**。正确处置 = `GnptMsrLocate` 判定失败 → EVENTINJ 注入 #GP(0) 回 guest（§15.20 注入不经拦截检查，不再 exit）。`[判例: 范围外 MSR 直通雷，v0.10w 修复]`
 - **RL-36** **树页（g_svmRootPtVa[]）对 guest 的隐蔽是注册面安全前提**：树页 PFN 已入 NPT 零页隐蔽集（读=静默零/写=fault→'O' 兜底），因此**运行期注册新 VA 进 root 树必须走 ROOTMAP 原语（vmcall 17，OS 轴内填树 PTE+新树页排水隐蔽）**——guest 态直写树页 = NPT 零页写 fault，'O' 兜底恢复恒等 = 隐蔽被安装流击穿。构建期（ConcealAll 前）裸机直写合法；`SvmRootMapVa` 已内聚该分流（引擎在位=原语/诊断形态=直写）。
+- **RL-37** **HOOK_TRANSPARENT 改道后必须置 RFLAGS.RF**（29fd331 终修，与让位分支同一语义）。改道是 fault 语义（RIP=入口未执行），无 IRET 置 RF 机会；不置 RF 则重执行再触发 DR0 执行断点 = **exit 死循环**（实测单核 6.8 万+轮，舞步账目全对而循环不止）。RF 只压制指令断点一条指令，槽码首指令无断点 = 零副作用。任何新增的"fault 语义改道/注入"路径都要自查：**重执行的第一条指令是否会再触发同一陷阱？会则置 RF**。
+- **RL-38** **NX-FENCE 目标页不得与任何高频代码同页（含本驱动回调）**（B/C/D 三会话判例：12s/31s/612s 随机 bugcheck 3/3 复现）。使用纪律 9 的 fence-fence 同页校验**未覆盖**"fence 页含高频代码"形态——beacon 重武装语义会把页级连坐 fault 以全系统流量频率卷入视图乒乓。当前安装门仅查 fence-fence；二次开发者选目标时须自查同页邻码流量（hook.h 纪律 9 注记）。
 
 ---
 
