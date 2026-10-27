@@ -1271,6 +1271,16 @@ BOOLEAN GnptHookDrBpDbExit(PVMCB Vmcb, ULONG Cpu)
 		Vmcb->State.Dr6 &= ~(DR6_BP_MASK | DR6_BS);
 		if (redirected)
 		{
+			//B缺陷修复(2026-10-26判例): 改道后必须置RF——与下方让位
+			//分支(1245行)同一语义: "B0为fault类(RIP=入口未执行), 静默
+			//消费无IRET置RF机会→重执行将再触发我方断点=exit死循环"。
+			//改道分支此前遗漏: VMRUN恢复RFLAGS.RF恒0, DR0执行断点在
+			//首个指令边界重新命中→dance重入→无限循环(实测: rx内核态
+			//调用触发, cpu0单核循环6.8万+轮, [o]尾跳/槽位账目全部正确
+			//而循环不止=唯一残留解释)。RF只压制指令断点一条指令,
+			//改道落点=槽码首指令(槽区无任何断点)=压制无副作用;
+			//槽码尾jmp后的正常取指恢复断点监视(下一轮合法调用)。
+			Vmcb->State.Rflags |= RFLAGS_RF;
 			//改道面包屑(热靶高频; Release构建零开销)
 			static volatile LONG s_drCnt[64] = { 0 };
 			GNPT_CRUMB(s_drCnt, 0xFFF, Cpu,
@@ -1896,6 +1906,14 @@ BOOLEAN GnptHookNpfEngine(PVMCB Vmcb, ULONG Cpu, ULONG64 ExitInfo1, ULONG64 Exit
 				if (hit->pub.Flags & HOOK_NXFENCE)
 				{
 					g_nxFenceRes[Cpu] = 1;
+#if DBG
+					//'X'探针簿记复位(对齐fence入口路径): 邻函数乒乓
+					//(同页驻留-信标回P的稳态同gpa高频fault)与入口
+					//detour同为合法形态; 不复位=每核误报一发[X]
+					//(判例2026-10-27会话B: 12核各64连环全是邻函数
+					//乒乓, 无一真环路)
+					g_npfLoopCnt[Cpu] = 0;
+#endif
 				}
 				return TRUE;
 			}
