@@ -304,7 +304,12 @@ ULONG CommCheckSvm(VOID);
 
 //生命周期: 每核发起线程+vmrun世界开关+探针+干净去虚拟化
 NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject);
-BOOLEAN SvmShutdownAllCpus(VOID);   //TRUE=全核已裸机; FALSE=拒绝(park)引擎仍在位
+BOOLEAN SvmShutdownAllCpus(VOID);   //TRUE=全核已裸机; FALSE=引擎仍在位(park/泄漏核在场)
+//映像驻留守卫(fail-stop): park/泄漏累计掩码或任一bInGuest非零=执行流
+//仍取指本映像——不返回(调用线程驻留=卸载不完成=映像不释放); 零驻留
+//=立即返回, 调用方继续收尾。DriverUnload收尾前+DriverEntry失败返回
+//前必过(两处返回后映像都会被释放; 跳过=驻留核取指野页蓝屏)
+VOID SvmImageResidentHold(const char* Why);
 
 #ifdef __cplusplus
 }

@@ -7,6 +7,7 @@
 //本文件=框架使用示例(面向二次开发者):
 //  DriverEntry  -> SvmStartAllCpus接管全核 -> 安装自己的hook
 //  DriverUnload -> 移除hook -> SvmShutdownAllCpus关停并释放资源
+//  (关停失败=驻留核在场, 过SvmImageResidentHold不返回=映像不释放)
 //框架细节(资源分配/串行启动/互斥仲裁/内置隐藏/日志)全在svm.c,
 //使用者只需关心hook回调本身。API契约见hook.h/msr.h头注释。
 //demo不区分构建形态: Debug构建经观测体系留痕, Release构建
@@ -154,8 +155,12 @@ VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
 	if (SvmShutdownAllCpus())
 	{
 		GnptHookFreeMemory();    //全核已裸机: 纯内存释放(无人引用)
+		FlLog("[Unload] 完成");
 	}
-	FlLog("[Unload] 完成");
+	//映像驻留守卫: 关停失败(park/泄漏核)时执行流仍取指本映像——
+	//不返回=卸载不完成=映像不释放(返回=驻留核取指野页蓝屏)。
+	//零驻留=立即返回, 收尾照常
+	SvmImageResidentHold("[Unload]");
 	FlShutdown();    //最后调用: 停线程+T1最终落盘
 }
 
@@ -171,6 +176,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegPath)
 	NTSTATUS st = SvmStartAllCpus(pDriverObject);
 	if (!NT_SUCCESS(st))
 	{
+		//映像驻留守卫(同Unload路径): 启动回滚遗留停泊/泄漏核时,
+		//加载器随后即卸载映像=驻留核取指野页蓝屏——守卫拦下不返回;
+		//零驻留=正常返回失败状态(返回后映像即被卸载, 无人引用)
+		SvmImageResidentHold("[Entry] Start失败");
 		FlLog("[Entry] SvmStartAllCpus失败=0x%X, 资源已自清理", (ULONG)st);
 		FlShutdown();
 		return st;
