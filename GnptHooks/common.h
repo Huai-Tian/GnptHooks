@@ -280,7 +280,7 @@ extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改;
 //accel -ExpectTag与GNPT_BUILD_TAG同步
-#define GNPT_BUILD_TAG "v0.10x"
+#define GNPT_BUILD_TAG "v0.10z"
 
 //==================== 引擎配置开关(功能语义; 历史演进见开发文档) ====================
 //TRANSPARENT模式=DR机件(DR0-3线性地址执行断点作入口陷阱, 原页恒等
