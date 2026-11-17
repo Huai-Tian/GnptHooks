@@ -236,7 +236,11 @@ static ULONG HookCaveEnum(VOID)
 		//仅X节(槽码需执行; .data/.rsrc/.reloc碎片=不可执行写入即#GP);
 		//VSize=0纯占位节无内容页——碎片落未提交页=root拷贝#PF(灾难),
 		//结构性跳过
+		//V8修复(2026-11-17判例): 可丢弃节(INIT)尾隙不得作cave——
+		//DriverEntry返回后加载器丢弃该节页面, 刻槽=悬空页, teardown
+		//触碰已释放页=速死(实测: .text尾碎片缩至槽块阈值下时槽迁移INIT即崩)
 		if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+			(sec[i].Characteristics & IMAGE_SCN_MEM_DISCARDABLE) ||
 			sec[i].Misc.VirtualSize == 0)
 		{
 			continue;
