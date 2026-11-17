@@ -6,7 +6,7 @@
 
 //==================== 常驻全局 ====================
 volatile LONG g_gnptVcpuCpu = -1;      //观测锚点核(-1=未启动)
-volatile LONG g_gnptParkedMask = 0;    //shutdown park核位掩码(bit i=cpu i)
+volatile LONG64 g_gnptParkedMask = 0;  //shutdown park核位掩码(bit i=cpu i; SvmRootParkOs置位)
 GNPT_VCPU_SVM g_svmVcpu[64];           //每核SVM引擎态(BSS清零)
 ULONG64 g_svmFeatBits = 0;             //Fn8000_000A_EDX特性快照(降级决策)
 volatile ULONG g_svmStgiPass = 0;      //STGI直通门控(启动时按CPUID定, 见SvmStartAllCpus)
@@ -14,9 +14,10 @@ volatile ULONG g_svmTscDlMode = 0;     //0x6E0轴换算门控(启动时裸机探
 KEVENT g_svmShutdownEvent;             //卸载广播(通知事件: 一次唤醒全部发起线程)
 static ULONG64 g_svmNcr3 = 0;          //P视图NCR3(SvmBuildNptViews返回; 其余视图经SvmNptViewNcr3)
 //泄漏核累计掩码(SvmStopAndFree置位, 跨Start回滚/Unload两路径累积):
-//非零=任一核仍guest化引用NPT/root翻译域——任何共享页表释放路径
-//(含零接管对照分支)必须先查此位, 非零即整体保留(蓝屏防线)
-static volatile ULONG g_svmLeakedMask = 0;
+//非零=任一核仍guest化引用NPT/root翻译域+本映像——任何共享页表释放
+//路径(含零接管对照分支)与映像释放路径(SvmImageResidentHold)必须
+//先查此位, 非零即整体保留(蓝屏防线; 累计不清零=本加载会话禁卸载)
+static volatile ULONG64 g_svmLeakedMask = 0;
 //NPF风暴探针(仅Debug构建读写): 引擎不可恢复NPF的取证面
 //(单发全档转储后静音)
 static volatile ULONG64 g_nStormGpa[64];  //各核最后不可恢复NPF的gpa
@@ -462,12 +463,14 @@ static VOID SvmVcpuThread(PVOID Context)
 //顺序: 广播事件->逐核有界等待(5s/核)->全核裸机后释放->清零。
 //超时核: 资源保留(该核可能仍guest化, 释放=蓝屏; 泄漏是安全降级)
 //返回: 泄漏核掩码(位i=核i线程超时未退出, 资源已隔离但核仍guest化
-//且仍引用NPT/root翻译域)——调用方据此决定是否释放共享页表。
-//Start回滚路径: NPT由失败返回后的整体回滚处理, 掩码仅日志;
+//且仍引用NPT/root翻译域+本映像)——调用方据此决定是否释放共享页表,
+//并必须过映像驻留守卫(SvmImageResidentHold; 掩码同时累积入
+//g_svmLeakedMask, 累计不清零)。
+//Start回滚路径: NPT由失败返回后的整体回滚处理;
 //Unload路径: 掩码非零=NPT/root树一并保留(泄漏是安全降级)。
-static ULONG SvmStopAndFree(ULONG n, const char* why)
+static ULONG64 SvmStopAndFree(ULONG n, const char* why)
 {
-	ULONG leaked = 0;
+	ULONG64 leaked = 0;
 	KeSetEvent(&g_svmShutdownEvent, IO_NO_INCREMENT, FALSE);
 	for (ULONG i = 0; i < n; i++)
 	{
@@ -481,7 +484,7 @@ static ULONG SvmStopAndFree(ULONG n, const char* why)
 		if (KeWaitForSingleObject(v->ThreadObj, Executive, KernelMode, FALSE, &to)
 			== STATUS_TIMEOUT)
 		{
-			leaked |= 1UL << i;
+			leaked |= 1ULL << i;
 			FlLog("%s: 核%u发起线程5秒未退出(该核资源泄漏保留)", why, i);
 			ObDereferenceObject(v->ThreadObj);
 			v->ThreadObj = NULL;
@@ -491,7 +494,7 @@ static ULONG SvmStopAndFree(ULONG n, const char* why)
 	KeClearEvent(&g_svmShutdownEvent);
 	for (ULONG i = 0; i < n; i++)
 	{
-		if (leaked & (1UL << i))
+		if (leaked & (1ULL << i))
 		{
 			continue;    //超时核资源保留
 		}
@@ -527,7 +530,7 @@ static ULONG SvmStopAndFree(ULONG n, const char* why)
 	//#GP处置账: 忠实回注=自然#GP(静置应≈0)
 	FlLog("%s: S1#GP手术: 族转换#UD=%lld 忠实回注=%lld(0x4D exit总账见r4D)",
 		why, g_svmGpUdConv, g_svmGpReinj);
-	FlLog("%s: 完成(泄漏核掩码=%X)", why, leaked);
+	FlLog("%s: 完成(泄漏核掩码=%llX)", why, (unsigned long long)leaked);
 	g_svmLeakedMask |= leaked;    //跨路径累积: 零接管对照分支的释放门
 	return leaked;
 }
@@ -937,14 +940,23 @@ BOOLEAN SvmRootCodeRead(ULONG64 Va, PUCHAR Dst, ULONG Len)
 //VCPU索引=ntoskrnl函数, 弃——CR2/RIP已足定位)
 static VOID SvmRootParkOs(VOID)
 {
+	//核号: park登记与OS IDTR还原共用(GS:[0x184]=KPCR.Prcb.Number,
+	//x64稳定偏移; 切轴后读=KPCR页OS域必映射, 且建树时KPCR首页已
+	//显式注册=双保险)
+	UCHAR c = __readgsbyte(0x184);
+	//⓪park登记(原子OR): 本核自此在asm尾sti;hlt环永久取指本映像——
+	//掩码=SvmShutdownAllCpus的park门/hook同步IPI切换/映像驻留守卫
+	//(SvmImageResidentHold)的共同判据, 首停泊即置位(与取证单飞
+	//无关); 越界不登记(理论不可达: 启动已拒>64核)
+	if (c < 64)
+	{
+		InterlockedOr64(&g_gnptParkedMask, 1LL << c);
+	}
 	//① [F]排水提速: 立刻唤醒T1(已切OS轴+非exit热路径=KeSetEvent
 	//合法; FlRingPush自身的#VMEXIT死锁纪律不适用于本上下文)
 	FlWakeT1();
-	//② 本核OS IDTR还原: Windows每核独立IDT, 核号=GS:[0x184]
-	//KPCR.Prcb.Number(x64稳定偏移; 切轴后读=KPCR页OS域必映射,
-	//且建树时KPCR首页已显式注册=双保险); 越界钳制=只跳lidt
+	//② 本核OS IDTR还原: Windows每核独立IDT; 越界钳制=只跳lidt
 	//(中断走root IDT超限向量→#GP→单飞门已占分支→再停泊, 稳定)
-	UCHAR c = __readgsbyte(0x184);
 	if (c < 64)
 	{
 		CmLidt(g_svmVcpu[c].RootOsIdtr);
@@ -1494,7 +1506,9 @@ NTSTATUS SvmStartAllCpus(PDRIVER_OBJECT DriverObject)
 	return STATUS_SUCCESS;
 }
 
-//返回TRUE=全核已裸机(引擎真正关停); FALSE=拒绝/未在位(引擎仍在位)
+//返回TRUE=全核已裸机(引擎真正关停); FALSE=引擎仍在位(park/泄漏
+//核仍取指本映像——调用方必须过SvmImageResidentHold, 直接返回=
+//映像被卸载=蓝屏)
 BOOLEAN SvmShutdownAllCpus(VOID)
 {
 	//实际接管数(TAKE_CORES诊断轮<全核; 从未启动=0同样成立)
@@ -1502,7 +1516,8 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 	//park守卫: park核的VMM栈/代码页被占用, 释放=蓝屏; 拒绝并泄漏
 	if (g_gnptParkedMask != 0)
 	{
-		FlLog("[Unload] 拒绝去虚拟化: park掩码=%X非零(资源泄漏保留)", g_gnptParkedMask);
+		FlLog("[Unload] 拒绝去虚拟化: park掩码=%llX非零(资源泄漏保留)",
+			(unsigned long long)g_gnptParkedMask);
 		return FALSE;
 	}
 	//从未启动(或已回滚): 无线程可退; 零接管对照轮(TAKE_CORES=0)
@@ -1515,7 +1530,8 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 		if (g_svmLeakedMask != 0)
 		{
 			g_gnptVcpuCpu = -1;
-			FlLog("[Unload] 泄漏核掩码=%X(Start回滚遗留): NPT/root树保留", g_svmLeakedMask);
+			FlLog("[Unload] 泄漏核掩码=%llX(Start回滚遗留): NPT/root树保留",
+				(unsigned long long)g_svmLeakedMask);
 			return FALSE;
 		}
 		if (g_svmNcr3 != 0)
@@ -1529,20 +1545,22 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 		FlLog("[Unload] 引擎未在位, 空卸载");
 		return TRUE;
 	}
-	ULONG leakedMask = SvmStopAndFree(n, "[Unload]");
+	ULONG64 leakedMask = SvmStopAndFree(n, "[Unload]");
 	if (leakedMask != 0)
 	{
 		//泄漏核仍在guest模式引用NPT翻译域(以及可能的HOOKS视图/
 		//CodePage)——共享页表释放=泄漏核脚下大陆被抽走+全局
-		//TLB-flush IPI死等该核应答(实测: 单核挂死升级为整机
-		//0x101 CLOCK_WATCHDOG_TIMEOUT的路径)。
+		//TLB-flush IPI死等该核应答(单核挂死升级为整机
+		//0x101 CLOCK_WATCHDOG_TIMEOUT的形态)。
 		//正确降级(对齐park守卫形态): NPT/root树/全部单核资源
 		//一并永久保留——泄漏是安全降级, 蓝屏不是。
 		//代价: 下次重新加载=新的NPT树, 本轮树成死页(池内
-		//无主, 无人再引用外的路径); sc stop正常返回, 其余核
-		//健康, 黑匣子可正常取走, 系统可继续运行/正常关机。
+		//无主, 无人再引用外的路径); 驻留守卫不返回(sc stop不
+		//返回), 其余核健康, 黑匣子可正常取走, 系统可继续运行/
+		//正常关机。
 		g_gnptVcpuCpu = -1;
-		FlLog("[Unload] 泄漏核掩码=%X: NPT/root树保留(单核挂死不升级为整机失效)", leakedMask);
+		FlLog("[Unload] 泄漏核掩码=%llX: NPT/root树保留(单核挂死不升级为整机失效)",
+			(unsigned long long)leakedMask);
 		return FALSE;    //main.c: if(SvmShutdownAllCpus()) GnptHookFreeMemory() 自动跳过
 	}
 	//NPT页表释放(全核已裸机, 页表无人引用)
@@ -1553,6 +1571,48 @@ BOOLEAN SvmShutdownAllCpus(VOID)
 	g_svmNcr3 = 0;
 	g_gnptVcpuCpu = -1;
 	return TRUE;
+}
+
+//==================== 映像驻留守卫(fail-stop) ====================
+//停泊核(RootXcptHalt环)与泄漏核(vmrun循环+exit handler)都持续取指
+//本驱动映像——此刻返回=卸载方(I/O管理器/加载器)随即释放映像, 驻留
+//核下一跳取指野页=蓝屏。park守卫的"资源泄漏保留"只保得住池内存,
+//保不住映像本身。
+//驻留判据(任一非零): park掩码|泄漏累计掩码|任一核bInGuest。
+//驻留态本函数不返回: 调用线程永久驻留=卸载不完成=映像不释放, 资源
+//按park守卫一并保留(泄漏是安全降级, 蓝屏不是; 回收=重启)。
+//零驻留=立即返回, 调用方继续正常收尾(映像可安全卸载)。
+//调用点: DriverUnload收尾前+DriverEntry失败返回前(两处返回后映像
+//都会被释放; 漏调=驻留核取指野页蓝屏)。
+VOID SvmImageResidentHold(const char* Why)
+{
+	LONG64 park = g_gnptParkedMask;
+	ULONG64 leak = g_svmLeakedMask;
+	ULONG64 inGuest = 0;
+	for (ULONG i = 0; i < 64; i++)
+	{
+		if (g_svmVcpu[i].base.bInGuest)
+		{
+			inGuest |= 1ULL << i;
+		}
+	}
+	if (park == 0 && leak == 0 && inGuest == 0)
+	{
+		return;    //零驻留执行流: 映像可安全卸载
+	}
+	FlLog("%s: 映像驻留守卫: park=%llX leak=%llX in-guest=%llX",
+		Why, (unsigned long long)park, (unsigned long long)leak,
+		(unsigned long long)inGuest);
+	FlLog("%s: 执行流仍引用本映像——拒绝卸载返回(永久驻留, "
+		"sc stop不返回; 资源保留须重启回收)", Why);
+	//永久驻留: 栈上无信号事件(本帧永不回收=等待对象常驻)。
+	//FlShutdown不达=观测线程继续排水留证, 系统其余部分照常运行
+	{
+		KEVENT hold;
+		KeInitializeEvent(&hold, NotificationEvent, FALSE);
+		(VOID)KeWaitForSingleObject(&hold, Executive, KernelMode,
+			FALSE, NULL);
+	}
 }
 
 //==================== "SVM未激活"自洽故事面 ====================

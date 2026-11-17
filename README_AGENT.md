@@ -111,8 +111,8 @@
 
 ### F. 生命周期与卸载
 
-- **RL-22** 卸载顺序**不可变动**：`GnptHookRemoveAll()`（关 SVM **前**，在途回调安全完成）→ `SvmShutdownAllCpus()`（STOP 桥全核去虚拟化，返回 TRUE 才继续）→ `GnptHookFreeMemory()`（关 SVM **后**，纯内存释放）。参考 main.c 的 DriverUnload 三段式。
-- **RL-23** park 守卫不可拆：`g_gnptParkedMask` 非零时 `SvmShutdownAllCpus` 拒绝去虚拟化（park 核的 VMM 栈/代码页仍被占用，释放 = 蓝屏），资源泄漏保留是**安全降级**。`[判例: shutdown park 核资源释放 = 蓝屏]`
+- **RL-22** 卸载顺序**不可变动**：`GnptHookRemoveAll()`（关 SVM **前**，在途回调安全完成）→ `SvmShutdownAllCpus()`（STOP 桥全核去虚拟化，返回 TRUE 才继续）→ `GnptHookFreeMemory()`（关 SVM **后**，纯内存释放）。参考 main.c 的 DriverUnload 三段式。收尾必须过 `SvmImageResidentHold`：关停失败（park/泄漏核）时执行流仍取指本映像，直接 return = I/O 管理器随即卸载映像 = 驻留核取指野页蓝屏；守卫不返回 = 卸载不完成 = 映像不释放。DriverEntry 失败返回前同理（加载器随即卸载映像）。
+- **RL-23** park 守卫不可拆：`g_gnptParkedMask` 非零时 `SvmShutdownAllCpus` 拒绝去虚拟化（park 核的 VMM 栈/代码页仍被占用，释放 = 蓝屏），资源泄漏保留是**安全降级**。掩码必须由 `SvmRootParkOs` 原子置位（守卫唯一判据；漏置 = 停泊核被当健康核放行 → 伪成功释放共享树）。`[判例: shutdown park 核资源释放 = 蓝屏]`
 - **RL-24** STOP 桥契约：exit handler 把 VMCB.RSP/RIP/RAX 填进触发帧的**易失 r10/r11/rax 槽**（asm CmSvmStop: mov rsp,r10; stgi; jmp r11），非易失寄存器全保真。改 vmcall(1) 语义必须同步 svm-asm.asm。
 - **RL-25** 发起线程钉核失败 / vmrun 一致性失败（'R' 环）→ 本核不接管，资源回滚；**绝不**带病继续。
 
@@ -161,6 +161,7 @@
 | "CPUID 应该过滤隐藏" | **已实现并转正（M13）**：拦截位服务于隐蔽（Fn8000_0001 SVM 位清零/无签名 leaf 归零/maxleaf 真值），GNPT_CPUID_STEALTH=1 为正式默认 | 伪装面=接管核集合的函数——部分接管下裸核回答真值，勿宣称部分形态的完整伪装；修改伪装三则须重过三步验证判据 |
 | "'i' 环事件是中断交付" | 'i' 已被 NPTSYNC 确认占用 | tag 表以 common.h 注释为权威（本文档 §8.2 同步） |
 | "SvmShutdownAllCpus 返回 void 够了" | park 拒绝时引擎仍在位, 卸载方不能释放 hook 内存 | BOOLEAN：TRUE=全核裸机可 FreeMemory |
+| "关停失败时 DriverUnload 正常返回即可（资源泄漏保留 = 安全降级）" | 泄漏保留只保数据页：停泊/泄漏核仍取指本映像（park 环 / vmrun 循环 / exit handler），返回 = I/O 管理器立即卸载映像 = 驻留核下一跳取指野页 | 过 `SvmImageResidentHold`：驻留 = 不返回（sc stop 不返回是安全降级，回收 = 重启）；零驻留才允许返回 |
 | "重定位跳板失败可以警告后继续安装" | 带病上机 = 不可调试时机的蓝屏 | FAIL → 拒绝安装（安全门语义） |
 | "VMware 嵌套 SVM 测出的异常就是 bug" | 嵌套环境特性位失真（无 vGIF 判例等） | 先物理机复现再定性（勿追鬼） |
 | "LeakCheck 每个 exit 都跑一遍太浪费, 该缓存/挪位/删除" | 清 TF 类指令（syscall/sysret/iret）使 #DB 永不到达 → 单步窗口永不关闭 → 拦截位永久泄漏（0x1E 判例: r70 心跳风暴 44→2542） | `GnptHookStepLeakCheck` 必须保持在 exit handler 每个 exit 首查；判据"armed 而 guest TF 已失"开销 = 窗口外 2 读+1 比较 |
@@ -259,6 +260,7 @@ hook 命中（NX-FENCE: 每调用2 exit, 两视图零工件）:
 
 卸载(DriverUnload): DemoHookShutdown(显式移除)→GnptHookRemoveAll(Remove OK+'i'×N)
   →SvmShutdownAllCpus(STOP桥'S'×N, SVME回读=0)→TRUE→GnptHookFreeMemory
+  →SvmImageResidentHold(零驻留返回→FlShutdown; FALSE=park/泄漏在场, 驻留不返回)
 ```
 
 ---
@@ -462,7 +464,7 @@ Debug 构建双自旋看门狗线程（纯 rdtsc 计时）：行环游标 30s �
 2. **接管**：每核 `接管(vmrun循环就绪)` → `已guest化(KEEP确认)` × 全核 → `全核接管完成`；'W'/'Q' 每核齐。
 3. **hook 安装**：`[Demo]` 三行安装 OK（热靶 TRANSPARENT / 本地冷靶普通模式 / LSTAR MSR）+ 冷靶自调行（返回值=直算值）+ `[Hook] Install OK` 全要素 + cave 选址行（段数/字节数；"cave槽N"=映像内选址命中, "池回退"仅 GNPT_SLOT_FORCE_POOL=1 时合法）→ 'i' × 核数（布防同步确认）→ 'g' 环（DR 全核武装）。
 4. **触发**：开关任意程序 → 'V'（首切）→ 'H'/'h'/'O' 推进；HB 行 r400 = 核数且**恒定**；r81 账目精确。TRANSPARENT 目标另查：'y'（DR 断点改道）推进正常、r41 随自然流量增长；泄漏面包屑 'L'/'D' 允许少量（每秒成百 = 异常须报告）。NX-FENCE 目标另查：'k'→'r' 链闭合、'A' 信标偶发（每秒成百 = fence 页过热/邻函数密集）。**root 域判据（v0.10+）**：`root CR3: 私有翻译域(N页)在位` 横幅 + 'r'(rsn=17) ROOTMAP 注册流量全 c=1（KPCR 排水+跳板+CodePage）+ 'o'=0（树页/隐蔽页零击穿）。
-5. **卸载**：`[Demo]` 显式移除（MSR/冷靶/热靶）→ Remove OK + 'i'×N → Remove 后新 'h' 即刻停止 → 'S'×N（SVME 回读=0）→ 泄漏掩码 0 → NPT 释放页数账目 → 槽池 teardown 行（cave槽N已复原+池槽M已释放, N+M=安装槽总数）→ FreeMemory → 完成。
+5. **卸载**：`[Demo]` 显式移除（MSR/冷靶/热靶）→ Remove OK + 'i'×N → Remove 后新 'h' 即刻停止 → 'S'×N（SVME 回读=0）→ 泄漏掩码 0 → NPT 释放页数账目 → 槽池 teardown 行（cave槽N已复原+池槽M已释放, N+M=安装槽总数）→ FreeMemory → 完成。关停失败对照形态：park/泄漏掩码非零 → `[Unload] ... 映像驻留守卫` 两行 + 不再打 `[Unload] 完成` + sc stop 不返回（安全降级, 重启回收）。
 6. **Release 崩溃无环**：任何 Release 构建的崩溃，先换 Debug 构建复现再判读。
 
 ### 10.3 崩溃取证
@@ -517,6 +519,7 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | VMware 嵌套 SVM 特性失真 | 已知项 | 异常先物理机复现再定性 |
 | 拆分 PT 页不释放 | 交付语义 | 每视图每 2MB 区 1 页, 上限 16 区/树 |
 | 回调线程迁移 | 理论臂 | 每核 g_curHook 上下文, 嵌套实测未出现 'w' 留痕 |
+| 关停失败后 sc stop 不返回 | 交付语义 | 映像驻留守卫（SvmImageResidentHold）：park/泄漏核持续取指本映像, 卸载返回=蓝屏；永久驻留=安全降级, 重启回收 |
 | 哨兵 v2 阈值 | 可调（默认 6s/12s） | 预警/实锤两级；全机瞬时冻结（T1 也死）场景哨兵无法开火=已知边界，需 KDNET |
 | accel 门禁二跑假警报 | v4 已知缺陷 | 同 boot 二跑 WRONGVER 误报；数据有效；v5 修复；v6 硬化（退役向量残留预检自愈+电源设置回读验证+AC/DC 忠实还原） |
 | **DWM 崩溃族** | **终案收口（M16.40/cm, commit 8df8003）** | CodePage 热靶机制定罪：单变量实验（同函数 PsGetProcessId 同流量 152k/600s）CodePage=23 崩+硬死 vs DR=零事件；三重修复=线程键表（ck）+拒装门 5c（cm）+热靶纪律 5b（≥100/s 一律 TRANSPARENT）；B1 残余历史勘误（前两起=M12 衰减态轻度形态） |

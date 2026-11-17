@@ -166,7 +166,8 @@ ULONG64 GnptCallOriginal(ULONG64 Arg1, ULONG64 Arg2, ULONG64 Arg3, ULONG64 Arg4)
 
 //卸载收尾: DriverUnload在关引擎**之前**调用GnptHookRemoveAll
 //(移除全部live hook, 在途回调安全完成); 关引擎**之后**调用
-//GnptHookFreeMemory(纯内存释放, 无引擎依赖)
+//GnptHookFreeMemory(纯内存释放, 无引擎依赖)。关停失败=驻留核
+//在场, SvmImageResidentHold不返回(映像不释放)——FreeMemory不达
 VOID GnptHookRemoveAll(VOID);
 VOID GnptHookFreeMemory(VOID);
 

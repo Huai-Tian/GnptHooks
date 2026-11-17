@@ -64,9 +64,11 @@ ULONG64 CmVmmCall(ULONG opcode, ULONG64 arg2, ULONG64 arg3, ULONG64 arg4);
 //处置终点: 本核退出虚拟化但持续服务中断, 切断级联冻结
 void CmShutdownPark();
 
-//shutdown park核位掩码(bit i=cpu i已park)。park核的VMM栈/代码页仍被
-//占用, 卸载守卫据此拒绝卸载
-extern volatile LONG g_gnptParkedMask;
+//shutdown park核位掩码(bit i=cpu i已park; SvmRootParkOs原子置位=守卫
+//判据, 漏置=停泊核被当健康核放行)。park核的VMM栈/代码页仍被占用且
+//持续取指本映像——SvmShutdownAllCpus的park门/hook同步IPI切换/映像
+//驻留守卫(SvmImageResidentHold)三处同据此
+extern volatile LONG64 g_gnptParkedMask;
 
 //落地探针魔数: guest侧探针首条vmmcall携带。
 //改动必须同步common-asm.asm的 mov rcx, 6BEEh
@@ -280,7 +282,7 @@ extern volatile LONG g_flLaunchHot;
 
 //构建标签: 打进日志第一行核对二进制版本。代码改动必须同步修改;
 //accel -ExpectTag与GNPT_BUILD_TAG同步
-#define GNPT_BUILD_TAG "v0.10z"
+#define GNPT_BUILD_TAG "v0.10y"
 
 //==================== 引擎配置开关(功能语义; 历史演进见开发文档) ====================
 //TRANSPARENT模式=DR机件(DR0-3线性地址执行断点作入口陷阱, 原页恒等

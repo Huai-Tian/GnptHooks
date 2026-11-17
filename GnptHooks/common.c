@@ -784,7 +784,7 @@ static VOID FlThreadProcT1(PVOID Context)
 			}
 #endif
 			RtlStringCbPrintfA(hbb, sizeof(hbb),
-				"[HB%llu] up=%us lag=%ld wf=%ld/%ld g:%X f:%X o:%X p:%X pk=%X vcpu=%d pend=%d st=%X exits:",
+				"[HB%llu] up=%us lag=%ld wf=%ld/%ld g:%X f:%X o:%X p:%X pk=%llX vcpu=%d pend=%d st=%X exits:",
 				++hb, (ULONG)(KeQueryUnbiasedInterruptTime() / 10000000ULL),
 				g_flT1Lag, g_flWriteFailsT1, g_flWriteFailsT2,
 				guestMsk, failMsk, onMsk, g_gnptParkedMask, parkedX,

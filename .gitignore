@@ -47,6 +47,7 @@ tools/
 # ===== 私有文档 (判例库/会话交接, 与GeptHooks仓库形态对齐不公开) =====
 NOTES.md
 HANDOFF.md
+.workbuddy/
 
 # ===== OS =====
 Thumbs.db
