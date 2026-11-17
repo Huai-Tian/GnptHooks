@@ -133,6 +133,8 @@
 - **RL-32** **绝不清 CR0.WP 来获得写权限**（含"瞬清-写-瞬恢复"舞步）。CR4.CET=1（shadow stack 在位，Win10 19045+ 平台常态）时清 WP = **mov cr0 架构性 #GP**（APM Vol1 CR0.WP 位规则原文），GIF=0 上下文内 raise = 0x139 FAST_FAIL_INCORRECT_STACK。WP 瞬清路径已整体退役。`[判例 M16.44: v0.9cn 双死, windbg 符号化 SvmExitDispatch+0x849 + 陷阱帧 RAX=合法值 + APM 原文三证闭合]`
 - **RL-33** **写只读内核页（RX 映像页/cave 槽）的正统原语 = 锁页 RW 重映射**：`MmProbeAndLockPages(mdl, KernelMode, IoReadAccess)` + `MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority)`（返回 RW 别名）→ 写别名 → `MmUnmapLockedPages` + `MmUnlockPages`（HookCaveAliasCopy 形态）。**勿用 `MmBuildMdlForNonPagedPool`**：它置 MDL 标志后 `MmGetSystemAddressForMdlSafe` **直接返回原 VA 而非别名**——"别名"写入实为直写 RX 页 = 0xBE ATTEMPTED_WRITE_TO_READONLY_MEMORY。`[判例 M16.45: v0.9cp 蓝屏]` 这两个判例构成"死亡窗口三次同点、三种形态"链：写同一片 cave 槽，cn=WP 瞬清→#GP，cp=非分页 MDL→0xBE，cq=锁页重映射→全绿毕业。
 
+- **RL-39** **映像内刻槽（cave 选址）不得落入可丢弃节——HookCaveEnum 已排除 IMAGE_SCN_MEM_DISCARDABLE（21fc779），勿回退**。可丢弃节（INIT）在 DriverEntry 返回后被加载器丢弃：安装期（Entry 内）页尚在=刻槽成功，槽体此后驻留悬空页带病工作，teardown 的锁页重映射触碰已释放页=确定性速死（蓝屏一闪无事件无转储）。**代码增量会改变 .text 尾碎片几何**（实测：+48B 使尾碎片 144B→96B，容不下双 64B 槽块→次选槽迁入 INIT 尾隙）：任何触及映像体积的改动后，核对"槽池选址"行的段数/字节数是否变化。`[判例 M19.3: v0.10y 首个外部 PR 触发, 八轮二分定案, 见 §15 排雷纪实]`
+
 ### J. root 窗口三纪律（私有 root CR3 域内——F 项十三轮判例结晶）
 
 - **RL-34** root CR3 窗口内（`CmSvmEnter` 切入私有翻译域起，至切回 OS 轴止）的**三纪律**：
@@ -500,6 +502,7 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 | **0xE17 自定义 bugcheck（STOP 桥帧代数错误形态）** | root IDT 取证 bugcheck 首战自捕：CmSvmStop 帧内 `mov rcx,[rsp+100h]` 应为 `[rsp+80h]`（两个 rsp 陷阱：vmmcall 帧与 exit 帧基不同）→ 卸载 STOP 桥确定性蓝屏 0xE17 | root IDT 的 32 门取证把"无声死"变成"带 dump 可分析崩溃"——自研缺陷照样自捕，这正是它的使命（M17-E 判例） |
 | **黑屏无蓝屏无 dump、事件查看器零事件、日志戛然而止（[F] 行缺席或滞后）** | **root 窗口缺映射三重故障**：root CR3 树外页取指 #PF → 递归 #PF → #DF → 三重故障核死透（取证器自身在 root 轴上调 ntoskrnl 函数/直读 guest VA 均可触发） | root 窗口三纪律（RL-34）；停泊保活（OS 可中断休眠）把 [F] 落盘窗口从 <100ms 扩到 ∞——先保取证通道，再按 [F] 的 CR2/err 定罪缺映射点（M17-F 判例链） |
 | **guest 探测器读非法 MSR 号（如 0x2000）→ 整核停泊 + 卸载拒绝** | 范围外 MSR 直通雷：MSRPM 三区外号必 exit（APM §15.11），未 hook 直通 `__readmsr` = root 轴非法号 #GP → root IDT 停泊 = guest 可触发的引擎灭活开关 | RL-35：GnptMsrLocate 判定失败 → 注入 #GP(0) 回 guest（裸机等价）；判据='m' 环 b>=2 形态（范围外号注入 #GP 的留痕形态） |
+| **正常关停确定性速死（蓝屏一闪无事件无转储；日志断于 [J]36 移除完成与"槽池teardown"行之间，零 [S]；同机基线全绿）** | **cave 槽迁入可丢弃节弃置区（M19.3 定案）**：代码增量压过 .text 尾碎片双槽阈值→次选槽落入 INIT 尾隙（DISCARDABLE，DriverEntry 后被加载器丢弃）→槽体悬空带病工作全会在→teardown 锁页触碰已释放页 | RL-39：选址器排除 DISCARDABLE（21fc779）；任何映像体积改动后核对"槽池选址"行形态（§15 排雷纪实） |
 
 ---
 
@@ -555,5 +558,21 @@ Debug 构建崩溃 → `MEMORY.DMP` → WinDbg `!analyze -v` + `k`；判例速�
 - 里程碑状态与设计裁决全史：本地私有判例库（NOTES.md/HANDOFF.md，均已 gitignore，不入公开仓——与 GeptHooks 仓库形态对齐）；仓库内的权威即本文档 + 源码注释。
 
 ---
+
+## 15. 排雷纪实：首个外部贡献与 cave 选址地雷（2026-11-16/17，供智能体借鉴）
+
+> 公开仓库治理的一次完整实战：外部 PR 到达→身份取证→代码审查→真机回归触发确定性速死→八轮单变量二分→二进制级取证→一行修复定案。方法论对任何"改动看似无辜却引发确定性崩溃"的排查具有直接迁移价值。
+
+**事件**：首个外部 PR（驻留守卫修复，语义正确、签名/comment_audit 全绿）合并前真机验证触发确定性速死。八轮二分证明 PR 的全部逻辑改动逐项叠加全绿；唯一扳机是 main.c 增量 48 字节——它把 .text 尾碎片从 144B 压到 96B，容不下双 64B 槽块，第二跳板槽迁入 INIT 尾隙；INIT 是可丢弃节，DriverEntry 后被加载器丢弃，槽体悬空工作整个会话，teardown 触碰已释放页即死。修复=选址器排除 DISCARDABLE，一行（RL-39）。
+
+**八轮二分骨架**（同机同序列，每轮横幅验明二进制身份）：
+位宽族绿 → +等量死代码绿 → +park 接线绿 → +真守卫+原型绿（=PR 减 main.c 全绿）→ PR 全量崩 → main.c 等量死代码（无接线）绿 → PR+一行修复绿。→ 扳机=main.c 增量；死代码不崩证明非"任何增长"而是**阈值跨越**。
+
+**五条可迁移方法论**：
+1. **变体验证必须二进制级**（编译产物 findstr 独有 ASCII 串）——源码级检查防不住三类事故：文件覆盖遗漏、增量构建残留（zip 解压保留旧时间戳→MSBuild 按 mtime 判定跳过重编→杂交二进制）、链接器剥离（cl 前端删除未读取 static 数据锚→函数成无引用 COMDAT 被 /OPT:REF 收走）；
+2. **死代码对照需活锚**：以"永不执行分支内的可达调用"作引用锚，编译器与链接器都无法消除；
+3. 二进制中文串按 ACP（GBK）存储，判别串优先 ASCII；
+4. 基线行尾混合（CRLF/LF 并存），字节级工具必须容错；
+5. **"槽池选址"行是布局敏感的免费观测面**——逐构建对比段数/字节数，秒级发现布局漂移。
 
 *本文档随代码演进同步维护。若你（Agent）发现文档与代码冲突：以代码为准，并在你的修改说明中指出文档偏差。*
